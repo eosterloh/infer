@@ -1,0 +1,6 @@
+torch
+safetensors
+transformers
+accelerate
+huggingface_hub
+pytest
