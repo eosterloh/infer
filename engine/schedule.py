@@ -73,32 +73,77 @@ def hybrid_pattern_schedule(pattern: str) -> tuple[LayerSpec, ...]:
     return tuple(specs)
 
 
+def dense_or_moe_schedule(
+    num_layers: int, moe_layers: set[int]
+) -> tuple[LayerSpec, ...]:
+    return tuple(
+        LayerSpec(
+            i,
+            MixerKind.ATTENTION,
+            FfnKind.MOE if i in moe_layers else FfnKind.DENSE_MLP,
+        )
+        for i in range(num_layers)
+    )
+
+
 def build_schedule(config: ModelConfig) -> tuple[LayerSpec, ...]:
     """Build layer schedule from already-detected recipe + config fields."""
     if config.layers:
         return config.layers
 
     recipe = getattr(config, "recipe_id", None)
+    n = config.num_hidden_layers
+    raw = config.raw or {}
+
     if recipe == "nemotron_h" or (config.model_type or "").lower() in {
         "nemotron_h",
         "nemotronh",
     }:
         pattern = getattr(config, "hybrid_override_pattern", None) or (
-            config.raw.get("hybrid_override_pattern") if config.raw else None
+            raw.get("hybrid_override_pattern")
         )
         if not pattern:
             raise ValueError(
                 "nemotron_h config missing hybrid_override_pattern — cannot build schedule"
             )
-        if len(pattern) != config.num_hidden_layers:
+        if len(pattern) != n:
             raise ValueError(
                 f"hybrid_override_pattern length {len(pattern)} != "
-                f"num_hidden_layers {config.num_hidden_layers}"
+                f"num_hidden_layers {n}"
             )
         return hybrid_pattern_schedule(pattern)
 
-    if recipe == "llama" or (config.model_type or "").lower() in {"llama", ""}:
-        return llama_dense_schedule(config.num_hidden_layers)
+    if recipe in {"mixtral", "gpt_oss"}:
+        return tuple(LayerSpec(i, MixerKind.ATTENTION, FfnKind.MOE) for i in range(n))
+
+    if recipe == "llama4":
+        listed = raw.get("moe_layers")
+        if listed is not None:
+            moe_set = {int(x) for x in listed}
+        else:
+            step = int(raw.get("interleave_moe_layer_step", 1) or 1)
+            moe_set = {i for i in range(n) if step > 0 and (i + 1) % step == 0}
+        return dense_or_moe_schedule(n, moe_set)
+
+    if recipe == "deepseek_v3":
+        first = int(raw.get("first_k_dense_replace") or 0)
+        moe_set = {i for i in range(n) if i >= first}
+        return dense_or_moe_schedule(n, moe_set)
+
+    if recipe in {
+        "llama",
+        "mistral",
+        "qwen2",
+        "qwen3",
+        "yi",
+        "gemma",
+        "phi3",
+        "gpt2",
+        "gpt_neox",
+        None,
+        "",
+    } or (config.model_type or "").lower() in {"llama", ""}:
+        return llama_dense_schedule(n)
 
     raise ValueError(
         f"no schedule for recipe={recipe!r} model_type={config.model_type!r}"

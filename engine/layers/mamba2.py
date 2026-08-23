@@ -25,16 +25,16 @@ def _rms_norm_gated(
 ) -> torch.Tensor:
     """Match mamba_ssm rmsnorm_fn with norm_before_gate=False (group RMS)."""
     # y = rmsnorm(x * silu(gate)) * weight, RMS over each group
-    y = x * F.silu(gate)
+    y = x.float() * F.silu(gate.float())
     orig = y.shape
     d = orig[-1]
     if d % group_size != 0:
         raise ValueError(f"hidden {d} not divisible by group_size {group_size}")
     y = y.reshape(*orig[:-1], d // group_size, group_size)
-    var = y.float().pow(2).mean(dim=-1, keepdim=True)
-    y = (y.float() * torch.rsqrt(var + eps)).to(dtype=x.dtype)
-    y = y.reshape(orig)
-    return y * weight
+    var = y.pow(2).mean(dim=-1, keepdim=True)
+    y = y * torch.rsqrt(var + eps)
+    y = y.reshape(orig) * weight.float()
+    return y.to(dtype=x.dtype)
 
 
 def _depthwise_conv1d(
@@ -98,7 +98,7 @@ def mamba2(
     decode = (
         cache is not None
         and cache.conv_states[layer] is not None
-        and cache._mamba_has_state
+        and cache.mamba_ready(layer)
         and s == 1
     )
 
@@ -167,7 +167,7 @@ def mamba2(
         y = y.reshape(b, 1, inter)
     else:
         # Sequential scan (correct, DIY-readable; not the chunk SSD fast path)
-        if cache is not None and cache.ssm_states[layer] is not None and cache._mamba_has_state:
+        if cache is not None and cache.mamba_ready(layer) and cache.ssm_states[layer] is not None:
             state = cache.ssm_states[layer].float().clone()
         else:
             state = torch.zeros(

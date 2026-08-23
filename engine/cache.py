@@ -52,16 +52,14 @@ class KVCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if layer < 0 or layer >= self.n_layers:
             raise IndexError(f"layer {layer} out of range 0..{self.n_layers - 1}")
-        if k_new.shape != v_new.shape:
-            raise ValueError(f"k/v shape mismatch: {k_new.shape} vs {v_new.shape}")
         if k_new.shape[0] != self.batch_size:
             raise ValueError(
                 f"batch {k_new.shape[0]} != cache batch_size {self.batch_size}"
             )
-        if k_new.shape[1] != self.n_kv or k_new.shape[3] != self.head_dim:
-            raise ValueError(
-                f"expected [B,{self.n_kv},S,{self.head_dim}], got {tuple(k_new.shape)}"
-            )
+        if k_new.dim() != 4 or v_new.dim() != 4:
+            raise ValueError(f"expected k/v [B, heads, S, dim], got {k_new.shape} {v_new.shape}")
+        if k_new.shape[2] != v_new.shape[2]:
+            raise ValueError(f"k/v seq mismatch: {k_new.shape} vs {v_new.shape}")
 
         if self.k[layer] is None:
             self.k[layer] = k_new
@@ -104,7 +102,10 @@ class RuntimeState:
         # Per-layer Mamba state (None for non-mamba layers)
         self.conv_states: list[torch.Tensor | None] = [None] * self.n_layers
         self.ssm_states: list[torch.Tensor | None] = [None] * self.n_layers
-        self._mamba_has_state = False
+        # Per-layer: True after that mixer has seen at least one token.
+        # A global flag is wrong on hybrid models — later Mamba layers would
+        # take the decode path during a 1-token prefill.
+        self._mamba_ready: list[bool] = [False] * self.n_layers
         self._token_len = 0
 
         for spec in self.layers:
@@ -130,6 +131,13 @@ class RuntimeState:
                 batch_size, n_heads, hd, n, device=self.device, dtype=ssm_dtype
             )
 
+    @property
+    def _mamba_has_state(self) -> bool:
+        return any(self._mamba_ready)
+
+    def mamba_ready(self, layer: int) -> bool:
+        return bool(self._mamba_ready[layer])
+
     def empty(self) -> bool:
         return self._token_len == 0 and self.kv.empty() and not self._mamba_has_state
 
@@ -142,7 +150,7 @@ class RuntimeState:
 
     def clear(self) -> None:
         self.kv.clear()
-        self._mamba_has_state = False
+        self._mamba_ready = [False] * self.n_layers
         self._token_len = 0
         for i, s in enumerate(self.conv_states):
             if s is not None:
@@ -166,7 +174,7 @@ class RuntimeState:
         self.conv_states[layer] = conv_state.to(
             device=self.device, dtype=self.dtype
         )
-        self._mamba_has_state = True
+        self._mamba_ready[layer] = True
 
     def update_conv_step(self, layer: int, x_t: torch.Tensor) -> torch.Tensor:
         """Roll conv cache and insert new token features. x_t: [B, 1, conv_dim]."""
@@ -175,11 +183,11 @@ class RuntimeState:
         state = state.roll(shifts=-1, dims=-1)
         state[:, :, -1] = x_t[:, 0, :].to(dtype=state.dtype)
         self.conv_states[layer] = state
-        self._mamba_has_state = True
+        self._mamba_ready[layer] = True
         return state
 
     def update_ssm(self, layer: int, ssm_state: torch.Tensor) -> None:
         self.ssm_states[layer] = ssm_state.to(
             device=self.device, dtype=self.ssm_dtype
         )
-        self._mamba_has_state = True
+        self._mamba_ready[layer] = True

@@ -60,7 +60,7 @@ class Capabilities:
 def inspect_capabilities(model_dir: str | Path) -> Capabilities:
     """Parse config only — no weight load. Safe for agents to probe first.
 
-    Raises UnsupportedRecipeError if config.json is not llama or nemotron_h.
+    Raises UnsupportedRecipeError if config.json is not a recipe we implement.
     """
     model_dir = Path(model_dir)
     config = ModelConfig.from_pretrained(model_dir)
@@ -70,7 +70,7 @@ def inspect_capabilities(model_dir: str | Path) -> Capabilities:
     has_mamba = any(s.mixer == MixerKind.MAMBA2 for s in layers)
     has_moe = any(s.ffn == FfnKind.MOE for s in layers)
     has_dense = any(s.ffn == FfnKind.DENSE_MLP for s in layers)
-    rope = has_attn and recipe_id == "llama"
+    rope = config.pos_kind == "rope"
 
     nvfp4, fp8, mtp = detect_quant_flags(config.raw or {}, model_dir.name)
     missing = detect_missing(config.raw or {}, model_dir.name)
@@ -81,12 +81,19 @@ def inspect_capabilities(model_dir: str | Path) -> Capabilities:
         notes.append("mamba2 scheduled — sequential SSM path")
     if has_moe:
         notes.append("moe scheduled — router+shared expert path")
+    if (model_dir / "chat_template.jinja").is_file() or (
+        (model_dir / "tokenizer_config.json").is_file()
+        and "chat_template" in (model_dir / "tokenizer_config.json").read_text(encoding="utf-8", errors="ignore")
+    ):
+        notes.append("chat template present — generate() wraps raw prompts")
+    if (model_dir / "generation_config.json").is_file():
+        notes.append("generation_config.json eos/stop ids used automatically")
     if "mtp_decode" in missing:
         notes.append("MTP advertised — greedy still works; speculative decode not wired")
-    if "nvfp4_runtime" in missing:
-        notes.append("NVFP4 advertised — dequant/fused path not wired yet")
-    if "fp8_runtime" in missing:
-        notes.append("FP8 advertised — load path not wired yet")
+    if nvfp4:
+        notes.append("NVFP4 advertised — dequant-on-load (not fused)")
+    if fp8:
+        notes.append("FP8 advertised — dequant-on-load (not fused)")
 
     return Capabilities(
         recipe_id=recipe_id,
@@ -128,6 +135,8 @@ class Engine:
         *,
         max_new_tokens: int = 32,
         use_cache: bool = True,
+        apply_chat_template: bool | None = None,
+        enable_thinking: bool = False,
     ) -> str:
         return "".join(
             generate_greedy(
@@ -136,6 +145,8 @@ class Engine:
                 prompt,
                 max_new_tokens=max_new_tokens,
                 use_cache=use_cache,
+                apply_chat_template=apply_chat_template,
+                enable_thinking=enable_thinking,
             )
         )
 
@@ -145,6 +156,8 @@ class Engine:
         *,
         max_new_tokens: int = 32,
         use_cache: bool = True,
+        apply_chat_template: bool | None = None,
+        enable_thinking: bool = False,
     ) -> Iterator[str]:
         yield from generate_greedy(
             self.model,
@@ -152,6 +165,8 @@ class Engine:
             prompt,
             max_new_tokens=max_new_tokens,
             use_cache=use_cache,
+            apply_chat_template=apply_chat_template,
+            enable_thinking=enable_thinking,
         )
 
     def info(self) -> dict[str, Any]:

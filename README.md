@@ -1,159 +1,93 @@
-# infer — DIY hybrid decoder engine
+# infer — DIY hybrid decoder
 
-Load HF safetensors, run a from-scratch decoder forward, and greedy-generate
-with a KV cache. Today: dense Llama (Phase 0–2 + Phase R schedule refactor).
-Next: Nemotron Nano hybrid (Mamba / Attn / MoE), then Super (+ MTP).
+From-scratch inference: HuggingFace folder in (`config.json` + safetensors) → logits → greedy tokens.
 
-## Setup
+Works today: drop in `config.json` + weights (safetensors or GGUF). Recipes: Llama, Mistral, Qwen2/3, Yi, Gemma, Phi-3, Mixtral, Llama 4, GPT-2, GPT-NeoX, GPT-OSS, DeepSeek V3, Nemotron-H (Nano + Super LatentMoE). NVFP4/FP8 dequant on load; MTP weights load (greedy uses the main head).  
+North star: **Nemotron NVFP4 fused on DGX Spark**, agent-runnable.
+
+## How to read `engine/`
+
+Read this **in order**. It is the same story as `~/Projects/Scratch/inference.py`, split into modules. Stop after Pass 1 if you only want Llama. Come back with questions.
+
+Skip `__init__.py`, `__main__.py`, `__pycache__`.
+
+### Pass 1 — Llama (the path you already understand)
+
+Same loop you know: embed → (norm → attention → residual → norm → MLP → residual) × N → final norm → lm_head → argmax.
+
+| # | File | What to look for |
+|---|---|---|
+| 1 | [`engine/chat.py`](engine/chat.py) | CLI. `--inspect` vs load + `--prompt`. Starts at `main()`. |
+| 2 | [`engine/detect.py`](engine/detect.py) | Folder in, no register. `config.json` → `llama` or `nemotron_h`. |
+| 3 | [`engine/config.py`](engine/config.py) | Sizes from `config.json` (`hidden_size`, heads, layers). Skim `from_pretrained`; skip `expected_shapes` until weights. |
+| 4 | [`engine/tokenizer.py`](engine/tokenizer.py) | Text ↔ ids. Short. |
+| 5 | [`engine/weights.py`](engine/weights.py) | HF tensor names → engine names. Read `_map_llama_hf_name` first; ignore Nemotron map. Then `load_weights`. |
+| 6 | [`engine/layers/norm.py`](engine/layers/norm.py) | RMSNorm. |
+| 7 | [`engine/layers/rope.py`](engine/layers/rope.py) | Cos/sin + `apply_rope`. |
+| 8 | [`engine/layers/attention.py`](engine/layers/attention.py) | **Q, K, V live here.** RoPE, causal mask, softmax, mix V, `o_proj`. Cache append is extra vs scratch. |
+| 9 | [`engine/layers/mlp.py`](engine/layers/mlp.py) | SwiGLU. One token, no other rows. |
+| 10 | [`engine/schedule.py`](engine/schedule.py) | Llama = every layer `attention + dense_mlp`. |
+| 11 | [`engine/layers/block.py`](engine/layers/block.py) | One layer: mixer then FFN, both with residual. This is the `x = x + attn; x = x + mlp` you already have. |
+| 12 | [`engine/model.py`](engine/model.py) | `DecoderModel.forward`: embed, RoPE tables, **for spec in layers**, lm_head. |
+| 13 | [`engine/cache.py`](engine/cache.py) | `KVCache` only (top of file). Prefill writes K/V; decode appends. Scratch file had none of this. |
+| 14 | [`engine/generate.py`](engine/generate.py) | `generate_greedy`: encode → forward → argmax → append. `use_cache=True` is the fast path. |
+
+After Pass 1 you can trace: `python -m engine.chat --model ~/models/Llama-3.2-1B-Instruct --prompt "..."`.
+
+### Pass 2 — Hybrid + agents (when you come back)
+
+| File | What to look for |
+|---|---|
+| [`engine/schedule.py`](engine/schedule.py) | `hybrid_override_pattern`: `M` / `E` / `*` |
+| [`engine/layers/moe.py`](engine/layers/moe.py) | Router + top-k + shared expert (replaces dense MLP on `E` layers) |
+| [`engine/layers/mamba2.py`](engine/layers/mamba2.py) | SSM mixer (replaces attention on `M` layers) |
+| [`engine/cache.py`](engine/cache.py) | `RuntimeState` = KV + Mamba conv/SSM |
+| [`engine/agent_api.py`](engine/agent_api.py) | `inspect_capabilities` / `load_engine` — public agent surface |
+| [`engine/capabilities.py`](engine/capabilities.py) | Older capability dict (Spark also has this) |
+| [`engine/runtime.py`](engine/runtime.py) | Older handle API; prefer `agent_api.py` if they overlap |
+
+### Not yet
+
+NVFP4/FP8 dequant-on-load. MTP speculative decode is listed in `missing` (`mtp_decode`) but greedy still runs.
+
+## Run (Spark)
 
 ```bash
 cd ~/Projects/infer
-python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
 export PYTHONPATH=~/Projects/infer
-```
 
-## Run (plug-and-play)
-
-**Inspect** a checkpoint (config only — no weight load):
-
-```bash
 python -m engine.chat --model testdata/nemotron3-nano-30b-a3b --inspect
-```
 
-**Load + generate** (Spark, Llama 1B already on disk):
-
-```bash
 python -m engine.chat --model ~/models/Llama-3.2-1B-Instruct --device cuda \
   --prompt "The capital of France is" --max-new-tokens 32
 ```
-
-**From Python (agents):**
 
 ```python
 from engine.agent_api import inspect_capabilities, load_engine
 
 print(inspect_capabilities("testdata/nemotron3-nano-30b-a3b").to_dict())
-# can_run / recipe_id / missing tell the agent if this folder will load
 eng = load_engine("~/models/Llama-3.2-1B-Instruct", device="cuda")
 print(eng.generate("The capital of France is", max_new_tokens=16))
 ```
 
+Toy walkthrough (no engine modules): `~/Projects/Scratch/inference.py`.
+
 ## Tests
 
 ```bash
-# unit tests (schedule, agent caps, MoE, Mamba, Nano name-map, dense forward)
 pytest -q
-
-# also run integration if weights exist
-pytest -q -m integration
-
-# Spark CUDA Llama load+generate
-pytest -q -m spark
+pytest -q -m spark    # CUDA Llama 1B
 ```
 
-Download weights (gated — accept the license on HF, then login):
-
 ```bash
-huggingface-cli login
 python scripts/download_llama.py --out ~/models/Llama-3.2-1B-Instruct
 python scripts/download_nano.py --out ~/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 ```
 
-## Phase 0 load
-
-```bash
-source .venv/bin/activate
-export PYTHONPATH=~/Projects/infer
-python -m engine.chat --model ~/models/Llama-3.2-1B-Instruct --device cuda
-```
-
-Success looks like `load_ok=true` plus param count / dtype / device.
-
-## Generate (Phase 2 — KV cache on by default)
-
-```bash
-python -m engine.chat --model ~/models/Llama-3.2-1B-Instruct --device cuda \
-  --prompt "The capital of France is" --max-new-tokens 32
-```
-
-Disable cache (Phase 1 full recompute): add `--no-cache`.
-
-Parity:
+Parity vs HuggingFace:
 
 ```bash
 python scripts/parity_check.py --model ~/models/Llama-3.2-1B-Instruct --device cuda
 python scripts/cache_parity_check.py --model ~/models/Llama-3.2-1B-Instruct --device cuda
-```
-
-### Smoke test without Meta gate access
-
-A tiny public Llama-shaped fixture is under `testdata/tiny-random-llama`
-(from `hf-internal-testing/tiny-random-LlamaForCausalLM`). Same load path:
-
-```bash
-export PYTHONPATH=~/Projects/infer
-python -m engine.chat --model testdata/tiny-random-llama --device cuda --dtype bfloat16
-```
-
-## Agent plug-and-play
-
-```python
-from engine.agent_api import inspect_capabilities, load_engine
-
-caps = inspect_capabilities("~/models/...")          # config only
-eng = load_engine("~/models/Llama-3.2-1B-Instruct")  # full load
-print(eng.info()["capabilities"])
-print(eng.generate("The capital of France is", max_new_tokens=16))
-```
-
-CLI inspect (no weights):
-
-```bash
-python -m engine.chat --model testdata/nemotron3-nano-30b-a3b --inspect
-```
-
-North star: **Nemotron NVFP4 on DGX Spark**, agent-runnable (MTP with Super later).
-
-## Hybrid schedule (Phase R / N0 / N2 / N3)
-
-Dense Llama still works. Nemotron-H configs (`hybrid_override_pattern`) build a
-per-layer schedule (`M`=Mamba2, `E`=MoE, `*`=Attention).
-
-```bash
-python scripts/schedule_smoke.py
-python scripts/nano_map_check.py --model testdata/nemotron3-nano-30b-a3b
-python scripts/moe_smoke.py
-```
-
-Full Nano weight load belongs on the Spark (VRAM / disk). MoE path is
-implemented (synthetic smoke). Next: Mamba-2 + dual cache (N3), then quant,
-then Super/MTP.
-
-## Layout
-
-| Path | Role |
-|---|---|
-| `engine/config.py` | `config.json` → `ModelConfig` + layer schedule |
-| `engine/schedule.py` | `LayerSpec` (mixer + FFN kinds per layer) |
-| `engine/weights.py` | safetensors → rename → validate → bf16 → CUDA |
-| `engine/tokenizer.py` | HF tokenizer wrapper |
-| `engine/layers/` | RMSNorm, RoPE, GQA, SwiGLU; MoE/Mamba stubs |
-| `engine/model.py` | `DecoderModel` scheduled forward → logits |
-| `engine/cache.py` | per-layer K/V cache |
-| `engine/generate.py` | greedy generate (cached prefill/decode) |
-| `engine/chat.py` | load + optional `--prompt` |
-| `scripts/parity_check.py` | vs HuggingFace |
-| `scripts/nano_map_check.py` | Nano config + index name-map check |
-| `testdata/nemotron3-nano-30b-a3b/` | Nano `config.json` + weight index |
-| `docs/llama-3.2-1b-config.annotated.md` | commented config walkthrough |
-
-## Load pipeline
-
-```text
-disk safetensors → CPU (HF names) → rename map → shape checks
-  → bf16 cast → .to(cuda) → GPU tensors ready for later matmuls
-config.json → ModelConfig → expected shapes
-tokenizer files → encode/decode
 ```

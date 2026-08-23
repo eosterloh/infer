@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from engine.config import ModelConfig
-from engine.layers.attention import attention
+from engine.layers.attention import attention_from_weights
 from engine.layers.mamba2 import mamba2
-from engine.layers.mlp import mlp
+from engine.layers.mlp import mlp_from_weights
 from engine.layers.moe import moe
-from engine.layers.norm import rms_norm
+from engine.layers.norm import apply_norm
 from engine.schedule import FfnKind, LayerSpec, MixerKind
 
 if TYPE_CHECKING:
@@ -32,27 +32,16 @@ def decoder_block(
     """One scheduled layer: optional mixer residual + optional FFN residual."""
     p = f"layers.{spec.index}"
     layer = spec.index
+    kind = config.norm_kind
 
     if spec.mixer == MixerKind.ATTENTION:
-        h = rms_norm(x, weights[f"{p}.input_norm.weight"], config.rms_norm_eps)
-        h = attention(
-            h,
-            weights[f"{p}.attn.q.weight"],
-            weights[f"{p}.attn.k.weight"],
-            weights[f"{p}.attn.v.weight"],
-            weights[f"{p}.attn.o.weight"],
-            cos,
-            sin,
-            nq=config.num_attention_heads,
-            nkv=config.num_key_value_heads,
-            hd=config.head_dim,
-            cache=cache,
-            layer=layer,
-            use_rope=use_rope,
+        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
+        h = attention_from_weights(
+            h, weights, layer, cos, sin, config, cache=cache, use_rope=use_rope
         )
         x = x + h
     elif spec.mixer == MixerKind.MAMBA2:
-        h = rms_norm(x, weights[f"{p}.input_norm.weight"], config.rms_norm_eps)
+        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
         h = mamba2(h, weights, layer, config, cache=cache)
         x = x + h
     elif spec.mixer == MixerKind.NONE:
@@ -61,24 +50,14 @@ def decoder_block(
         raise ValueError(f"unknown mixer: {spec.mixer}")
 
     if spec.ffn == FfnKind.DENSE_MLP:
-        # Llama: post-attn norm. Nemotron-H MLP-only layer: prenorm is input_norm
-        # (and mixer is NONE — already applied above would be wrong).
-        if spec.mixer == MixerKind.NONE:
-            h = rms_norm(x, weights[f"{p}.input_norm.weight"], config.rms_norm_eps)
-        else:
-            h = rms_norm(x, weights[f"{p}.post_attn_norm.weight"], config.rms_norm_eps)
-        h = mlp(
-            h,
-            weights[f"{p}.mlp.gate.weight"],
-            weights[f"{p}.mlp.up.weight"],
-            weights[f"{p}.mlp.down.weight"],
-        )
+        nkey = f"{p}.input_norm" if spec.mixer == MixerKind.NONE else f"{p}.post_attn_norm"
+        h = apply_norm(x, weights, nkey, config.rms_norm_eps, kind)
+        act = config.mlp_hidden_act or config.hidden_act
+        h = mlp_from_weights(h, weights, layer, act)
         x = x + h
     elif spec.ffn == FfnKind.MOE:
-        if spec.mixer == MixerKind.NONE:
-            h = rms_norm(x, weights[f"{p}.input_norm.weight"], config.rms_norm_eps)
-        else:
-            h = rms_norm(x, weights[f"{p}.post_attn_norm.weight"], config.rms_norm_eps)
+        nkey = f"{p}.input_norm" if spec.mixer == MixerKind.NONE else f"{p}.post_attn_norm"
+        h = apply_norm(x, weights, nkey, config.rms_norm_eps, kind)
         h = moe(h, weights, layer, config)
         x = x + h
     elif spec.ffn == FfnKind.NONE:

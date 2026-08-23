@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 from engine.cache import KVCache, RuntimeState
 from engine.config import ModelConfig
-from engine.layers import build_inv_freq, build_rope_cos_sin, decoder_block, rms_norm
+from engine.layers import build_inv_freq, build_rope_cos_sin, decoder_block
+from engine.layers.norm import apply_norm
 from engine.schedule import MixerKind, build_schedule
 
 
@@ -21,13 +22,20 @@ class DecoderModel:
         self.device = sample.device
         self.dtype = sample.dtype
         self.layers = config.layers or build_schedule(config)
-        # Nemotron-H has attention layers but no positional embeddings / RoPE.
-        self.use_rope = (config.recipe_id == "llama") and any(
+        self.use_rope = (config.pos_kind == "rope") and any(
             s.mixer == MixerKind.ATTENTION for s in self.layers
         )
-        self._inv_freq = (
-            build_inv_freq(config, device=self.device) if self.use_rope else None
-        )
+        rope_dim = config.qk_rope_head_dim if config.attention_kind == "mla" else None
+        self._inv_freq = None
+        if self.use_rope:
+            self._inv_freq = build_inv_freq(config, device=self.device)
+            if rope_dim and self._inv_freq.numel() * 2 != rope_dim:
+                # rebuild inv_freq for MLA rotary dim
+                from engine.layers.rope import _inv_freq_default
+
+                self._inv_freq = _inv_freq_default(
+                    rope_dim, float(config.rope_theta), self.device
+                )
 
     def make_cache(
         self,
@@ -63,6 +71,14 @@ class DecoderModel:
         start_pos = cache.seq_len() if cache is not None else 0
 
         x = self.weights["embed.weight"][input_ids]
+        scale = self.config.embed_scale
+        if scale != 1.0:
+            x = x * scale
+        if self.config.pos_kind == "learned":
+            pos = torch.arange(
+                start_pos, start_pos + s, device=input_ids.device, dtype=torch.long
+            )
+            x = x + self.weights["pos_embed.weight"][pos]
 
         if self.use_rope:
             assert self._inv_freq is not None
@@ -86,14 +102,19 @@ class DecoderModel:
             )
 
         if cache is not None and hasattr(cache, "advance"):
-            # Token cursor for hybrid (KV may not update until first attn layer).
             if isinstance(cache, RuntimeState):
                 if start_pos == 0:
                     cache._token_len = s
                 else:
                     cache.advance(s)
 
-        x = rms_norm(x, self.weights["final_norm.weight"], self.config.rms_norm_eps)
+        x = apply_norm(
+            x,
+            self.weights,
+            "final_norm",
+            self.config.rms_norm_eps,
+            self.config.norm_kind,
+        )
         return F.linear(x, self.weights["lm_head.weight"])
 
     def num_params(self) -> int:

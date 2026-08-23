@@ -1,125 +1,19 @@
-"""Load safetensors, rename HF keys → engine keys, cast, place on device."""
+"""Load safetensors / GGUF, rename HF keys → engine keys, cast, place on device."""
 
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
 
 from engine.config import ModelConfig
+from engine.maps import is_quant_aux, map_gguf_name, map_hf_name
+from engine.quant import maybe_dequant_state
 
-
-def _map_llama_hf_name(hf_name: str) -> str | None:
-    """Map one Llama-style HF tensor name to our engine name."""
-    if hf_name == "model.embed_tokens.weight":
-        return "embed.weight"
-    if hf_name == "model.norm.weight":
-        return "final_norm.weight"
-    if hf_name == "lm_head.weight":
-        return "lm_head.weight"
-
-    m = re.match(r"^model\.layers\.(\d+)\.(.+)$", hf_name)
-    if not m:
-        return None
-    i, rest = m.group(1), m.group(2)
-    table = {
-        "self_attn.q_proj.weight": f"layers.{i}.attn.q.weight",
-        "self_attn.k_proj.weight": f"layers.{i}.attn.k.weight",
-        "self_attn.v_proj.weight": f"layers.{i}.attn.v.weight",
-        "self_attn.o_proj.weight": f"layers.{i}.attn.o.weight",
-        "mlp.gate_proj.weight": f"layers.{i}.mlp.gate.weight",
-        "mlp.up_proj.weight": f"layers.{i}.mlp.up.weight",
-        "mlp.down_proj.weight": f"layers.{i}.mlp.down.weight",
-        "input_layernorm.weight": f"layers.{i}.input_norm.weight",
-        "post_attention_layernorm.weight": f"layers.{i}.post_attn_norm.weight",
-    }
-    return table.get(rest)
-
-
-def _map_nemotron_h_hf_name(hf_name: str) -> str | None:
-    """Map Nemotron-H (Nano 3 / Super family) HF names → engine names."""
-    if hf_name == "backbone.embeddings.weight":
-        return "embed.weight"
-    if hf_name == "backbone.norm_f.weight":
-        return "final_norm.weight"
-    if hf_name == "lm_head.weight":
-        return "lm_head.weight"
-
-    m = re.match(r"^backbone\.layers\.(\d+)\.(.+)$", hf_name)
-    if not m:
-        return None
-    i, rest = m.group(1), m.group(2)
-
-    if rest == "norm.weight":
-        return f"layers.{i}.input_norm.weight"
-
-    # Attention mixer
-    attn = {
-        "mixer.q_proj.weight": f"layers.{i}.attn.q.weight",
-        "mixer.k_proj.weight": f"layers.{i}.attn.k.weight",
-        "mixer.v_proj.weight": f"layers.{i}.attn.v.weight",
-        "mixer.o_proj.weight": f"layers.{i}.attn.o.weight",
-    }
-    if rest in attn:
-        return attn[rest]
-
-    # Dense MLP mixer (pattern '-')
-    mlp = {
-        "mixer.up_proj.weight": f"layers.{i}.mlp.up.weight",
-        "mixer.down_proj.weight": f"layers.{i}.mlp.down.weight",
-    }
-    if rest in mlp:
-        return mlp[rest]
-
-    # MoE
-    if rest == "mixer.gate.weight":
-        return f"layers.{i}.moe.gate.weight"
-    if rest == "mixer.gate.e_score_correction_bias":
-        return f"layers.{i}.moe.gate.e_score_correction_bias"
-    if rest == "mixer.shared_experts.up_proj.weight":
-        return f"layers.{i}.moe.shared.up.weight"
-    if rest == "mixer.shared_experts.down_proj.weight":
-        return f"layers.{i}.moe.shared.down.weight"
-    em = re.match(r"^mixer\.experts\.(\d+)\.(up_proj|down_proj)\.weight$", rest)
-    if em:
-        e, which = em.group(1), em.group(2)
-        short = "up" if which == "up_proj" else "down"
-        return f"layers.{i}.moe.experts.{e}.{short}.weight"
-
-    # Mamba-2 mixer
-    mamba = {
-        "mixer.in_proj.weight": f"layers.{i}.mamba.in_proj.weight",
-        "mixer.out_proj.weight": f"layers.{i}.mamba.out_proj.weight",
-        "mixer.conv1d.weight": f"layers.{i}.mamba.conv1d.weight",
-        "mixer.conv1d.bias": f"layers.{i}.mamba.conv1d.bias",
-        "mixer.A_log": f"layers.{i}.mamba.A_log",
-        "mixer.D": f"layers.{i}.mamba.D",
-        "mixer.dt_bias": f"layers.{i}.mamba.dt_bias",
-        "mixer.norm.weight": f"layers.{i}.mamba.norm.weight",
-    }
-    if rest in mamba:
-        return mamba[rest]
-
-    return None
-
-
-def map_hf_name(hf_name: str, config: ModelConfig | None = None) -> str | None:
-    """Dispatch HF→engine rename from auto-detected recipe."""
-    recipe = getattr(config, "recipe_id", "") if config else ""
-    if not recipe and config is not None:
-        from engine.detect import detect_recipe_id
-
-        recipe = detect_recipe_id(config.raw or {"model_type": config.model_type})
-    if recipe == "nemotron_h" or (hf_name.startswith("backbone.") and recipe != "llama"):
-        return _map_nemotron_h_hf_name(hf_name)
-    return _map_llama_hf_name(hf_name)
-
-
-# Backward-compatible private name used in older call sites / tests.
-_map_hf_name = _map_llama_hf_name
+_map_hf_name = map_hf_name
+_map_llama_hf_name = map_hf_name
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -174,18 +68,37 @@ def load_weight_index(model_dir: str | Path) -> dict[str, str]:
     raise FileNotFoundError(f"no weight index under {model_dir}")
 
 
+def _maybe_transpose(name: str, tensor: torch.Tensor, config: ModelConfig) -> torch.Tensor:
+    """GPT-2 Conv1D is stored [in, out]; engine Linear wants [out, in]."""
+    if config.recipe_id != "gpt2":
+        return tensor
+    if name.endswith((".attn.c_attn.weight", ".attn.c_proj.weight", ".mlp.c_fc.weight", ".mlp.c_proj.weight")):
+        if tensor.dim() == 2:
+            return tensor.t().contiguous()
+    return tensor
+
+
+def _iter_hf_names(hf_names: list[str] | set[str]) -> list[str]:
+    return [n for n in sorted(hf_names) if not is_quant_aux(n)]
+
+
 def validate_name_map(
     config: ModelConfig, hf_names: list[str] | set[str]
 ) -> dict[str, str]:
     """Map all HF names; ensure they cover expected_shapes exactly.
 
     Returns engine_name → hf_name. Raises on unknown / missing / extra keys.
+    Quant scale/zero tensors are ignored (consumed during dequant).
     """
     mapped: dict[str, str] = {}
     unknown: list[str] = []
-    for hf_name in sorted(hf_names):
+    for hf_name in _iter_hf_names(hf_names):
         engine_name = map_hf_name(hf_name, config)
         if engine_name is None:
+            if map_gguf_name(hf_name) is None and hf_name.startswith(
+                ("rope_", "blk.")
+            ):
+                continue
             unknown.append(hf_name)
             continue
         if engine_name in mapped:
@@ -207,6 +120,8 @@ def validate_name_map(
 
     missing = sorted(expected - got)
     extra = sorted(got - expected)
+    # MTP extras mapped under mtp.* are allowed even if not in expected
+    extra = [e for e in extra if not e.startswith("mtp.")]
     if missing:
         raise KeyError(f"missing weights after map: {missing[:12]}")
     if extra:
@@ -253,6 +168,7 @@ def validate_shapes(config: ModelConfig, state: dict[str, torch.Tensor]) -> None
     expected = config.expected_shapes()
     missing = sorted(set(expected) - set(state))
     extra = sorted(set(state) - set(expected))
+    extra = [e for e in extra if not e.startswith("mtp.")]
 
     if config.tie_word_embeddings and "lm_head.weight" in missing:
         missing = [m for m in missing if m != "lm_head.weight"]
@@ -355,22 +271,51 @@ def load_weights(
     elif isinstance(dtype, str):
         dtype = _resolve_dtype(dtype)
 
+    from engine.gguf import find_gguf, load_gguf_state
+
+    gguf = find_gguf(model_dir)
+    has_st = (model_dir / "model.safetensors").is_file() or (
+        model_dir / "model.safetensors.index.json"
+    ).is_file() or bool(list(model_dir.glob("model-*.safetensors")))
+
+    if gguf is not None and not has_st:
+        _meta, state = load_gguf_state(gguf)
+        if config.tie_word_embeddings:
+            expected = set(config.expected_shapes())
+            expected.discard("lm_head.weight")
+        else:
+            expected = set(config.expected_shapes())
+        validate_shapes(config, state)
+        state = apply_tied_embeddings(config, state)
+        return {k: _cast_one(k, v, dtype, device) for k, v in state.items()}
+
     index = load_weight_index(model_dir)
     validate_name_map(config, index.keys())
 
     shards = _shard_paths(model_dir)
-    state: dict[str, torch.Tensor] = {}
+    hf_piece: dict[str, torch.Tensor] = {}
     for i, shard in enumerate(shards, start=1):
         print(f"  shard {i}/{len(shards)} {shard.name}", flush=True)
         piece = load_file(str(shard), device="cpu")
-        for hf_name, tensor in piece.items():
-            engine_name = map_hf_name(hf_name, config)
-            if engine_name is None:
-                raise KeyError(f"unmapped HF tensor during load: {hf_name}")
-            if engine_name in state:
-                raise RuntimeError(f"name map collision on {engine_name}")
-            state[engine_name] = _cast_one(engine_name, tensor, dtype, device)
+        overlap = set(hf_piece) & set(piece)
+        if overlap:
+            raise RuntimeError(f"duplicate tensors across shards: {sorted(overlap)[:5]}")
+        hf_piece.update(piece)
         del piece
+
+    hf_piece = maybe_dequant_state(hf_piece)
+    state: dict[str, torch.Tensor] = {}
+    for hf_name, tensor in hf_piece.items():
+        if is_quant_aux(hf_name):
+            continue
+        engine_name = map_hf_name(hf_name, config)
+        if engine_name is None:
+            raise KeyError(f"unmapped HF tensor during load: {hf_name}")
+        if engine_name in state:
+            raise RuntimeError(f"name map collision on {engine_name}")
+        tensor = _maybe_transpose(engine_name, tensor, config)
+        state[engine_name] = _cast_one(engine_name, tensor, dtype, device)
+    del hf_piece
 
     validate_shapes(config, state)
     state = apply_tied_embeddings(config, state)

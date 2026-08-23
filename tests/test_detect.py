@@ -38,8 +38,8 @@ def test_detect_nano(nano_dir: Path) -> None:
 
 def test_unknown_recipe_fails(tmp_path: Path) -> None:
     raw = {
-        "architectures": ["GptOssForCausalLM"],
-        "model_type": "gpt_oss",
+        "architectures": ["BertForMaskedLM"],
+        "model_type": "bert",
         "vocab_size": 32,
         "hidden_size": 16,
         "intermediate_size": 32,
@@ -56,12 +56,12 @@ def test_unknown_recipe_fails(tmp_path: Path) -> None:
     with pytest.raises(UnsupportedRecipeError) as ei:
         ModelConfig.from_pretrained(tmp_path)
     msg = str(ei.value)
-    assert "gpt_oss" in msg
+    assert "bert" in msg
     for name in KNOWN_RECIPES:
         assert name in msg
 
 
-def test_nvfp4_folder_cannot_run_yet(tmp_path: Path) -> None:
+def test_nvfp4_folder_dequants_on_load(tmp_path: Path) -> None:
     raw = {
         "architectures": ["NemotronHForCausalLM"],
         "model_type": "nemotron_h",
@@ -88,11 +88,11 @@ def test_nvfp4_folder_cannot_run_yet(tmp_path: Path) -> None:
     folder.mkdir()
     (folder / "config.json").write_text(json.dumps(raw))
     missing = detect_missing(raw, folder.name)
-    assert "nvfp4_runtime" in missing
-    assert can_run("nemotron_h", missing) is False
+    assert "nvfp4_runtime" not in missing
+    assert can_run("nemotron_h", missing) is True
     caps = inspect_capabilities(folder)
-    assert caps.can_run is False
-    assert "nvfp4_runtime" in caps.missing
+    assert caps.can_run is True
+    assert caps.nvfp4 is True
 
 
 def test_detect_recipe_id_from_raw() -> None:
@@ -104,3 +104,30 @@ def test_detect_recipe_id_from_raw() -> None:
         )
         == "nemotron_h"
     )
+
+
+def test_generation_config_eos_overrides_config_json(tmp_path: Path) -> None:
+    raw = {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 128,
+        "tie_word_embeddings": True,
+        "torch_dtype": "float32",
+        "eos_token_id": 2,
+        "bos_token_id": 1,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": [2, 11], "bos_token_id": 1})
+    )
+    cfg = ModelConfig.from_pretrained(tmp_path)
+    assert cfg.eos_token_id == [2, 11]

@@ -61,6 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable cache (full recompute each step)",
     )
+    p.add_argument(
+        "--raw-prompt",
+        action="store_true",
+        help="Do not wrap --prompt in the folder's chat template",
+    )
+    p.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Leave the reasoning/think prefix open (Nano default template)",
+    )
     return p
 
 
@@ -105,7 +115,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"prompt={args.prompt!r}")
     use_cache = not args.no_cache
+    apply_tmpl = False if args.raw_prompt else None
     print(f"use_cache={use_cache}")
+    print(f"apply_chat_template={not args.raw_prompt}")
     print("generate:", end="", flush=True)
     pieces: list[str] = []
     for piece in generate_greedy(
@@ -114,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         args.prompt,
         max_new_tokens=args.max_new_tokens,
         use_cache=use_cache,
+        apply_chat_template=apply_tmpl,
+        enable_thinking=args.enable_thinking,
     ):
         pieces.append(piece)
         print(piece, end="", flush=True)
