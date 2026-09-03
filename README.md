@@ -2,7 +2,7 @@
 
 From-scratch inference: HuggingFace folder in (`config.json` + safetensors) → logits → greedy tokens.
 
-Works today: drop in `config.json` + weights (safetensors or GGUF). Recipes: Llama, Mistral, Qwen2/3, Qwen3.5/Qwen3.8 (hybrid text, image/video, native MTP), Yi, Gemma, Phi-3, Mixtral, Llama 4, GPT-2, GPT-NeoX, GPT-OSS, DeepSeek V3, Nemotron-H (Nano + Super LatentMoE). NVFP4/FP8 dequant on load.  
+Works today: drop in `config.json` + weights (safetensors or GGUF). Recipes: Llama, Mistral, Qwen2/3, Qwen3.5/Qwen3.8 (hybrid text, image/video, native MTP), Yi, Gemma, Phi-3, Mixtral, Llama 4, GPT-2, GPT-NeoX, GPT-OSS, DeepSeek V3, Nemotron-H (Nano + Super LatentMoE). NVFP4/FP8 dequant on load.
 North star: **Nemotron NVFP4 fused on DGX Spark**, agent-runnable.
 
 ## How to read `engine/`
