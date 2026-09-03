@@ -213,3 +213,48 @@ def test_mtp_greedy_hybrid_rollback_is_lossless(tmp_path: Path) -> None:
     long_logits = model.forward(long)
     assert torch.allclose(batch_logits[0, -3:], short_logits[0], atol=1e-4, rtol=1e-4)
     assert torch.allclose(batch_logits[1], long_logits[0], atol=1e-4, rtol=1e-4)
+
+    prompt_ids = torch.tensor([[2, 3, 4]])
+    verify_ids = torch.tensor([[13, 14, 15, 16]])
+    for accepted_tokens in range(1, verify_ids.shape[1] + 1):
+        transactional = model.make_cache(
+            batch_size=1, device="cpu", dtype=torch.float32
+        )
+        model.forward(prompt_ids, cache=transactional)
+        transactional.begin_speculative()
+        model.forward(verify_ids, cache=transactional)
+        transactional.commit_speculative(accepted_tokens)
+
+        sequential = model.make_cache(
+            batch_size=1, device="cpu", dtype=torch.float32
+        )
+        accepted_ids = torch.cat(
+            (prompt_ids, verify_ids[:, :accepted_tokens]), dim=1
+        )
+        model.forward(accepted_ids, cache=sequential)
+        assert transactional.seq_len() == sequential.seq_len()
+        for actual_state, expected_state in zip(
+            transactional.conv_states, sequential.conv_states
+        ):
+            if actual_state is not None:
+                assert expected_state is not None
+                assert torch.allclose(
+                    actual_state, expected_state, atol=1e-5, rtol=1e-5
+                )
+        for actual_state, expected_state in zip(
+            transactional.ssm_states, sequential.ssm_states
+        ):
+            if actual_state is not None:
+                assert expected_state is not None
+                assert torch.allclose(
+                    actual_state, expected_state, atol=1e-5, rtol=1e-5
+                )
+        for actual_k, expected_k in zip(transactional.kv.k, sequential.kv.k):
+            if actual_k is not None:
+                assert expected_k is not None
+                assert torch.allclose(actual_k, expected_k, atol=1e-5, rtol=1e-5)
+
+        next_id = torch.tensor([[17]])
+        actual_logits = model.forward(next_id, cache=transactional)
+        expected_logits = model.forward(next_id, cache=sequential)
+        assert torch.allclose(actual_logits, expected_logits, atol=1e-4, rtol=1e-4)

@@ -253,8 +253,8 @@ def generate_mtp_greedy(
         prefill_mask = batch.get("attention_mask")
 
     target_cache = model.make_cache(batch_size=1, device=device, dtype=model.dtype)
-    if not hasattr(target_cache, "snapshot"):
-        raise TypeError("MTP requires a hybrid target cache with snapshot/restore")
+    if not hasattr(target_cache, "begin_speculative"):
+        raise TypeError("MTP requires a transactional hybrid target cache")
     if prefill_embeddings is None:
         logits, target_hidden = model.forward(
             tokens,
@@ -327,17 +327,21 @@ def generate_mtp_greedy(
             draft_input = int(torch.argmax(draft_logits[0, -1]).item())
             drafts.append(draft_input)
 
-        snapshot = target_cache.snapshot()  # type: ignore[union-attr]
+        target_cache.begin_speculative()  # type: ignore[union-attr]
         target_start = target_cache.seq_len()
         verify_ids = torch.tensor(
             [[seed, *drafts]], device=device, dtype=torch.long
         )
-        verify_logits, verify_hidden = model.forward(
-            verify_ids,
-            cache=target_cache,
-            position_ids=positions(target_start, k + 1),
-            return_hidden=True,
-        )
+        try:
+            verify_logits, verify_hidden = model.forward(
+                verify_ids,
+                cache=target_cache,
+                position_ids=positions(target_start, k + 1),
+                return_hidden=True,
+            )
+        except Exception:
+            target_cache.cancel_speculative()  # type: ignore[union-attr]
+            raise
         assert isinstance(verify_logits, torch.Tensor)
         target_next = torch.argmax(verify_logits[0], dim=-1).tolist()
         accepted = 0
@@ -351,6 +355,7 @@ def generate_mtp_greedy(
         round_tokens = [seed, *drafts[:accepted]]
         if accepted == k:
             bonus = int(target_next[k])
+            target_cache.finish_speculative()  # type: ignore[union-attr]
             # Keep the MTP KV stream aligned through the final accepted draft.
             mtp.forward(
                 torch.tensor([[drafts[-1]]], device=device, dtype=torch.long),
@@ -362,18 +367,9 @@ def generate_mtp_greedy(
             seed = bonus
         else:
             replacement = int(target_next[accepted])
-            target_cache.restore(snapshot)  # type: ignore[union-attr]
-            replay_ids = torch.tensor(
-                [[seed, *drafts[:accepted]]], device=device, dtype=torch.long
-            )
-            _, replay_hidden = model.forward(
-                replay_ids,
-                cache=target_cache,
-                position_ids=positions(target_start, 1 + accepted),
-                return_hidden=True,
-            )
+            target_cache.commit_speculative(1 + accepted)  # type: ignore[union-attr]
             mtp_cache.truncate(mtp_base + 1 + accepted)
-            previous_hidden = replay_hidden[:, -1:]
+            previous_hidden = verify_hidden[:, accepted : accepted + 1]
             seed = replacement
 
         for token_id in round_tokens:

@@ -32,6 +32,7 @@ def _gated_delta_recurrent(
     g_log: torch.Tensor,
     beta: torch.Tensor,
     state: torch.Tensor | None,
+    trajectory: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """query/key/value: [B, S, H, D]; g_log/beta: [B, S, H]; state: [B, H, Dk, Dv]."""
     query = _l2norm(query)
@@ -61,6 +62,8 @@ def _gated_delta_recurrent(
         kv_mem = (rec * k_t.unsqueeze(-1)).sum(dim=-2)
         delta = (v_t - kv_mem) * beta_t
         rec = rec + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        if trajectory is not None:
+            trajectory.append(rec)
         outs.append((rec * q_t.unsqueeze(-1)).sum(dim=-2))
     out = torch.stack(outs, dim=2).transpose(1, 2).contiguous().to(dtype=query.dtype)
     return out, rec
@@ -226,15 +229,25 @@ def gated_delta_net(
     elif cache is not None and cache.mamba_ready(layer) and cache.ssm_states[layer] is not None:
         initial = cache.ssm_states[layer]
 
+    trajectory: list[torch.Tensor] | None = (
+        [] if cache is not None and cache.is_speculating else None
+    )
     use_chunk = (
         x.is_cuda
         and s >= 64
+        and trajectory is None
         and os.environ.get("INFER_GDN_CHUNK", "1") != "0"
     )
-    delta_rule = _gated_delta_chunk if use_chunk else _gated_delta_recurrent
-    core, rec = delta_rule(query, key, value, g_log, beta, initial)
+    if use_chunk:
+        core, rec = _gated_delta_chunk(query, key, value, g_log, beta, initial)
+    else:
+        core, rec = _gated_delta_recurrent(
+            query, key, value, g_log, beta, initial, trajectory
+        )
     if cache is not None:
         cache.update_ssm(layer, rec)
+        if trajectory is not None:
+            cache.record_gdn_speculation(layer, trajectory, mixed)
 
     core = core.reshape(b, s, n_v, dv)
     core_n = rms_norm(core, norm_w, config.rms_norm_eps)

@@ -165,6 +165,8 @@ class RuntimeState:
         # take the decode path during a 1-token prefill.
         self._mamba_ready: list[bool] = [False] * self.n_layers
         self._token_len = 0
+        self._spec_base: dict[str, object] | None = None
+        self._spec_gdn: dict[int, tuple[list[torch.Tensor], torch.Tensor]] = {}
 
         for spec in self.layers:
             if spec.mixer == MixerKind.MAMBA2:
@@ -236,10 +238,92 @@ class RuntimeState:
         """Record that `n_tokens` were consumed (prefill sets absolute via replace)."""
         self._token_len += int(n_tokens)
 
+    @property
+    def is_speculating(self) -> bool:
+        return self._spec_base is not None
+
+    def begin_speculative(self) -> None:
+        """Begin a target verification transaction without cloning fixed state."""
+        if self._spec_base is not None:
+            raise RuntimeError("speculative transaction already active")
+        if any(spec.mixer == MixerKind.MAMBA2 for spec in self.layers):
+            raise NotImplementedError(
+                "transactional speculative commit is implemented for Gated DeltaNet"
+            )
+        self._spec_base = {
+            "token_len": self._token_len,
+            "kv_len": self.kv.seq_len(),
+            "ready": list(self._mamba_ready),
+            "conv": list(self.conv_states),
+            "ssm": list(self.ssm_states),
+        }
+        self._spec_gdn = {}
+
+    def record_gdn_speculation(
+        self,
+        layer: int,
+        recurrent_states: list[torch.Tensor],
+        mixed_inputs: torch.Tensor,
+    ) -> None:
+        if self._spec_base is None:
+            return
+        self._spec_gdn[layer] = (recurrent_states, mixed_inputs)
+
+    def commit_speculative(self, accepted_tokens: int) -> None:
+        """Commit one accepted verification prefix across KV, conv, and SSM."""
+        if self._spec_base is None:
+            raise RuntimeError("no speculative transaction active")
+        accepted_tokens = int(accepted_tokens)
+        if accepted_tokens < 1:
+            raise ValueError("verification must commit at least its target seed")
+        base = self._spec_base
+        self.kv.truncate(int(base["kv_len"]) + accepted_tokens)
+        self._token_len = int(base["token_len"]) + accepted_tokens
+        base_conv = list(base["conv"])  # type: ignore[arg-type]
+        for layer, (states, mixed) in self._spec_gdn.items():
+            if accepted_tokens > len(states):
+                raise ValueError(
+                    f"accepted {accepted_tokens} exceeds GDN trajectory {len(states)}"
+                )
+            self.ssm_states[layer] = states[accepted_tokens - 1]
+            previous = base_conv[layer]
+            assert previous is not None
+            joined = torch.cat(
+                (previous, mixed[:, :accepted_tokens].transpose(1, 2)), dim=-1
+            )
+            self.conv_states[layer] = joined[
+                :, :, -previous.shape[-1] :
+            ].contiguous()
+            self._mamba_ready[layer] = True
+        self._spec_base = None
+        self._spec_gdn = {}
+
+    def finish_speculative(self) -> None:
+        """Keep the full verified sequence and release transaction metadata."""
+        if self._spec_base is None:
+            raise RuntimeError("no speculative transaction active")
+        self._spec_base = None
+        self._spec_gdn = {}
+
+    def cancel_speculative(self) -> None:
+        """Restore state references if verification raises before commit."""
+        if self._spec_base is None:
+            return
+        base = self._spec_base
+        self.kv.truncate(int(base["kv_len"]))
+        self._token_len = int(base["token_len"])
+        self._mamba_ready = list(base["ready"])  # type: ignore[arg-type]
+        self.conv_states = list(base["conv"])  # type: ignore[arg-type]
+        self.ssm_states = list(base["ssm"])  # type: ignore[arg-type]
+        self._spec_base = None
+        self._spec_gdn = {}
+
     def clear(self) -> None:
         self.kv.clear()
         self._mamba_ready = [False] * self.n_layers
         self._token_len = 0
+        self._spec_base = None
+        self._spec_gdn = {}
         for i, s in enumerate(self.conv_states):
             if s is not None:
                 self.conv_states[i] = torch.zeros_like(s)
