@@ -78,6 +78,7 @@ def attention(
     rms_eps: float = 1e-6,
     output_gate: bool = False,
     qk_gemma: bool = False,
+    attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Causal GQA attention. x: [B, S_new, H]."""
     b, s_new, _ = x.shape
@@ -158,17 +159,28 @@ def attention(
         )
 
     scores = scores + causal
+    if attention_mask is not None:
+        if attention_mask.dim() != 2 or attention_mask.shape[0] != b:
+            raise ValueError(
+                f"expected attention_mask [B,S], got {tuple(attention_mask.shape)}"
+            )
+        key_mask = attention_mask[:, -s_total:].to(device=x.device, dtype=torch.bool)
+        scores = scores.masked_fill(~key_mask[:, None, None, :], float("-inf"))
     if sinks is not None:
         sink = sinks.reshape(1, -1, 1, 1).to(dtype=scores.dtype)
         scores = torch.cat([scores, sink.expand(b, nq, s_new, 1)], dim=-1)
         weights = torch.softmax(scores, dim=-1)[..., :-1].to(dtype=v.dtype)
     else:
         weights = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
+    weights = torch.nan_to_num(weights)
     out = torch.matmul(weights, v)
     out = out.transpose(1, 2).contiguous().view(b, s_new, nq * hd)
     if gate is not None:
         out = out * torch.sigmoid(gate)
-    return F.linear(out, w_o, b_o)
+    out = F.linear(out, w_o, b_o)
+    if attention_mask is not None:
+        out = out * attention_mask[:, -s_new:, None].to(dtype=out.dtype)
+    return out
 
 
 def attention_from_weights(
@@ -181,6 +193,7 @@ def attention_from_weights(
     cache: KVCache | RuntimeState | None = None,
     *,
     use_rope: bool = True,
+    attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     p = f"layers.{spec_index}"
     nq, nkv, hd = config.num_attention_heads, config.num_key_value_heads, config.head_dim
@@ -273,4 +286,5 @@ def attention_from_weights(
         rms_eps=config.rms_norm_eps,
         output_gate=config.attn_output_gate,
         qk_gemma=config.norm_kind == "gemma_rms",
+        attention_mask=attention_mask,
     )

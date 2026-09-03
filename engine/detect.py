@@ -69,17 +69,30 @@ def detect_recipe_id(raw: dict[str, Any]) -> str:
         return "phi3"
     if mt.startswith("gemma") or any("gemma" in a for a in arches):
         return "gemma"
-    if mt.startswith("qwen") and ("moe" in mt or any("moe" in a for a in arches)):
-        return "mixtral"
+    if mt in {"qwen3_next", "qwen3_next_text"} or any(
+        "qwen3next" in a or "qwen3_next" in a for a in arches
+    ):
+        raise UnsupportedRecipeError(
+            "qwen3-next uses fused GDN projections and is not the qwen3_5 recipe"
+        )
+    if mt in {"qwen3_5_moe", "qwen3_5_moe_text"} or any(
+        "qwen3_5" in a and "moe" in a for a in arches
+    ):
+        raise UnsupportedRecipeError(
+            "qwen3_5 MoE scheduling and expert weights are not implemented"
+        )
     if (
-        mt in {"qwen3_5", "qwen3_5_text", "qwen3_next", "qwen3_next_text"}
-        or any("qwen3_5" in a or "qwen3next" in a or "qwen3_next" in a for a in arches)
+        mt in {"qwen3_5", "qwen3_5_text"}
+        or any("qwen3_5" in a for a in arches)
         or (
-            isinstance(raw.get("layer_types"), list)
+            not mt
+            and isinstance(raw.get("layer_types"), list)
             and "linear_attention" in raw["layer_types"]
         )
     ):
         return "qwen3_5"
+    if mt.startswith("qwen") and ("moe" in mt or any("moe" in a for a in arches)):
+        return "mixtral"
     if mt in {"qwen3"} or any("qwen3" in a for a in arches):
         return "qwen3"
     if mt.startswith("qwen") or any("qwen" in a for a in arches):
@@ -131,17 +144,17 @@ def detect_quant_flags(
 def detect_missing(
     raw: dict[str, Any], folder_name: str = ""
 ) -> tuple[str, ...]:
-    """Runtime pieces advertised but not on the greedy path.
-
-    NVFP4/FP8 dequant-on-load is implemented, so those no longer block.
-    MTP speculative decode is still not wired; greedy uses the main LM head.
-    Vision towers are skipped; text greedy still runs.
-    """
+    """Runtime pieces advertised but not implemented for the detected recipe."""
     _nvfp4, _fp8, mtp = detect_quant_flags(raw, folder_name)
+    recipe_id = detect_recipe_id(raw)
     missing: list[str] = []
-    if mtp:
+    if mtp and recipe_id != "qwen3_5":
         missing.append("mtp_decode")
-    if raw.get("vision_config") and not raw.get("language_model_only"):
+    if (
+        raw.get("vision_config")
+        and not raw.get("language_model_only")
+        and recipe_id != "qwen3_5"
+    ):
         missing.append("vision")
     return tuple(missing)
 

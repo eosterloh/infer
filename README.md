@@ -2,7 +2,7 @@
 
 From-scratch inference: HuggingFace folder in (`config.json` + safetensors) → logits → greedy tokens.
 
-Works today: drop in `config.json` + weights (safetensors or GGUF). Recipes: Llama, Mistral, Qwen2/3, Yi, Gemma, Phi-3, Mixtral, Llama 4, GPT-2, GPT-NeoX, GPT-OSS, DeepSeek V3, Nemotron-H (Nano + Super LatentMoE). NVFP4/FP8 dequant on load; MTP weights load (greedy uses the main head).  
+Works today: drop in `config.json` + weights (safetensors or GGUF). Recipes: Llama, Mistral, Qwen2/3, Qwen3.5/Qwen3.8 (hybrid text, image/video, native MTP), Yi, Gemma, Phi-3, Mixtral, Llama 4, GPT-2, GPT-NeoX, GPT-OSS, DeepSeek V3, Nemotron-H (Nano + Super LatentMoE). NVFP4/FP8 dequant on load.  
 North star: **Nemotron NVFP4 fused on DGX Spark**, agent-runnable.
 
 ## How to read `engine/`
@@ -41,14 +41,13 @@ After Pass 1 you can trace: `python -m engine.chat --model ~/models/Llama-3.2-1B
 | [`engine/schedule.py`](engine/schedule.py) | `hybrid_override_pattern`: `M` / `E` / `*` |
 | [`engine/layers/moe.py`](engine/layers/moe.py) | Router + top-k + shared expert (replaces dense MLP on `E` layers) |
 | [`engine/layers/mamba2.py`](engine/layers/mamba2.py) | SSM mixer (replaces attention on `M` layers) |
+| [`engine/layers/gdn.py`](engine/layers/gdn.py) | Qwen Gated DeltaNet reference + chunked CUDA prefill |
+| [`engine/vision.py`](engine/vision.py) | Qwen image/video tower, merger, M-RoPE positions |
+| [`engine/mtp.py`](engine/mtp.py) | Native Qwen MTP draft layer sharing embed/lm_head |
 | [`engine/cache.py`](engine/cache.py) | `RuntimeState` = KV + Mamba conv/SSM |
 | [`engine/agent_api.py`](engine/agent_api.py) | `inspect_capabilities` / `load_engine` — public agent surface |
 | [`engine/capabilities.py`](engine/capabilities.py) | Older capability dict (Spark also has this) |
 | [`engine/runtime.py`](engine/runtime.py) | Older handle API; prefer `agent_api.py` if they overlap |
-
-### Not yet
-
-NVFP4/FP8 dequant-on-load. MTP speculative decode is listed in `missing` (`mtp_decode`) but greedy still runs.
 
 ## Run (Spark)
 
@@ -61,6 +60,9 @@ python -m engine.chat --model testdata/nemotron3-nano-30b-a3b --inspect
 
 python -m engine.chat --model ~/models/Llama-3.2-1B-Instruct --device cuda \
   --prompt "The capital of France is" --max-new-tokens 32
+
+python -m engine.chat --model ~/models/Qwen3.8-27B --device cuda \
+  --prompt "Write one sentence." --max-new-tokens 32 --mtp-draft-tokens 3
 ```
 
 ```python
@@ -69,6 +71,15 @@ from engine.agent_api import inspect_capabilities, load_engine
 print(inspect_capabilities("testdata/nemotron3-nano-30b-a3b").to_dict())
 eng = load_engine("~/models/Llama-3.2-1B-Instruct", device="cuda")
 print(eng.generate("The capital of France is", max_new_tokens=16))
+
+# Qwen image/video messages use the checkpoint's official AutoProcessor.
+# content may contain PIL images, local paths, URLs, or videos accepted by it.
+qwen = load_engine("~/models/Qwen3.8-27B", device="cuda")
+messages = [{"role": "user", "content": [
+    {"type": "image", "image": image},
+    {"type": "text", "text": "What is shown?"},
+]}]
+print(qwen.generate_messages(messages, max_new_tokens=32))
 ```
 
 Toy walkthrough (no engine modules): `~/Projects/Scratch/inference.py`.

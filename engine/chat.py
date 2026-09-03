@@ -10,7 +10,6 @@ from pathlib import Path
 import torch
 
 from engine.agent_api import inspect_capabilities, load_engine
-from engine.generate import generate_greedy
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Leave the reasoning/think prefix open (Nano default template)",
     )
+    p.add_argument(
+        "--mtp-draft-tokens",
+        type=int,
+        default=0,
+        help="Use native MTP with this many speculative tokens per verify step",
+    )
     return p
 
 
@@ -120,19 +125,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"apply_chat_template={not args.raw_prompt}")
     print("generate:", end="", flush=True)
     pieces: list[str] = []
-    for piece in generate_greedy(
-        eng.model,
-        eng.tokenizer,
+    for piece in eng.stream(
         args.prompt,
         max_new_tokens=args.max_new_tokens,
         use_cache=use_cache,
         apply_chat_template=apply_tmpl,
         enable_thinking=args.enable_thinking,
+        num_speculative_tokens=args.mtp_draft_tokens,
     ):
         pieces.append(piece)
         print(piece, end="", flush=True)
     print()
     print(f"completion={''.join(pieces)!r}")
+    if eng.last_mtp_stats is not None:
+        print(f"mtp_stats={json.dumps(eng.last_mtp_stats, sort_keys=True)}")
     print("generate_ok=true")
     return 0
 

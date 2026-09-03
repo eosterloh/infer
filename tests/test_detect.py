@@ -99,6 +99,10 @@ def test_detect_recipe_id_from_raw() -> None:
     assert detect_recipe_id({"model_type": "llama"}) == "llama"
     assert detect_recipe_id({"model_type": "qwen3"}) == "qwen3"
     assert detect_recipe_id({"model_type": "qwen3_5"}) == "qwen3_5"
+    with pytest.raises(UnsupportedRecipeError, match="fused GDN"):
+        detect_recipe_id({"model_type": "qwen3_next"})
+    with pytest.raises(UnsupportedRecipeError, match="MoE"):
+        detect_recipe_id({"model_type": "qwen3_5_moe"})
     assert (
         detect_recipe_id(
             {

@@ -29,6 +29,7 @@ def decoder_block(
     cache: KVCache | RuntimeState | None = None,
     *,
     use_rope: bool = True,
+    attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One scheduled layer: optional mixer residual + optional FFN residual."""
     p = f"layers.{spec.index}"
@@ -38,7 +39,15 @@ def decoder_block(
     if spec.mixer == MixerKind.ATTENTION:
         h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
         h = attention_from_weights(
-            h, weights, layer, cos, sin, config, cache=cache, use_rope=use_rope
+            h,
+            weights,
+            layer,
+            cos,
+            sin,
+            config,
+            cache=cache,
+            use_rope=use_rope,
+            attention_mask=attention_mask,
         )
         x = x + h
     elif spec.mixer == MixerKind.MAMBA2:
@@ -47,7 +56,9 @@ def decoder_block(
         x = x + h
     elif spec.mixer == MixerKind.GATED_DELTANET:
         h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
-        h = gated_delta_net(h, weights, layer, config, cache=cache)
+        h = gated_delta_net(
+            h, weights, layer, config, cache=cache, attention_mask=attention_mask
+        )
         x = x + h
     elif spec.mixer == MixerKind.NONE:
         pass

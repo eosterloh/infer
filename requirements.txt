@@ -1,6 +1,8 @@
 torch
+torchvision
 safetensors
 transformers
 accelerate
 huggingface_hub
+pillow
 pytest

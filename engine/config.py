@@ -227,6 +227,10 @@ class ModelConfig:
             shared_inter = (moe_inter or int(raw.get("intermediate_size", 0))) * int(
                 raw["n_shared_experts"]
             )
+        partial_rotary = raw.get("partial_rotary_factor")
+        if partial_rotary is None:
+            partial_rotary = 0.25 if recipe_id == "qwen3_5" else 1.0
+        linear_defaults = recipe_id == "qwen3_5"
 
         partial = cls(
             vocab_size=int(raw["vocab_size"]),
@@ -278,7 +282,8 @@ class ModelConfig:
             v_head_dim=_opt_int(raw, "v_head_dim"),
             first_k_dense_replace=_opt_int(raw, "first_k_dense_replace"),
             num_nextn_predict_layers=_opt_int(raw, "num_nextn_predict_layers")
-            or _opt_int(raw, "mtp_num_layers"),
+            or _opt_int(raw, "mtp_num_layers")
+            or _opt_int(raw, "mtp_num_hidden_layers"),
             sliding_window=sliding_i,
             qk_norm=qk_norm,
             intermediate_size_mlp=_opt_int(raw, "intermediate_size_mlp"),
@@ -286,12 +291,17 @@ class ModelConfig:
             attn_output_gate=bool(
                 raw.get("attn_output_gate", recipe_id == "qwen3_5")
             ),
-            partial_rotary_factor=float(raw.get("partial_rotary_factor") or 1.0),
-            linear_num_key_heads=_opt_int(raw, "linear_num_key_heads"),
-            linear_num_value_heads=_opt_int(raw, "linear_num_value_heads"),
-            linear_key_head_dim=_opt_int(raw, "linear_key_head_dim"),
-            linear_value_head_dim=_opt_int(raw, "linear_value_head_dim"),
-            linear_conv_kernel_dim=_opt_int(raw, "linear_conv_kernel_dim"),
+            partial_rotary_factor=float(partial_rotary),
+            linear_num_key_heads=_opt_int(raw, "linear_num_key_heads")
+            or (16 if linear_defaults else None),
+            linear_num_value_heads=_opt_int(raw, "linear_num_value_heads")
+            or (32 if linear_defaults else None),
+            linear_key_head_dim=_opt_int(raw, "linear_key_head_dim")
+            or (128 if linear_defaults else None),
+            linear_value_head_dim=_opt_int(raw, "linear_value_head_dim")
+            or (128 if linear_defaults else None),
+            linear_conv_kernel_dim=_opt_int(raw, "linear_conv_kernel_dim")
+            or (4 if linear_defaults else None),
             raw=raw,
         )
         schedule = build_schedule(partial)
@@ -354,7 +364,9 @@ class ModelConfig:
                         shapes[f"{p}.post_attn_norm.bias"] = (h,)
                 shapes.update(self._moe_shapes(p))
 
-        n_mtp = self.num_nextn_predict_layers or 0
+        # Qwen3.5's complete MTP transformer is loaded by engine.mtp, not as
+        # three legacy inline tensors in the target backbone state.
+        n_mtp = 0 if self.recipe_id == "qwen3_5" else (self.num_nextn_predict_layers or 0)
         for j in range(n_mtp):
             shapes[f"mtp.layers.{j}.enorm.weight"] = (h,)
             shapes[f"mtp.layers.{j}.hnorm.weight"] = (h,)
@@ -594,7 +606,8 @@ def normalize_raw(raw: dict[str, Any]) -> dict[str, Any]:
     """Fold nested text_config and GPT-2 / Mixtral aliases into one dict."""
     raw = dict(raw)
     if "text_config" in raw and isinstance(raw["text_config"], dict):
-        if "hidden_size" not in raw:
+        outer_model_type = str(raw.get("model_type", ""))
+        if "hidden_size" not in raw or outer_model_type.startswith("qwen3_5"):
             text = dict(raw["text_config"])
             arches = raw.get("architectures")
             mt = raw.get("model_type")

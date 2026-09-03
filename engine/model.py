@@ -71,6 +71,7 @@ class DecoderModel:
         *,
         inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         return_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Token IDs or precomputed embeddings → logits, optionally final hidden."""
@@ -95,6 +96,9 @@ class DecoderModel:
                 )
             x = inputs_embeds
         start_pos = cache.seq_len() if cache is not None else 0
+        effective_mask = attention_mask
+        if cache is not None:
+            effective_mask = cache.prepare_padding_mask(attention_mask, s)
 
         scale = self.config.embed_scale
         if scale != 1.0:
@@ -108,9 +112,13 @@ class DecoderModel:
         if self.use_rope:
             assert self._inv_freq is not None
             if position_ids is None:
-                position_ids = torch.arange(
-                    start_pos, start_pos + s, device=x.device, dtype=torch.long
-                )[None, :].expand(b, -1)
+                if effective_mask is not None:
+                    position_ids = effective_mask.long().cumsum(-1) - 1
+                    position_ids = position_ids.clamp_min(0)[:, -s:]
+                else:
+                    position_ids = torch.arange(
+                        start_pos, start_pos + s, device=x.device, dtype=torch.long
+                    )[None, :].expand(b, -1)
             if position_ids.dim() == 3:
                 section = (
                     (self.config.rope_scaling or {}).get("mrope_section")
@@ -137,6 +145,7 @@ class DecoderModel:
                 self.config,
                 cache=cache,
                 use_rope=self.use_rope,
+                attention_mask=effective_mask,
             )
 
         if cache is not None and hasattr(cache, "advance"):
@@ -146,6 +155,7 @@ class DecoderModel:
                 else:
                     cache.advance(s)
 
+        pre_norm_hidden = x
         hidden = apply_norm(
             x,
             self.weights,
@@ -155,7 +165,7 @@ class DecoderModel:
         )
         logits = F.linear(hidden, self.weights["lm_head.weight"])
         if return_hidden:
-            return logits, hidden
+            return logits, pre_norm_hidden
         return logits
 
     def num_params(self) -> int:

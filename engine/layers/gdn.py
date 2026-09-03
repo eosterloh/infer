@@ -1,11 +1,13 @@
-"""Gated DeltaNet mixer (Qwen3.5 / Qwen3.8) — sequential PyTorch path.
+"""Gated DeltaNet mixer (Qwen3.5 / Qwen3.8).
 
 Matches transformers `Qwen3_5GatedDeltaNet` + `torch_recurrent_gated_delta_rule`.
-Prefill walks the sequence; decode is one recurrent step. Not the chunk kernel.
+The recurrent path is the reference; CUDA prefill can use the equivalent
+64-token chunk rule to reduce Python launch overhead.
 """
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -64,12 +66,84 @@ def _gated_delta_recurrent(
     return out, rec
 
 
+def _gated_delta_chunk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_log: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor | None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Parallel-within-chunk form of the same gated delta recurrence."""
+    original_dtype = query.dtype
+    query, key = _l2norm(query), _l2norm(key)
+    q, k, v, beta_f, g = (
+        tensor.transpose(1, 2).contiguous().float()
+        for tensor in (query, key, value, beta, g_log)
+    )
+    b, heads, seq_len, k_dim = k.shape
+    v_dim = v.shape[-1]
+    pad = (chunk_size - seq_len % chunk_size) % chunk_size
+    q, k, v = [F.pad(tensor, (0, 0, 0, pad)) for tensor in (q, k, v)]
+    beta_f, g = [F.pad(tensor, (0, pad)) for tensor in (beta_f, g)]
+    total = seq_len + pad
+    q = q * (k_dim**-0.5)
+
+    v_beta = v * beta_f.unsqueeze(-1)
+    k_beta = k * beta_f.unsqueeze(-1)
+    q, k, v, k_beta, v_beta = [
+        tensor.reshape(b, heads, -1, chunk_size, tensor.shape[-1])
+        for tensor in (q, k, v, k_beta, v_beta)
+    ]
+    g = g.reshape(b, heads, -1, chunk_size).cumsum(dim=-1)
+    causal = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device)
+    )
+    decay = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp()).tril()
+    transform = -((k_beta @ k.transpose(-1, -2)) * decay).masked_fill(
+        causal, 0
+    )
+    for i in range(1, chunk_size):
+        row = transform[..., i, :i].clone()
+        prior = transform[..., :i, :i].clone()
+        transform[..., i, :i] = row + (row.unsqueeze(-1) * prior).sum(-2)
+    transform = transform + torch.eye(
+        chunk_size, dtype=transform.dtype, device=transform.device
+    )
+    v = transform @ v_beta
+    k_decay = transform @ (k_beta * g.exp().unsqueeze(-1))
+    rec = (
+        torch.zeros(b, heads, k_dim, v_dim, device=q.device, dtype=torch.float32)
+        if state is None
+        else state.float()
+    )
+    out = torch.zeros_like(v)
+    for i in range(total // chunk_size):
+        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
+        local = q_i @ k_i.transpose(-1, -2) * decay[:, :, i]
+        v_new = v_i - k_decay[:, :, i] @ rec
+        inter = (q_i * g[:, :, i, :, None].exp()) @ rec
+        out[:, :, i] = inter + local @ v_new
+        rec = (
+            rec * g[:, :, i, -1, None, None].exp()
+            + (
+                k_i
+                * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]
+            ).transpose(-1, -2)
+            @ v_new
+        )
+    out = out.reshape(b, heads, total, v_dim)[:, :, :seq_len]
+    return out.transpose(1, 2).contiguous().to(original_dtype), rec
+
+
 def gated_delta_net(
     x: torch.Tensor,
     weights: dict[str, torch.Tensor],
     layer: int,
     config: ModelConfig,
     cache: RuntimeState | None = None,
+    attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Qwen3.5 linear-attention mixer. x: [B, S, H] (already prenormed)."""
     if (
@@ -91,6 +165,8 @@ def gated_delta_net(
     value_dim = n_v * dv
     kernel = config.linear_conv_kernel_dim
     dtype = x.dtype
+    if attention_mask is not None:
+        x = x * attention_mask[:, -s:, None].to(device=x.device, dtype=x.dtype)
 
     mixed = F.linear(x, weights[f"{p}.gdn.in_proj_qkv.weight"])
     z = F.linear(x, weights[f"{p}.gdn.in_proj_z.weight"]).view(b, s, n_v, dv)
@@ -102,18 +178,26 @@ def gated_delta_net(
     norm_w = weights[f"{p}.gdn.norm.weight"]
     out_proj = weights[f"{p}.gdn.out_proj.weight"]
 
-    decode = (
+    continuation = (
         cache is not None
         and cache.conv_states[layer] is not None
         and cache.mamba_ready(layer)
-        and s == 1
     )
 
-    if decode:
+    if continuation:
         assert cache is not None
-        conv_state = cache.update_conv_step(layer, mixed)
-        mixed_out = torch.sum(conv_state * conv_w.squeeze(1), dim=-1)
-        mixed_out = F.silu(mixed_out)[:, None, :]
+        previous = cache.conv_states[layer]
+        assert previous is not None
+        joined = torch.cat((previous, mixed.transpose(1, 2)), dim=-1)
+        mixed_out = F.conv1d(
+            joined,
+            conv_w,
+            bias=None,
+            padding=0,
+            groups=joined.shape[1],
+        )[..., -s:]
+        cache.update_conv_prefill(layer, joined[..., -kernel:].contiguous())
+        mixed_out = F.silu(mixed_out.transpose(1, 2))
     else:
         if cache is not None and cache.conv_states[layer] is not None:
             mixed_t = mixed.transpose(1, 2)
@@ -136,13 +220,19 @@ def gated_delta_net(
     g_log = -a_log.float().exp() * F.softplus(a_raw.float() + dt_bias.float())
 
     initial = None
-    if decode:
+    if continuation:
         assert cache is not None
         initial = cache.ssm_states[layer]
     elif cache is not None and cache.mamba_ready(layer) and cache.ssm_states[layer] is not None:
         initial = cache.ssm_states[layer]
 
-    core, rec = _gated_delta_recurrent(query, key, value, g_log, beta, initial)
+    use_chunk = (
+        x.is_cuda
+        and s >= 64
+        and os.environ.get("INFER_GDN_CHUNK", "1") != "0"
+    )
+    delta_rule = _gated_delta_chunk if use_chunk else _gated_delta_recurrent
+    core, rec = delta_rule(query, key, value, g_log, beta, initial)
     if cache is not None:
         cache.update_ssm(layer, rec)
 

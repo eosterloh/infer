@@ -6,10 +6,16 @@ import json
 from pathlib import Path
 
 import torch
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 
 from engine.cache import RuntimeState
 from engine.config import ModelConfig
-from engine.layers.gdn import gated_delta_net
+from engine.layers.gdn import (
+    _gated_delta_chunk,
+    _gated_delta_recurrent,
+    gated_delta_net,
+)
 from engine.layers.norm import gemma_rms_norm
 from engine.schedule import MixerKind
 from engine.synth import random_engine_weights
@@ -62,3 +68,49 @@ def test_gdn_prefill_decode(tmp_path: Path) -> None:
     y_step = gated_delta_net(xn[:, 4:], w, 0, cfg, cache=cache)
     y_cached = torch.cat([y_pre, y_step], dim=1)
     assert torch.allclose(y0, y_cached, atol=1e-4, rtol=1e-4)
+
+    chunked = RuntimeState(cfg, batch_size=1, device="cpu", dtype=torch.float32)
+    y_a = gated_delta_net(xn[:, :3], w, 0, cfg, cache=chunked)
+    y_b = gated_delta_net(xn[:, 3:], w, 0, cfg, cache=chunked)
+    assert torch.allclose(y0, torch.cat((y_a, y_b), dim=1), atol=1e-4, rtol=1e-4)
+
+
+def test_gdn_matches_transformers_reference(tmp_path: Path) -> None:
+    torch.manual_seed(11)
+    cfg = _gdn_cfg(tmp_path)
+    w = random_engine_weights(cfg)
+    hf_cfg = Qwen3_5TextConfig(**cfg.raw)
+    hf = Qwen3_5GatedDeltaNet(hf_cfg, layer_idx=0).eval()
+    prefix = "layers.0.gdn."
+    state = {
+        name: w[f"{prefix}{name}"].clone()
+        for name in (
+            "A_log",
+            "dt_bias",
+            "conv1d.weight",
+            "norm.weight",
+            "out_proj.weight",
+            "in_proj_qkv.weight",
+            "in_proj_z.weight",
+            "in_proj_b.weight",
+            "in_proj_a.weight",
+        )
+    }
+    hf.load_state_dict(state)
+    x = torch.randn(1, 6, cfg.hidden_size)
+    with torch.inference_mode():
+        expected = hf(x, cache_params=None, attention_mask=None)
+        actual = gated_delta_net(x, w, 0, cfg, cache=None)
+    assert torch.allclose(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_gdn_chunk_matches_recurrent() -> None:
+    torch.manual_seed(13)
+    shape = (1, 65, 6, 8)
+    q, k, v = (torch.randn(shape) * 0.1 for _ in range(3))
+    g = -torch.rand(1, 65, 6) * 0.1
+    beta = torch.sigmoid(torch.randn(1, 65, 6))
+    expected, expected_state = _gated_delta_recurrent(q, k, v, g, beta, None)
+    actual, actual_state = _gated_delta_chunk(q, k, v, g, beta, None)
+    assert torch.allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(actual_state, expected_state, atol=2e-5, rtol=2e-5)

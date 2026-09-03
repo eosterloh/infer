@@ -295,13 +295,37 @@ def test_qwen3_5_nested_text_config(tmp_path: Path) -> None:
     assert cfg.rope_theta == 1000000.0
     caps = inspect_capabilities(folder)
     assert caps.can_run is True
-    assert "vision" in caps.missing
-    assert "mtp_decode" in caps.missing
+    assert caps.missing == ()
+    assert any("native MTP" in note for note in caps.notes)
+    assert any("image/video tower" in note for note in caps.notes)
     from engine.maps import is_ignored_hf_name
 
     assert is_ignored_hf_name("model.visual.blocks.0.attn.proj.bias", cfg)
     assert is_ignored_hf_name("mtp.fc.weight", cfg)
     assert is_ignored_hf_name("mtp.layers.0.mlp.down_proj.weight", cfg)
+
+
+def test_qwen3_5_defaults_and_nested_text_precedence(tmp_path: Path) -> None:
+    raw = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "hidden_size": 999,  # wrapper metadata must not replace text_config
+        "text_config": {
+            **_BASE,
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": 1,
+            "layer_types": ["linear_attention"],
+            "tie_word_embeddings": False,
+        },
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "defaults", raw))
+    assert cfg.hidden_size == _BASE["hidden_size"]
+    assert cfg.partial_rotary_factor == 0.25
+    assert cfg.linear_num_key_heads == 16
+    assert cfg.linear_num_value_heads == 32
+    assert cfg.linear_key_head_dim == 128
+    assert cfg.linear_value_head_dim == 128
+    assert cfg.linear_conv_kernel_dim == 4
 
 
 def test_llama4_nested_text_config(tmp_path: Path) -> None:

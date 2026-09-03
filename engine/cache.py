@@ -32,6 +32,7 @@ class KVCache:
         self.k: list[torch.Tensor | None] = [None] * self.n_layers
         self.v: list[torch.Tensor | None] = [None] * self.n_layers
         self._seq_len = 0
+        self.padding_mask: torch.Tensor | None = None
 
     def empty(self) -> bool:
         return self._seq_len == 0
@@ -43,6 +44,63 @@ class KVCache:
         self.k = [None] * self.n_layers
         self.v = [None] * self.n_layers
         self._seq_len = 0
+        self.padding_mask = None
+
+    def truncate(self, seq_len: int) -> None:
+        """Discard cached positions at and after ``seq_len``."""
+        seq_len = int(seq_len)
+        if seq_len < 0 or seq_len > self._seq_len:
+            raise ValueError(f"cannot truncate KV length {self._seq_len} to {seq_len}")
+        self.k = [
+            tensor[:, :, :seq_len].contiguous() if tensor is not None else None
+            for tensor in self.k
+        ]
+        self.v = [
+            tensor[:, :, :seq_len].contiguous() if tensor is not None else None
+            for tensor in self.v
+        ]
+        if self.padding_mask is not None:
+            self.padding_mask = self.padding_mask[:, :seq_len].contiguous()
+        self._seq_len = seq_len
+
+    def prepare_padding_mask(
+        self, mask: torch.Tensor | None, new_tokens: int
+    ) -> torch.Tensor | None:
+        """Install or extend one key-padding mask before layer KV updates."""
+        if mask is None:
+            if self.padding_mask is not None:
+                ones = torch.ones(
+                    self.batch_size,
+                    new_tokens,
+                    device=self.device,
+                    dtype=self.padding_mask.dtype,
+                )
+                self.padding_mask = torch.cat((self.padding_mask, ones), dim=1)
+            return self.padding_mask
+        if mask.dim() != 2 or mask.shape[0] != self.batch_size:
+            raise ValueError(f"expected attention_mask [B,S], got {tuple(mask.shape)}")
+        mask = mask.to(device=self.device)
+        total = self._seq_len + new_tokens
+        if mask.shape[1] == total:
+            self.padding_mask = mask
+        elif mask.shape[1] == new_tokens:
+            prefix = self.padding_mask
+            if prefix is None and self._seq_len:
+                prefix = torch.ones(
+                    self.batch_size,
+                    self._seq_len,
+                    device=self.device,
+                    dtype=mask.dtype,
+                )
+            self.padding_mask = (
+                torch.cat((prefix, mask), dim=1) if prefix is not None else mask
+            )
+        else:
+            raise ValueError(
+                f"attention_mask length {mask.shape[1]} != new {new_tokens} "
+                f"or total {total}"
+            )
+        return self.padding_mask
 
     def update(
         self,
@@ -165,6 +223,15 @@ class RuntimeState:
     def seq_len(self) -> int:
         return max(self._token_len, self.kv.seq_len())
 
+    @property
+    def padding_mask(self) -> torch.Tensor | None:
+        return self.kv.padding_mask
+
+    def prepare_padding_mask(
+        self, mask: torch.Tensor | None, new_tokens: int
+    ) -> torch.Tensor | None:
+        return self.kv.prepare_padding_mask(mask, new_tokens)
+
     def advance(self, n_tokens: int) -> None:
         """Record that `n_tokens` were consumed (prefill sets absolute via replace)."""
         self._token_len += int(n_tokens)
@@ -179,6 +246,24 @@ class RuntimeState:
         for i, s in enumerate(self.ssm_states):
             if s is not None:
                 self.ssm_states[i] = torch.zeros_like(s)
+
+    def snapshot(self) -> dict[str, object]:
+        """Copy fixed-size hybrid state; KV rollback only needs its sequence length."""
+        return {
+            "token_len": self._token_len,
+            "kv_len": self.kv.seq_len(),
+            "ready": list(self._mamba_ready),
+            "conv": [s.clone() if s is not None else None for s in self.conv_states],
+            "ssm": [s.clone() if s is not None else None for s in self.ssm_states],
+        }
+
+    def restore(self, snapshot: dict[str, object]) -> None:
+        """Restore a snapshot after speculative tokens are rejected."""
+        self.kv.truncate(int(snapshot["kv_len"]))
+        self._token_len = int(snapshot["token_len"])
+        self._mamba_ready = list(snapshot["ready"])  # type: ignore[arg-type]
+        self.conv_states = list(snapshot["conv"])  # type: ignore[arg-type]
+        self.ssm_states = list(snapshot["ssm"])  # type: ignore[arg-type]
 
     # --- attention passthrough ---
     def update(

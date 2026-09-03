@@ -8,18 +8,66 @@ This module mirrors the checkpoint's Conv3D patch embed, learned/interpolated
 from __future__ import annotations
 
 import itertools
-from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers.vision_utils import (
-    get_vision_attention_seqlens,
-    get_vision_interpolation_indices_and_weights,
-    get_vision_position_ids,
-)
 
 from engine.layers.rope import rotate_half
+
+
+def validate_qwen35_vision_weights(
+    weights: dict[str, torch.Tensor], config: dict[str, Any]
+) -> None:
+    """Require the complete vision tower and exact checkpoint shapes."""
+    h = int(config["hidden_size"])
+    inter = int(config["intermediate_size"])
+    out = int(config["out_hidden_size"])
+    c = int(config.get("in_channels", 3))
+    t = int(config.get("temporal_patch_size", 2))
+    p = int(config.get("patch_size", 16))
+    m = int(config.get("spatial_merge_size", 2))
+    npos = int(config.get("num_position_embeddings", 2304))
+    expected: dict[str, tuple[int, ...]] = {
+        "model.visual.patch_embed.proj.weight": (h, c, t, p, p),
+        "model.visual.patch_embed.proj.bias": (h,),
+        "model.visual.pos_embed.weight": (npos, h),
+        "model.visual.merger.norm.weight": (h,),
+        "model.visual.merger.norm.bias": (h,),
+        "model.visual.merger.linear_fc1.weight": (h * m * m, h * m * m),
+        "model.visual.merger.linear_fc1.bias": (h * m * m,),
+        "model.visual.merger.linear_fc2.weight": (out, h * m * m),
+        "model.visual.merger.linear_fc2.bias": (out,),
+    }
+    for i in range(int(config["depth"])):
+        prefix = f"model.visual.blocks.{i}"
+        expected.update(
+            {
+                f"{prefix}.norm1.weight": (h,),
+                f"{prefix}.norm1.bias": (h,),
+                f"{prefix}.norm2.weight": (h,),
+                f"{prefix}.norm2.bias": (h,),
+                f"{prefix}.attn.qkv.weight": (3 * h, h),
+                f"{prefix}.attn.qkv.bias": (3 * h,),
+                f"{prefix}.attn.proj.weight": (h, h),
+                f"{prefix}.attn.proj.bias": (h,),
+                f"{prefix}.mlp.linear_fc1.weight": (inter, h),
+                f"{prefix}.mlp.linear_fc1.bias": (inter,),
+                f"{prefix}.mlp.linear_fc2.weight": (h, inter),
+                f"{prefix}.mlp.linear_fc2.bias": (h,),
+            }
+        )
+    missing = sorted(set(expected) - set(weights))
+    extra = sorted(set(weights) - set(expected))
+    if missing or extra:
+        raise KeyError(
+            f"vision weight mismatch: missing={missing[:5]} extra={extra[:5]}"
+        )
+    for name, shape in expected.items():
+        if tuple(weights[name].shape) != shape:
+            raise ValueError(
+                f"vision {name}: got {tuple(weights[name].shape)}, expected {shape}"
+            )
 
 
 def _linear(
@@ -41,7 +89,10 @@ def _layer_norm(
 
 
 def _vision_rope(
-    position_ids: torch.Tensor, head_dim: int, device: torch.device
+    position_ids: torch.Tensor,
+    head_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dim = head_dim // 2
     inv = 1.0 / (
@@ -50,10 +101,78 @@ def _vision_rope(
             torch.arange(0, dim, 2, device=device, dtype=torch.float32)
             / float(dim)
         )
-    )
-    freqs = (position_ids.to(device=device).unsqueeze(-1).float() * inv).flatten(1)
+    ).to(dtype=dtype)
+    freqs = (position_ids.to(device=device).unsqueeze(-1) * inv).flatten(1)
     emb = torch.cat((freqs, freqs), dim=-1)
     return emb.cos(), emb.sin()
+
+
+def _vision_position_ids(
+    grid_thw: torch.Tensor, spatial_merge_size: int
+) -> torch.Tensor:
+    positions: list[torch.Tensor] = []
+    device = grid_thw.device
+    m = spatial_merge_size
+    for t, h, w in grid_thw.tolist():
+        hp, wp = torch.meshgrid(
+            torch.arange(h, device=device),
+            torch.arange(w, device=device),
+            indexing="ij",
+        )
+        shape = (h // m, m, w // m, m)
+        hp = hp.reshape(shape).transpose(1, 2).flatten()
+        wp = wp.reshape(shape).transpose(1, 2).flatten()
+        positions.append(torch.stack((hp, wp), dim=-1).repeat(t, 1))
+    return torch.cat(positions, dim=0)
+
+
+def _interpolate_vision_positions(
+    table: torch.Tensor,
+    grid_thw: torch.Tensor,
+    *,
+    spatial_merge_size: int,
+    align_corners: bool = True,
+) -> torch.Tensor:
+    side = int(table.shape[0] ** 0.5)
+    index_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
+    weight_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
+    m = spatial_merge_size
+    for t, h, w in grid_thw.tolist():
+        if not align_corners:
+            raise ValueError("Qwen3.5 vision positions require align_corners=True")
+        h_grid = torch.linspace(0, side - 1, h, device=table.device)
+        w_grid = torch.linspace(0, side - 1, w, device=table.device)
+        h_floor, w_floor = h_grid.int(), w_grid.int()
+        h_ceil = (h_floor + 1).clamp(max=side - 1)
+        w_ceil = (w_floor + 1).clamp(max=side - 1)
+        h_frac, w_frac = h_grid - h_floor, w_grid - w_floor
+        h_floor_offset, h_ceil_offset = h_floor * side, h_ceil * side
+        corners = [
+            (h_floor_offset[:, None] + w_floor[None]).flatten(),
+            (h_floor_offset[:, None] + w_ceil[None]).flatten(),
+            (h_ceil_offset[:, None] + w_floor[None]).flatten(),
+            (h_ceil_offset[:, None] + w_ceil[None]).flatten(),
+        ]
+        weights = [
+            ((1 - h_frac)[:, None] * (1 - w_frac)[None]).flatten(),
+            ((1 - h_frac)[:, None] * w_frac[None]).flatten(),
+            (h_frac[:, None] * (1 - w_frac)[None]).flatten(),
+            (h_frac[:, None] * w_frac[None]).flatten(),
+        ]
+        h_idx = torch.arange(h, device=table.device).view(h // m, m)
+        w_idx = torch.arange(w, device=table.device).view(w // m, m)
+        reorder = (
+            (h_idx[:, :, None, None] * w + w_idx[None, None])
+            .transpose(1, 2)
+            .flatten()
+            .repeat(t)
+        )
+        for i in range(4):
+            index_parts[i].append(corners[i][reorder])
+            weight_parts[i].append(weights[i][reorder])
+    indices = torch.stack([torch.cat(parts) for parts in index_parts])
+    weights = torch.stack([torch.cat(parts) for parts in weight_parts])
+    return (table[indices] * weights[:, :, None]).sum(0)
 
 
 def _vision_attention(
@@ -87,9 +206,25 @@ def _vision_attention(
     outs: list[torch.Tensor] = []
     scale = head_dim**-0.5
     for q_i, k_i, v_i in zip(q_parts, k_parts, v_parts):
-        scores = torch.einsum("thd,shd->hts", q_i.float(), k_i.float()) * scale
-        probs = torch.softmax(scores, dim=-1).to(v_i.dtype)
-        outs.append(torch.einsum("hts,shd->thd", probs, v_i))
+        q_h = q_i.transpose(0, 1)
+        k_h = k_i.transpose(0, 1)
+        v_h = v_i.transpose(0, 1)
+        if x.is_cuda:
+            attended = F.scaled_dot_product_attention(
+                q_h[None],
+                k_h[None],
+                v_h[None],
+                dropout_p=0.0,
+                is_causal=False,
+                scale=scale,
+            )[0]
+        else:
+            scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * scale
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(
+                q_i.dtype
+            )
+            attended = torch.matmul(probs, v_h)
+        outs.append(attended.transpose(0, 1))
     out = torch.cat(outs, dim=0).reshape(seq, hidden)
     return _linear(out, weights, f"{prefix}.proj")
 
@@ -120,23 +255,26 @@ def qwen35_vision_forward(
         stride=(temporal, patch, patch),
     ).reshape(-1, hidden)
 
-    helper_config = SimpleNamespace(**config)
-    helper_config._attn_implementation = "eager"
     grid_thw = grid_thw.to(device=device, dtype=torch.long)
-    interp_i, interp_w = get_vision_interpolation_indices_and_weights(
+    if int(num_pos**0.5) ** 2 != num_pos:
+        raise ValueError("vision num_position_embeddings must be a square grid")
+    pos = _interpolate_vision_positions(
+        weights["model.visual.pos_embed.weight"],
         grid_thw,
-        num_grid_per_side=int(num_pos**0.5),
-        mode="bilinear",
-        align_corners=True,
         spatial_merge_size=spatial_merge,
     )
-    pos_table = weights["model.visual.pos_embed.weight"]
-    pos = (pos_table[interp_i] * interp_w[:, :, None].to(pos_table.dtype)).sum(1)
     x = x + pos.to(dtype=x.dtype)
 
-    position_ids = get_vision_position_ids(grid_thw, spatial_merge)
-    cu_seqlens, _ = get_vision_attention_seqlens(grid_thw, helper_config)
-    cos, sin = _vision_rope(position_ids, hidden // num_heads, device)
+    position_ids = _vision_position_ids(grid_thw, spatial_merge)
+    frame_lengths = torch.repeat_interleave(
+        grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+    )
+    cu_seqlens = F.pad(
+        frame_lengths.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0
+    )
+    cos, sin = _vision_rope(
+        position_ids, hidden // num_heads, device, dtype=x.dtype
+    )
     cos, sin = cos.to(x.dtype), sin.to(x.dtype)
     cu_seqlens = cu_seqlens.to(device)
 
