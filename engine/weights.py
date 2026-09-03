@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -166,6 +167,73 @@ def validate_name_map(
     if extra:
         raise KeyError(f"unexpected weights after map: {extra[:12]}")
     return mapped
+
+
+def validate_qwen35_checkpoint_metadata(
+    model_dir: str | Path, config: ModelConfig
+) -> dict[str, int]:
+    """Validate every real Qwen3.5 tensor name/shape from safetensors headers."""
+    if config.recipe_id != "qwen3_5":
+        raise ValueError("Qwen3.5 metadata validation requires its recipe")
+    model_dir = Path(model_dir)
+    index = load_weight_index(model_dir)
+    by_shard: dict[str, list[str]] = {}
+    for name, shard in index.items():
+        by_shard.setdefault(shard, []).append(name)
+    hf_shapes: dict[str, tuple[int, ...]] = {}
+    for shard, names in by_shard.items():
+        with safe_open(str(model_dir / shard), framework="pt", device="cpu") as f:
+            for name in names:
+                hf_shapes[name] = tuple(f.get_slice(name).get_shape())
+
+    mapped = validate_name_map(config, set(index))
+    expected_text = config.expected_shapes()
+    for engine_name, hf_name in mapped.items():
+        expected = expected_text[engine_name]
+        if hf_shapes[hf_name] != expected:
+            raise ValueError(
+                f"{hf_name}: got {hf_shapes[hf_name]}, expected {expected}"
+            )
+
+    from engine.mtp import qwen35_mtp_expected_shapes
+    from engine.vision import qwen35_vision_expected_shapes
+
+    vision_config = config.raw.get("vision_config")
+    expected_vision = (
+        qwen35_vision_expected_shapes(vision_config)
+        if isinstance(vision_config, dict)
+        else {}
+    )
+    expected_mtp = qwen35_mtp_expected_shapes(config)
+    for label, expected in (
+        ("vision", expected_vision),
+        ("MTP", expected_mtp),
+    ):
+        actual = {
+            name: shape
+            for name, shape in hf_shapes.items()
+            if name in expected
+        }
+        missing = sorted(set(expected) - set(actual))
+        if missing:
+            raise KeyError(f"{label} metadata missing tensors: {missing[:8]}")
+        for name, shape in expected.items():
+            if actual[name] != shape:
+                raise ValueError(
+                    f"{name}: got {actual[name]}, expected {shape}"
+                )
+
+    expected_names = set(mapped.values()) | set(expected_vision) | set(expected_mtp)
+    extras = sorted(set(hf_shapes) - expected_names)
+    if extras:
+        raise KeyError(f"unexpected Qwen3.5 checkpoint tensors: {extras[:8]}")
+    return {
+        "tensors": len(hf_shapes),
+        "parameters": sum(math.prod(shape) for shape in hf_shapes.values()),
+        "text_tensors": len(mapped),
+        "vision_tensors": len(expected_vision),
+        "mtp_tensors": len(expected_mtp),
+    }
 
 
 def load_hf_state_cpu(model_dir: str | Path) -> dict[str, torch.Tensor]:

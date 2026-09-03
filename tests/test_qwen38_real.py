@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from engine.agent_api import load_engine
+from engine.config import ModelConfig
+from engine.weights import validate_qwen35_checkpoint_metadata
 
 
 @pytest.mark.spark
@@ -25,6 +27,17 @@ def test_qwen38_real_text_mtp_and_vision() -> None:
 
     import numpy as np
     from PIL import Image
+
+    metadata = validate_qwen35_checkpoint_metadata(
+        path, ModelConfig.from_pretrained(path)
+    )
+    assert metadata == {
+        "tensors": 1_199,
+        "parameters": 27_781_427_952,
+        "text_tensors": 851,
+        "vision_tensors": 333,
+        "mtp_tensors": 15,
+    }
 
     engine = load_engine(path, device="cuda")
     assert engine.config.recipe_id == "qwen3_5"

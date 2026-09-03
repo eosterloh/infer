@@ -34,6 +34,41 @@ _MTP_LAYER_MAP = {
 }
 
 
+def qwen35_mtp_expected_shapes(
+    config: ModelConfig,
+) -> dict[str, tuple[int, ...]]:
+    """Return the exact HF MTP tensor contract, excluding shared weights."""
+    h = config.hidden_size
+    inter = config.intermediate_size
+    nq = config.num_attention_heads
+    nkv = config.num_key_value_heads
+    hd = config.head_dim
+    expected = {
+        "mtp.fc.weight": (h, 2 * h),
+        "mtp.norm.weight": (h,),
+        "mtp.pre_fc_norm_embedding.weight": (h,),
+        "mtp.pre_fc_norm_hidden.weight": (h,),
+    }
+    for i in range(config.num_nextn_predict_layers or 0):
+        prefix = f"mtp.layers.{i}"
+        expected.update(
+            {
+                f"{prefix}.input_layernorm.weight": (h,),
+                f"{prefix}.post_attention_layernorm.weight": (h,),
+                f"{prefix}.self_attn.q_proj.weight": (2 * nq * hd, h),
+                f"{prefix}.self_attn.k_proj.weight": (nkv * hd, h),
+                f"{prefix}.self_attn.v_proj.weight": (nkv * hd, h),
+                f"{prefix}.self_attn.o_proj.weight": (h, nq * hd),
+                f"{prefix}.self_attn.q_norm.weight": (hd,),
+                f"{prefix}.self_attn.k_norm.weight": (hd,),
+                f"{prefix}.mlp.gate_proj.weight": (inter, h),
+                f"{prefix}.mlp.up_proj.weight": (inter, h),
+                f"{prefix}.mlp.down_proj.weight": (h, inter),
+            }
+        )
+    return expected
+
+
 class Qwen35MTP:
     """One full-attention draft layer sharing target embeddings and LM head."""
 
@@ -83,12 +118,10 @@ class Qwen35MTP:
         missing = sorted(expected - set(self.weights))
         if missing:
             raise KeyError(f"MTP layer missing weights: {missing}")
-        h = config.hidden_size
         root_shapes = {
-            "fc.weight": (h, 2 * h),
-            "norm.weight": (h,),
-            "pre_fc_norm_embedding.weight": (h,),
-            "pre_fc_norm_hidden.weight": (h,),
+            name.removeprefix("mtp."): shape
+            for name, shape in qwen35_mtp_expected_shapes(config).items()
+            if not name.startswith("mtp.layers.")
         }
         for name, shape in root_shapes.items():
             if tuple(self.root[name].shape) != shape:

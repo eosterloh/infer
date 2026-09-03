@@ -16,10 +16,10 @@ import torch.nn.functional as F
 from engine.layers.rope import rotate_half
 
 
-def validate_qwen35_vision_weights(
-    weights: dict[str, torch.Tensor], config: dict[str, Any]
-) -> None:
-    """Require the complete vision tower and exact checkpoint shapes."""
+def qwen35_vision_expected_shapes(
+    config: dict[str, Any],
+) -> dict[str, tuple[int, ...]]:
+    """Return the exact HF vision tensor contract for this config."""
     h = int(config["hidden_size"])
     inter = int(config["intermediate_size"])
     out = int(config["out_hidden_size"])
@@ -57,6 +57,14 @@ def validate_qwen35_vision_weights(
                 f"{prefix}.mlp.linear_fc2.bias": (h,),
             }
         )
+    return expected
+
+
+def validate_qwen35_vision_weights(
+    weights: dict[str, torch.Tensor], config: dict[str, Any]
+) -> None:
+    """Require the complete vision tower and exact checkpoint shapes."""
+    expected = qwen35_vision_expected_shapes(config)
     missing = sorted(set(expected) - set(weights))
     extra = sorted(set(weights) - set(expected))
     if missing or extra:
