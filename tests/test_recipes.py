@@ -239,6 +239,71 @@ def test_super_latent_mtp_dropin(tmp_path: Path) -> None:
     _run_folder(tmp_path, raw, "nemotron_h")
 
 
+def test_qwen3_5_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": "qwen3_5",
+        "num_hidden_layers": 2,
+        "layer_types": ["linear_attention", "full_attention"],
+        "attn_output_gate": True,
+        "partial_rotary_factor": 0.5,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "qwen3_5")
+
+
+def test_qwen3_5_nested_text_config(tmp_path: Path) -> None:
+    raw = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "language_model_only": False,
+        "vision_config": {"hidden_size": 16, "depth": 1},
+        "text_config": {
+            **_BASE,
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": 2,
+            "layer_types": ["linear_attention", "full_attention"],
+            "attn_output_gate": True,
+            "partial_rotary_factor": 0.5,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 8,
+            "linear_value_head_dim": 8,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "mtp_num_hidden_layers": 1,
+            "tie_word_embeddings": False,
+            "dtype": "float32",
+            "rope_parameters": {
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.5,
+                "rope_type": "default",
+            },
+        },
+    }
+    folder = write_config(tmp_path / "qwen38nested", raw)
+    cfg = ModelConfig.from_pretrained(folder)
+    assert cfg.recipe_id == "qwen3_5"
+    assert cfg.attn_output_gate is True
+    assert cfg.layers[0].mixer.value == "gated_deltanet"
+    assert cfg.layers[1].mixer.value == "attention"
+    assert cfg.rope_theta == 1000000.0
+    caps = inspect_capabilities(folder)
+    assert caps.can_run is True
+    assert "vision" in caps.missing
+    assert "mtp_decode" in caps.missing
+    from engine.maps import is_ignored_hf_name
+
+    assert is_ignored_hf_name("model.visual.blocks.0.attn.proj.bias", cfg)
+    assert is_ignored_hf_name("mtp.fc.weight", cfg)
+    assert is_ignored_hf_name("mtp.layers.0.mlp.down_proj.weight", cfg)
+
+
 def test_llama4_nested_text_config(tmp_path: Path) -> None:
     raw = {
         "architectures": ["Llama4ForConditionalGeneration"],

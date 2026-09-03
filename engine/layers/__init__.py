@@ -7,6 +7,7 @@ from engine.layers.norm import apply_norm, gemma_rms_norm, layer_norm, rms_norm
 from engine.layers.rope import (
     apply_rope,
     build_inv_freq,
+    build_mrope_cos_sin,
     build_rope_cos_sin,
     rotate_half,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "attention",
     "attention_from_weights",
     "build_inv_freq",
+    "build_mrope_cos_sin",
     "build_rope_cos_sin",
     "decoder_block",
     "gemma_rms_norm",

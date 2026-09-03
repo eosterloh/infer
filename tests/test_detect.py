@@ -97,6 +97,17 @@ def test_nvfp4_folder_dequants_on_load(tmp_path: Path) -> None:
 
 def test_detect_recipe_id_from_raw() -> None:
     assert detect_recipe_id({"model_type": "llama"}) == "llama"
+    assert detect_recipe_id({"model_type": "qwen3"}) == "qwen3"
+    assert detect_recipe_id({"model_type": "qwen3_5"}) == "qwen3_5"
+    assert (
+        detect_recipe_id(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+            }
+        )
+        == "qwen3_5"
+    )
     assert detect_recipe_id({"architectures": ["LlamaForCausalLM"]}) == "llama"
     assert (
         detect_recipe_id(

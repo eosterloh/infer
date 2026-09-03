@@ -34,6 +34,15 @@ _LLAMA_LAYER = {
     "self_attn.q_norm.weight": "attn.q_norm.weight",
     "self_attn.k_norm.weight": "attn.k_norm.weight",
     "self_attn.sinks": "attn.sinks",
+    "linear_attn.in_proj_qkv.weight": "gdn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight": "gdn.in_proj_z.weight",
+    "linear_attn.in_proj_b.weight": "gdn.in_proj_b.weight",
+    "linear_attn.in_proj_a.weight": "gdn.in_proj_a.weight",
+    "linear_attn.conv1d.weight": "gdn.conv1d.weight",
+    "linear_attn.A_log": "gdn.A_log",
+    "linear_attn.dt_bias": "gdn.dt_bias",
+    "linear_attn.norm.weight": "gdn.norm.weight",
+    "linear_attn.out_proj.weight": "gdn.out_proj.weight",
     "mlp.gate_proj.weight": "mlp.gate.weight",
     "mlp.up_proj.weight": "mlp.up.weight",
     "mlp.down_proj.weight": "mlp.down.weight",
@@ -361,7 +370,20 @@ def map_hf_name(hf_name: str, config: ModelConfig | None = None) -> str | None:
     return _map_llama_family(hf_name)
 
 
-# Skip scale/zero tensors; quant.py consumes them next to the weight.
+def is_ignored_hf_name(hf_name: str, config: ModelConfig | None = None) -> bool:
+    """Vision / unused MTP tensors on a text greedy path."""
+    if hf_name.startswith(("model.visual.", "visual.", "model.vision_tower.")):
+        return True
+    recipe = getattr(config, "recipe_id", "") if config is not None else ""
+    if recipe == "qwen3_5" and (
+        hf_name.startswith("mtp.")
+        or hf_name.startswith("model.mtp.")
+        or ".mtp." in hf_name
+    ):
+        return True
+    return False
+
+
 _QUANT_SUFFIXES = (
     ".weight_scale",
     ".weight_scale_inv",

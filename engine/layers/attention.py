@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
-from engine.layers.norm import rms_norm
+from engine.layers.norm import gemma_rms_norm, rms_norm
 from engine.layers.rope import apply_rope
 
 if TYPE_CHECKING:
@@ -76,6 +76,8 @@ def attention(
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     rms_eps: float = 1e-6,
+    output_gate: bool = False,
+    qk_gemma: bool = False,
 ) -> torch.Tensor:
     """Causal GQA attention. x: [B, S_new, H]."""
     b, s_new, _ = x.shape
@@ -83,14 +85,23 @@ def attention(
     k = F.linear(x, w_k, b_k)
     v = F.linear(x, w_v, b_v)
 
-    q = q.view(b, s_new, nq, hd).transpose(1, 2)
+    gate = None
+    if output_gate:
+        q = q.view(b, s_new, nq, hd * 2)
+        q, gate_h = q.split(hd, dim=-1)
+        gate = gate_h.reshape(b, s_new, nq * hd)
+        q = q.transpose(1, 2)
+    else:
+        q = q.view(b, s_new, nq, hd).transpose(1, 2)
     k = k.view(b, s_new, nkv, hd).transpose(1, 2)
     v = v.view(b, s_new, nkv, hd).transpose(1, 2)
 
     if q_norm is not None:
-        q = rms_norm(q, q_norm, rms_eps)
+        qn = gemma_rms_norm if qk_gemma else rms_norm
+        q = qn(q, q_norm, rms_eps)
     if k_norm is not None:
-        k = rms_norm(k, k_norm, rms_eps)
+        kn = gemma_rms_norm if qk_gemma else rms_norm
+        k = kn(k, k_norm, rms_eps)
 
     if use_rope:
         if cos.numel() == 0 or sin.numel() == 0:
@@ -155,6 +166,8 @@ def attention(
         weights = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
     out = torch.matmul(weights, v)
     out = out.transpose(1, 2).contiguous().view(b, s_new, nq * hd)
+    if gate is not None:
+        out = out * torch.sigmoid(gate)
     return F.linear(out, w_o, b_o)
 
 
@@ -258,4 +271,6 @@ def attention_from_weights(
         sliding_window=config.sliding_window,
         sinks=weights.get(f"{p}.attn.sinks"),
         rms_eps=config.rms_norm_eps,
+        output_gate=config.attn_output_gate,
+        qk_gemma=config.norm_kind == "gemma_rms",
     )

@@ -8,6 +8,7 @@ import torch
 
 from engine.config import ModelConfig
 from engine.layers.attention import attention_from_weights
+from engine.layers.gdn import gated_delta_net
 from engine.layers.mamba2 import mamba2
 from engine.layers.mlp import mlp_from_weights
 from engine.layers.moe import moe
@@ -43,6 +44,10 @@ def decoder_block(
     elif spec.mixer == MixerKind.MAMBA2:
         h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
         h = mamba2(h, weights, layer, config, cache=cache)
+        x = x + h
+    elif spec.mixer == MixerKind.GATED_DELTANET:
+        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
+        h = gated_delta_net(h, weights, layer, config, cache=cache)
         x = x + h
     elif spec.mixer == MixerKind.NONE:
         pass

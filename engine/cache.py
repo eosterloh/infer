@@ -109,27 +109,48 @@ class RuntimeState:
         self._token_len = 0
 
         for spec in self.layers:
-            if spec.mixer != MixerKind.MAMBA2:
-                continue
-            if config.mamba_num_heads is None or config.mamba_head_dim is None:
-                raise ValueError("mamba dims required for RuntimeState on hybrid model")
-            if config.conv_kernel is None or config.ssm_state_size is None:
-                raise ValueError("conv_kernel / ssm_state_size required")
-            inter = config.mamba_intermediate
-            conv_dim = config.mamba_conv_dim
-            k = config.conv_kernel
-            n = config.ssm_state_size
-            n_heads = config.mamba_num_heads
-            hd = config.mamba_head_dim
-            i = spec.index
-            # Depthwise conv sees conv_dim channels (x + B + C projections).
-            self.conv_states[i] = torch.zeros(
-                batch_size, conv_dim, k, device=self.device, dtype=dtype
-            )
-            # SSM state: [B, n_heads, head_dim, state]
-            self.ssm_states[i] = torch.zeros(
-                batch_size, n_heads, hd, n, device=self.device, dtype=ssm_dtype
-            )
+            if spec.mixer == MixerKind.MAMBA2:
+                if config.mamba_num_heads is None or config.mamba_head_dim is None:
+                    raise ValueError("mamba dims required for RuntimeState on hybrid model")
+                if config.conv_kernel is None or config.ssm_state_size is None:
+                    raise ValueError("conv_kernel / ssm_state_size required")
+                conv_dim = config.mamba_conv_dim
+                k = config.conv_kernel
+                n = config.ssm_state_size
+                n_heads = config.mamba_num_heads
+                hd = config.mamba_head_dim
+                i = spec.index
+                self.conv_states[i] = torch.zeros(
+                    batch_size, conv_dim, k, device=self.device, dtype=dtype
+                )
+                self.ssm_states[i] = torch.zeros(
+                    batch_size, n_heads, hd, n, device=self.device, dtype=ssm_dtype
+                )
+            elif spec.mixer == MixerKind.GATED_DELTANET:
+                if (
+                    config.linear_num_key_heads is None
+                    or config.linear_num_value_heads is None
+                    or config.linear_key_head_dim is None
+                    or config.linear_value_head_dim is None
+                    or config.linear_conv_kernel_dim is None
+                ):
+                    raise ValueError("linear_* dims required for Gated DeltaNet cache")
+                key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+                value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+                conv_dim = key_dim * 2 + value_dim
+                k = config.linear_conv_kernel_dim
+                i = spec.index
+                self.conv_states[i] = torch.zeros(
+                    batch_size, conv_dim, k, device=self.device, dtype=dtype
+                )
+                self.ssm_states[i] = torch.zeros(
+                    batch_size,
+                    config.linear_num_value_heads,
+                    config.linear_key_head_dim,
+                    config.linear_value_head_dim,
+                    device=self.device,
+                    dtype=ssm_dtype,
+                )
 
     @property
     def _mamba_has_state(self) -> bool:

@@ -7,7 +7,12 @@ import torch.nn.functional as F
 
 from engine.cache import KVCache, RuntimeState
 from engine.config import ModelConfig
-from engine.layers import build_inv_freq, build_rope_cos_sin, decoder_block
+from engine.layers import (
+    build_inv_freq,
+    build_mrope_cos_sin,
+    build_rope_cos_sin,
+    decoder_block,
+)
 from engine.layers.norm import apply_norm
 from engine.schedule import MixerKind, build_schedule
 
@@ -48,9 +53,10 @@ class DecoderModel:
         device = device or self.device
         dtype = dtype or self.dtype
         mt = (self.config.recipe_id or self.config.model_type or "").lower()
-        if mt in {"nemotron_h", "nemotronh"} or any(
-            s.mixer == MixerKind.MAMBA2 for s in self.layers
-        ):
+        hybrid = any(
+            s.mixer in {MixerKind.MAMBA2, MixerKind.GATED_DELTANET} for s in self.layers
+        )
+        if mt in {"nemotron_h", "nemotronh", "qwen3_5", "qwen3_5_text"} or hybrid:
             return RuntimeState(
                 self.config, batch_size=batch_size, device=device, dtype=dtype
             )
@@ -60,32 +66,64 @@ class DecoderModel:
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         cache: KVCache | RuntimeState | None = None,
-    ) -> torch.Tensor:
-        """input_ids: [B, S] → logits [B, S, V]."""
-        if input_ids.dim() != 2:
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Token IDs or precomputed embeddings → logits, optionally final hidden."""
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("provide exactly one of input_ids or inputs_embeds")
+        if input_ids is not None and input_ids.dim() != 2:
             raise ValueError(f"expected input_ids [B, S], got {tuple(input_ids.shape)}")
+        if inputs_embeds is not None and inputs_embeds.dim() != 3:
+            raise ValueError(
+                f"expected inputs_embeds [B,S,H], got {tuple(inputs_embeds.shape)}"
+            )
 
-        b, s = input_ids.shape
+        if inputs_embeds is None:
+            assert input_ids is not None
+            b, s = input_ids.shape
+            x = self.weights["embed.weight"][input_ids]
+        else:
+            b, s, h = inputs_embeds.shape
+            if h != self.config.hidden_size:
+                raise ValueError(
+                    f"embedding hidden {h} != config hidden {self.config.hidden_size}"
+                )
+            x = inputs_embeds
         start_pos = cache.seq_len() if cache is not None else 0
 
-        x = self.weights["embed.weight"][input_ids]
         scale = self.config.embed_scale
         if scale != 1.0:
             x = x * scale
         if self.config.pos_kind == "learned":
             pos = torch.arange(
-                start_pos, start_pos + s, device=input_ids.device, dtype=torch.long
+                start_pos, start_pos + s, device=x.device, dtype=torch.long
             )
             x = x + self.weights["pos_embed.weight"][pos]
 
         if self.use_rope:
             assert self._inv_freq is not None
-            position_ids = torch.arange(
-                start_pos, start_pos + s, device=input_ids.device, dtype=torch.long
-            )[None, :].expand(b, -1)
-            cos, sin = build_rope_cos_sin(self._inv_freq, position_ids, dtype=x.dtype)
+            if position_ids is None:
+                position_ids = torch.arange(
+                    start_pos, start_pos + s, device=x.device, dtype=torch.long
+                )[None, :].expand(b, -1)
+            if position_ids.dim() == 3:
+                section = (
+                    (self.config.rope_scaling or {}).get("mrope_section")
+                    or (self.config.raw.get("rope_parameters") or {}).get("mrope_section")
+                    or [11, 11, 10]
+                )
+                cos, sin = build_mrope_cos_sin(
+                    self._inv_freq, position_ids, dtype=x.dtype, mrope_section=section
+                )
+            else:
+                cos, sin = build_rope_cos_sin(
+                    self._inv_freq, position_ids, dtype=x.dtype
+                )
         else:
             cos = sin = torch.empty(0, device=x.device, dtype=x.dtype)
 
@@ -108,14 +146,17 @@ class DecoderModel:
                 else:
                     cache.advance(s)
 
-        x = apply_norm(
+        hidden = apply_norm(
             x,
             self.weights,
             "final_norm",
             self.config.rms_norm_eps,
             self.config.norm_kind,
         )
-        return F.linear(x, self.weights["lm_head.weight"])
+        logits = F.linear(hidden, self.weights["lm_head.weight"])
+        if return_hidden:
+            return logits, hidden
+        return logits
 
     def num_params(self) -> int:
         from engine.weights import count_params

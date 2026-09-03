@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from engine.config import ModelConfig
-from engine.maps import is_quant_aux, map_gguf_name, map_hf_name
+from engine.maps import is_ignored_hf_name, is_quant_aux, map_gguf_name, map_hf_name
 from engine.quant import maybe_dequant_state
 
 _map_hf_name = map_hf_name
@@ -68,6 +69,42 @@ def load_weight_index(model_dir: str | Path) -> dict[str, str]:
     raise FileNotFoundError(f"no weight index under {model_dir}")
 
 
+def load_hf_prefixes(
+    model_dir: str | Path,
+    prefixes: tuple[str, ...],
+    *,
+    device: str | torch.device = "cuda",
+    dtype: str | torch.dtype | None = None,
+) -> dict[str, torch.Tensor]:
+    """Load only matching HF tensors without deserializing unrelated shard members."""
+    model_dir = Path(model_dir)
+    device = torch.device(device)
+    if isinstance(dtype, str):
+        dtype = _resolve_dtype(dtype)
+
+    index = load_weight_index(model_dir)
+    selected = {
+        name: shard
+        for name, shard in index.items()
+        if any(name.startswith(prefix) for prefix in prefixes)
+    }
+    if not selected:
+        raise KeyError(f"no checkpoint tensors match prefixes={prefixes!r}")
+
+    by_shard: dict[str, list[str]] = {}
+    for name, shard in selected.items():
+        by_shard.setdefault(shard, []).append(name)
+
+    out: dict[str, torch.Tensor] = {}
+    for shard, names in sorted(by_shard.items()):
+        with safe_open(str(model_dir / shard), framework="pt", device="cpu") as f:
+            for name in names:
+                tensor = f.get_tensor(name)
+                target_dtype = dtype or tensor.dtype
+                out[name] = tensor.to(device=device, dtype=target_dtype)
+    return out
+
+
 def _maybe_transpose(name: str, tensor: torch.Tensor, config: ModelConfig) -> torch.Tensor:
     """GPT-2 Conv1D is stored [in, out]; engine Linear wants [out, in]."""
     if config.recipe_id != "gpt2":
@@ -95,8 +132,10 @@ def validate_name_map(
     for hf_name in _iter_hf_names(hf_names):
         engine_name = map_hf_name(hf_name, config)
         if engine_name is None:
-            if map_gguf_name(hf_name) is None and hf_name.startswith(
-                ("rope_", "blk.")
+            if is_ignored_hf_name(hf_name, config) or (
+                map_gguf_name(hf_name) is None and hf_name.startswith(
+                    ("rope_", "blk.")
+                )
             ):
                 continue
             unknown.append(hf_name)
@@ -152,6 +191,8 @@ def rename_state(
     for hf_name, tensor in hf_state.items():
         engine_name = map_hf_name(hf_name, config)
         if engine_name is None:
+            if is_ignored_hf_name(hf_name, config):
+                continue
             unknown.append(hf_name)
             continue
         if engine_name in out:
@@ -293,29 +334,22 @@ def load_weights(
     validate_name_map(config, index.keys())
 
     shards = _shard_paths(model_dir)
-    hf_piece: dict[str, torch.Tensor] = {}
+    state: dict[str, torch.Tensor] = {}
     for i, shard in enumerate(shards, start=1):
         print(f"  shard {i}/{len(shards)} {shard.name}", flush=True)
         piece = load_file(str(shard), device="cpu")
-        overlap = set(hf_piece) & set(piece)
-        if overlap:
-            raise RuntimeError(f"duplicate tensors across shards: {sorted(overlap)[:5]}")
-        hf_piece.update(piece)
+        piece = maybe_dequant_state(piece)
+        for hf_name, tensor in piece.items():
+            if is_quant_aux(hf_name) or is_ignored_hf_name(hf_name, config):
+                continue
+            engine_name = map_hf_name(hf_name, config)
+            if engine_name is None:
+                raise KeyError(f"unmapped HF tensor during load: {hf_name}")
+            if engine_name in state:
+                raise RuntimeError(f"name map collision on {engine_name}")
+            tensor = _maybe_transpose(engine_name, tensor, config)
+            state[engine_name] = _cast_one(engine_name, tensor, dtype, device)
         del piece
-
-    hf_piece = maybe_dequant_state(hf_piece)
-    state: dict[str, torch.Tensor] = {}
-    for hf_name, tensor in hf_piece.items():
-        if is_quant_aux(hf_name):
-            continue
-        engine_name = map_hf_name(hf_name, config)
-        if engine_name is None:
-            raise KeyError(f"unmapped HF tensor during load: {hf_name}")
-        if engine_name in state:
-            raise RuntimeError(f"name map collision on {engine_name}")
-        tensor = _maybe_transpose(engine_name, tensor, config)
-        state[engine_name] = _cast_one(engine_name, tensor, dtype, device)
-    del hf_piece
 
     validate_shapes(config, state)
     state = apply_tied_embeddings(config, state)

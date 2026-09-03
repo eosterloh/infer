@@ -79,6 +79,10 @@ def inspect_capabilities(model_dir: str | Path) -> Capabilities:
     notes: list[str] = []
     if has_mamba:
         notes.append("mamba2 scheduled — sequential SSM path")
+    if any(s.mixer == MixerKind.GATED_DELTANET for s in layers):
+        notes.append("gated deltanet scheduled — sequential linear-attention path")
+    if "vision" in missing:
+        notes.append("vision advertised — text greedy only; vision tower not wired")
     if has_moe:
         notes.append("moe scheduled — router+shared expert path")
     if (model_dir / "chat_template.jinja").is_file() or (

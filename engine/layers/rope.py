@@ -43,7 +43,9 @@ def _inv_freq_llama3(
 
 
 def build_inv_freq(config: ModelConfig, device: torch.device) -> torch.Tensor:
-    dim = config.head_dim
+    dim = int(config.head_dim * float(getattr(config, "partial_rotary_factor", 1.0) or 1.0))
+    if dim < 2:
+        dim = config.head_dim
     base = float(config.rope_theta)
     scaling = config.rope_scaling
     if scaling and scaling.get("rope_type") == "llama3":
@@ -76,6 +78,33 @@ def build_rope_cos_sin(
     return cos, sin
 
 
+def build_mrope_cos_sin(
+    inv_freq: torch.Tensor,
+    position_ids: torch.Tensor,
+    dtype: torch.dtype,
+    mrope_section: list[int] | tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Qwen multimodal RoPE from temporal/height/width positions.
+
+    ``position_ids`` is [3, B, S]. Text positions have three identical rows.
+    Frequency slots are interleaved T/H/W according to ``mrope_section``.
+    """
+    if position_ids.dim() != 3 or position_ids.shape[0] != 3:
+        raise ValueError(
+            f"expected MRoPE position_ids [3,B,S], got {tuple(position_ids.shape)}"
+        )
+    b = position_ids.shape[1]
+    inv = inv_freq[None, None, :, None].float().expand(3, b, -1, 1)
+    pos = position_ids[:, :, None, :].float()
+    freqs = (inv @ pos).transpose(2, 3)
+    mixed = freqs[0].clone()
+    for source, offset in ((1, 1), (2, 2)):
+        length = int(mrope_section[source]) * 3
+        mixed[..., offset:length:3] = freqs[source, ..., offset:length:3]
+    emb = torch.cat((mixed, mixed), dim=-1)
+    return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -88,9 +117,20 @@ def apply_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """q/k: [B, heads, S, hd]; cos/sin: [B, S, hd]."""
+    """q/k: [B, heads, S, hd]; cos/sin: [B, S, rotary_dim] (may be < hd)."""
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
+    rotary_dim = cos.shape[-1]
+    if rotary_dim < q.shape[-1]:
+        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+        q_embed = torch.cat(
+            ((q_rot * cos) + (rotate_half(q_rot) * sin), q_pass), dim=-1
+        )
+        k_embed = torch.cat(
+            ((k_rot * cos) + (rotate_half(k_rot) * sin), k_pass), dim=-1
+        )
+        return q_embed, k_embed
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed

@@ -23,6 +23,7 @@ KNOWN_RECIPES = (
     "gpt_oss",
     "deepseek_v3",
     "nemotron_h",
+    "qwen3_5",
 )
 
 
@@ -70,6 +71,15 @@ def detect_recipe_id(raw: dict[str, Any]) -> str:
         return "gemma"
     if mt.startswith("qwen") and ("moe" in mt or any("moe" in a for a in arches)):
         return "mixtral"
+    if (
+        mt in {"qwen3_5", "qwen3_5_text", "qwen3_next", "qwen3_next_text"}
+        or any("qwen3_5" in a or "qwen3next" in a or "qwen3_next" in a for a in arches)
+        or (
+            isinstance(raw.get("layer_types"), list)
+            and "linear_attention" in raw["layer_types"]
+        )
+    ):
+        return "qwen3_5"
     if mt in {"qwen3"} or any("qwen3" in a for a in arches):
         return "qwen3"
     if mt.startswith("qwen") or any("qwen" in a for a in arches):
@@ -110,9 +120,11 @@ def detect_quant_flags(
         "float8_e5m2",
         "fp8",
     }
-    mtp = bool(raw.get("num_nextn_predict_layers") or raw.get("mtp_num_layers")) or (
-        "mtp" in name
-    )
+    mtp = bool(
+        raw.get("num_nextn_predict_layers")
+        or raw.get("mtp_num_layers")
+        or raw.get("mtp_num_hidden_layers")
+    ) or ("mtp" in name)
     return nvfp4, fp8, mtp
 
 
@@ -123,11 +135,14 @@ def detect_missing(
 
     NVFP4/FP8 dequant-on-load is implemented, so those no longer block.
     MTP speculative decode is still not wired; greedy uses the main LM head.
+    Vision towers are skipped; text greedy still runs.
     """
     _nvfp4, _fp8, mtp = detect_quant_flags(raw, folder_name)
     missing: list[str] = []
     if mtp:
         missing.append("mtp_decode")
+    if raw.get("vision_config") and not raw.get("language_model_only"):
+        missing.append("vision")
     return tuple(missing)
 
 

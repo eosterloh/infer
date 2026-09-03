@@ -67,6 +67,14 @@ class ModelConfig:
     sliding_window: int | None = None
     qk_norm: bool = False
     intermediate_size_mlp: int | None = None
+    layer_types: tuple[str, ...] = field(default_factory=tuple)
+    attn_output_gate: bool = False
+    partial_rotary_factor: float = 1.0
+    linear_num_key_heads: int | None = None
+    linear_num_value_heads: int | None = None
+    linear_key_head_dim: int | None = None
+    linear_value_head_dim: int | None = None
+    linear_conv_kernel_dim: int | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -111,7 +119,7 @@ class ModelConfig:
     def norm_kind(self) -> str:
         if self.recipe_id in {"gpt2", "gpt_neox"}:
             return "layer"
-        if self.gemma_rms:
+        if self.gemma_rms or self.recipe_id == "qwen3_5":
             return "gemma_rms"
         return "rms"
 
@@ -180,6 +188,7 @@ class ModelConfig:
         if head_dim * nq != hidden_size and "head_dim" not in raw and recipe_id not in {
             "deepseek_v3",
             "phi3",
+            "qwen3_5",
         }:
             raise ValueError(
                 f"hidden_size={hidden_size} not divisible by "
@@ -200,7 +209,12 @@ class ModelConfig:
             pattern = str(pattern)
 
         attn_bias = bool(raw.get("attention_bias", recipe_id in {"qwen2", "qwen3", "gpt2", "gpt_neox"}))
-        qk_norm = bool(raw.get("qk_norm", recipe_id in {"qwen3"} or raw.get("use_qk_norm", False)))
+        qk_norm = bool(
+            raw.get(
+                "qk_norm",
+                recipe_id in {"qwen3", "qwen3_5"} or raw.get("use_qk_norm", False),
+            )
+        )
         sliding = raw.get("sliding_window")
         sliding_i = int(sliding) if sliding not in (None, False) else None
 
@@ -268,6 +282,16 @@ class ModelConfig:
             sliding_window=sliding_i,
             qk_norm=qk_norm,
             intermediate_size_mlp=_opt_int(raw, "intermediate_size_mlp"),
+            layer_types=tuple(str(t) for t in (raw.get("layer_types") or ())),
+            attn_output_gate=bool(
+                raw.get("attn_output_gate", recipe_id == "qwen3_5")
+            ),
+            partial_rotary_factor=float(raw.get("partial_rotary_factor") or 1.0),
+            linear_num_key_heads=_opt_int(raw, "linear_num_key_heads"),
+            linear_num_value_heads=_opt_int(raw, "linear_num_value_heads"),
+            linear_key_head_dim=_opt_int(raw, "linear_key_head_dim"),
+            linear_value_head_dim=_opt_int(raw, "linear_value_head_dim"),
+            linear_conv_kernel_dim=_opt_int(raw, "linear_conv_kernel_dim"),
             raw=raw,
         )
         schedule = build_schedule(partial)
@@ -310,6 +334,8 @@ class ModelConfig:
                 shapes.update(self._attn_shapes(p, nq, nkv, dh, h, bias))
             elif spec.mixer == MixerKind.MAMBA2:
                 shapes.update(self._mamba_shapes(p))
+            elif spec.mixer == MixerKind.GATED_DELTANET:
+                shapes.update(self._gdn_shapes(p))
 
             if spec.ffn == FfnKind.DENSE_MLP:
                 if spec.mixer != MixerKind.NONE:
@@ -379,14 +405,15 @@ class ModelConfig:
             else:
                 shapes[f"{p}.attn.q.weight"] = (nq * qk, h)
             return shapes
+        q_out = nq * dh * (2 if self.attn_output_gate else 1)
         shapes = {
-            f"{p}.attn.q.weight": (nq * dh, h),
+            f"{p}.attn.q.weight": (q_out, h),
             f"{p}.attn.k.weight": (nkv * dh, h),
             f"{p}.attn.v.weight": (nkv * dh, h),
             f"{p}.attn.o.weight": (h, nq * dh),
         }
         if bias:
-            shapes[f"{p}.attn.q.bias"] = (nq * dh,)
+            shapes[f"{p}.attn.q.bias"] = (q_out,)
             shapes[f"{p}.attn.k.bias"] = (nkv * dh,)
             shapes[f"{p}.attn.v.bias"] = (nkv * dh,)
         if self.qk_norm:
@@ -395,6 +422,30 @@ class ModelConfig:
         if kind == "gqa_sinks":
             shapes[f"{p}.attn.sinks"] = (nq,)
         return shapes
+
+    def _gdn_shapes(self, p: str) -> dict[str, tuple[int, ...]]:
+        assert self.linear_num_key_heads is not None
+        assert self.linear_num_value_heads is not None
+        assert self.linear_key_head_dim is not None
+        assert self.linear_value_head_dim is not None
+        assert self.linear_conv_kernel_dim is not None
+        h = self.hidden_size
+        key_dim = self.linear_num_key_heads * self.linear_key_head_dim
+        value_dim = self.linear_num_value_heads * self.linear_value_head_dim
+        conv_dim = key_dim * 2 + value_dim
+        k = self.linear_conv_kernel_dim
+        nv = self.linear_num_value_heads
+        return {
+            f"{p}.gdn.in_proj_qkv.weight": (conv_dim, h),
+            f"{p}.gdn.in_proj_z.weight": (value_dim, h),
+            f"{p}.gdn.in_proj_b.weight": (nv, h),
+            f"{p}.gdn.in_proj_a.weight": (nv, h),
+            f"{p}.gdn.conv1d.weight": (conv_dim, 1, k),
+            f"{p}.gdn.A_log": (nv,),
+            f"{p}.gdn.dt_bias": (nv,),
+            f"{p}.gdn.norm.weight": (self.linear_value_head_dim,),
+            f"{p}.gdn.out_proj.weight": (h, value_dim),
+        }
 
     def _mlp_shapes(
         self, p: str, h: int, i: int, mlp_bias: bool
@@ -573,6 +624,14 @@ def normalize_raw(raw: dict[str, Any]) -> dict[str, Any]:
         raw["num_key_value_heads"] = raw["num_attention_heads"]
     if "vocab_size" not in raw and isinstance(raw.get("tokenizer.ggml.tokens"), list):
         raw["vocab_size"] = len(raw["tokenizer.ggml.tokens"])
+    if "torch_dtype" not in raw and isinstance(raw.get("dtype"), str):
+        raw["torch_dtype"] = raw["dtype"]
+    rp = raw.get("rope_parameters")
+    if isinstance(rp, dict):
+        if rp.get("rope_theta") is not None:
+            raw["rope_theta"] = rp["rope_theta"]
+        if rp.get("partial_rotary_factor") is not None and "partial_rotary_factor" not in raw:
+            raw["partial_rotary_factor"] = rp["partial_rotary_factor"]
     return raw
 
 
