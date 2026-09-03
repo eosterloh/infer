@@ -103,13 +103,13 @@ def _vision_rope(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dim = head_dim // 2
-    inv = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-            / float(dim)
+    inv = (
+        1.0
+        / (
+            10000.0
+            ** (torch.arange(0, dim, 2, dtype=torch.float32) / float(dim))
         )
-    ).to(dtype=dtype)
+    ).to(device=device, dtype=dtype)
     freqs = (position_ids.to(device=device).unsqueeze(-1) * inv).flatten(1)
     emb = torch.cat((freqs, freqs), dim=-1)
     return emb.cos(), emb.sin()
@@ -283,7 +283,6 @@ def qwen35_vision_forward(
     cos, sin = _vision_rope(
         position_ids, hidden // num_heads, device, dtype=x.dtype
     )
-    cos, sin = cos.to(x.dtype), sin.to(x.dtype)
     cu_seqlens = cu_seqlens.to(device)
 
     for i in range(depth):

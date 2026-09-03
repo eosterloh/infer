@@ -10,14 +10,28 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import (
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5TextRotaryEmbedding,
     Qwen3_5VisionModel,
+    Qwen3_5VisionRotaryEmbedding,
 )
 
 from engine.layers.rope import build_mrope_cos_sin
 from engine.vision import (
+    _vision_rope,
     qwen35_rope_index,
     qwen35_vision_forward,
     validate_qwen35_vision_weights,
 )
+
+
+def test_qwen35_vision_rope_bfloat16_is_exact() -> None:
+    position_ids = torch.arange(40).reshape(20, 2)
+    reference = Qwen3_5VisionRotaryEmbedding(36).to(dtype=torch.bfloat16)
+    frequencies = reference(position_ids)
+    embedding = torch.cat((frequencies, frequencies), dim=-1)
+    actual_cos, actual_sin = _vision_rope(
+        position_ids, 72, torch.device("cpu"), torch.bfloat16
+    )
+    assert torch.equal(actual_cos, embedding.cos())
+    assert torch.equal(actual_sin, embedding.sin())
 
 
 def test_qwen35_vision_tiny_parity() -> None:
