@@ -33,6 +33,8 @@ _LLAMA_LAYER = {
     "self_attn.o_proj.bias": "attn.o.bias",
     "self_attn.q_norm.weight": "attn.q_norm.weight",
     "self_attn.k_norm.weight": "attn.k_norm.weight",
+    "self_attn.q_norm.bias": "attn.q_norm.bias",
+    "self_attn.k_norm.bias": "attn.k_norm.bias",
     "self_attn.sinks": "attn.sinks",
     "linear_attn.in_proj_qkv.weight": "gdn.in_proj_qkv.weight",
     "linear_attn.in_proj_z.weight": "gdn.in_proj_z.weight",
@@ -50,17 +52,35 @@ _LLAMA_LAYER = {
     "mlp.up_proj.bias": "mlp.up.bias",
     "mlp.down_proj.bias": "mlp.down.bias",
     "mlp.gate_up_proj.weight": "mlp.gate_up.weight",
+    "mlp.fc1.weight": "mlp.up.weight",
+    "mlp.fc1.bias": "mlp.up.bias",
+    "mlp.fc2.weight": "mlp.down.weight",
+    "mlp.fc2.bias": "mlp.down.bias",
+    "self_attn.dense.weight": "attn.o.weight",
+    "self_attn.dense.bias": "attn.o.bias",
+    "self_attn.q_layernorm.weight": "attn.q_norm.weight",
+    "self_attn.q_layernorm.bias": "attn.q_norm.bias",
+    "self_attn.k_layernorm.weight": "attn.k_norm.weight",
+    "self_attn.k_layernorm.bias": "attn.k_norm.bias",
     "self_attn.qkv_proj.weight": "attn.qkv.weight",
+    "mlp.c_fc.weight": "mlp.c_fc.weight",
+    "mlp.c_fc.bias": "mlp.c_fc.bias",
+    "mlp.c_proj.weight": "mlp.c_proj.weight",
+    "mlp.c_proj.bias": "mlp.c_proj.bias",
     "input_layernorm.weight": "input_norm.weight",
     "post_attention_layernorm.weight": "post_attn_norm.weight",
     "pre_feedforward_layernorm.weight": "pre_ff_norm.weight",
     "post_feedforward_layernorm.weight": "post_ff_norm.weight",
+    "post_self_attn_layernorm.weight": "post_attn_norm.weight",
+    "post_mlp_layernorm.weight": "post_ff_norm.weight",
     "input_layernorm.bias": "input_norm.bias",
     "post_attention_layernorm.bias": "post_attn_norm.bias",
+    "pre_feedforward_layernorm.bias": "pre_ff_norm.bias",
+    "post_feedforward_layernorm.bias": "post_ff_norm.bias",
 }
 
 
-def _map_llama_family(hf_name: str) -> str | None:
+def _map_llama_family(hf_name: str, config: ModelConfig | None = None) -> str | None:
     if hf_name in {
         "model.embed_tokens.weight",
         "model.language_model.embed_tokens.weight",
@@ -71,14 +91,24 @@ def _map_llama_family(hf_name: str) -> str | None:
         "model.norm.weight",
         "model.language_model.norm.weight",
         "language_model.model.norm.weight",
+        "model.final_layernorm.weight",
     }:
         return "final_norm.weight"
+    if hf_name in {
+        "model.norm.bias",
+        "model.language_model.norm.bias",
+        "language_model.model.norm.bias",
+        "model.final_layernorm.bias",
+    }:
+        return "final_norm.bias"
     if hf_name in {
         "lm_head.weight",
         "language_model.lm_head.weight",
         "model.lm_head.weight",
     }:
         return "lm_head.weight"
+    if hf_name in {"lm_head.bias", "language_model.lm_head.bias", "model.lm_head.bias"}:
+        return "lm_head.bias"
 
     hit = _layer_rest(
         hf_name,
@@ -93,7 +123,19 @@ def _map_llama_family(hf_name: str) -> str | None:
     _, i, rest = hit
 
     if rest in _LLAMA_LAYER:
-        return f"layers.{i}.{_LLAMA_LAYER[rest]}"
+        mapped = _LLAMA_LAYER[rest]
+        # GLM-4: post_attention_layernorm is the pre-MLP norm; post_self_attn is post-attn.
+        if rest == "post_attention_layernorm.weight" and config is not None:
+            mt = str(getattr(config, "model_type", "") or "").lower()
+            arches = " ".join(getattr(config, "architectures", ()) or ()).lower()
+            if mt.startswith("glm4") or "glm4" in arches:
+                mapped = "pre_ff_norm.weight"
+        if rest == "post_attention_layernorm.bias" and config is not None:
+            mt = str(getattr(config, "model_type", "") or "").lower()
+            arches = " ".join(getattr(config, "architectures", ()) or ()).lower()
+            if mt.startswith("glm4") or "glm4" in arches:
+                mapped = "pre_ff_norm.bias"
+        return f"layers.{i}.{mapped}"
 
     # Mixtral classic experts
     m = re.match(
@@ -105,6 +147,22 @@ def _map_llama_family(hf_name: str) -> str | None:
         return f"layers.{i}.moe.experts.{e}.{engine}.weight"
     if rest == "block_sparse_moe.gate.weight":
         return f"layers.{i}.moe.gate.weight"
+    if rest == "block_sparse_moe.router.weight":
+        return f"layers.{i}.moe.gate.weight"
+    if rest in {
+        "block_sparse_moe.experts.gate_up_proj",
+        "block_sparse_moe.experts.gate_up_proj.weight",
+    }:
+        return f"layers.{i}.moe.experts.gate_up.weight"
+    if rest in {
+        "block_sparse_moe.experts.down_proj",
+        "block_sparse_moe.experts.down_proj.weight",
+    }:
+        return f"layers.{i}.moe.experts.down.weight"
+    if rest == "shared_mlp.input_linear.weight":
+        return f"layers.{i}.moe.shared.gate_up.weight"
+    if rest == "shared_mlp.output_linear.weight":
+        return f"layers.{i}.moe.shared.down.weight"
 
     # Llama 4 packed MoE
     if rest == "feed_forward.router.weight":
@@ -119,6 +177,14 @@ def _map_llama_family(hf_name: str) -> str | None:
         return f"layers.{i}.moe.shared.up.weight"
     if rest == "feed_forward.shared_expert.down_proj.weight":
         return f"layers.{i}.moe.shared.down.weight"
+    if rest == "mlp.shared_expert.gate_proj.weight":
+        return f"layers.{i}.moe.shared.gate.weight"
+    if rest == "mlp.shared_expert.up_proj.weight":
+        return f"layers.{i}.moe.shared.up.weight"
+    if rest == "mlp.shared_expert.down_proj.weight":
+        return f"layers.{i}.moe.shared.down.weight"
+    if rest == "mlp.shared_expert_gate.weight":
+        return f"layers.{i}.moe.shared_gate.weight"
     if rest == "feed_forward.gate_proj.weight":
         return f"layers.{i}.mlp.gate.weight"
     if rest == "feed_forward.up_proj.weight":
@@ -131,13 +197,13 @@ def _map_llama_family(hf_name: str) -> str | None:
         return f"layers.{i}.moe.gate.weight"
     if rest == "mlp.router.bias":
         return f"layers.{i}.moe.gate.bias"
-    if rest == "mlp.experts.gate_up_proj":
+    if rest in {"mlp.experts.gate_up_proj", "mlp.experts.gate_up_proj.weight"}:
         return f"layers.{i}.moe.experts.gate_up.weight"
-    if rest == "mlp.experts.gate_up_proj_bias":
+    if rest in {"mlp.experts.gate_up_proj_bias", "mlp.experts.gate_up_proj.bias"}:
         return f"layers.{i}.moe.experts.gate_up.bias"
-    if rest == "mlp.experts.down_proj":
+    if rest in {"mlp.experts.down_proj", "mlp.experts.down_proj.weight"}:
         return f"layers.{i}.moe.experts.down.weight"
-    if rest == "mlp.experts.down_proj_bias":
+    if rest in {"mlp.experts.down_proj_bias", "mlp.experts.down_proj.bias"}:
         return f"layers.{i}.moe.experts.down.bias"
 
     # DeepSeek MLA + MoE
@@ -367,7 +433,7 @@ def map_hf_name(hf_name: str, config: ModelConfig | None = None) -> str | None:
         hf_name.startswith("backbone.") and recipe != "llama"
     ):
         return _map_nemotron_h_hf_name(hf_name)
-    return _map_llama_family(hf_name)
+    return _map_llama_family(hf_name, config)
 
 
 def is_ignored_hf_name(hf_name: str, config: ModelConfig | None = None) -> bool:

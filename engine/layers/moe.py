@@ -87,11 +87,14 @@ def softmax_topk(
     gate_weight: torch.Tensor,
     top_k: int,
     gate_bias: torch.Tensor | None = None,
+    *,
+    norm_topk_prob: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = F.linear(x.float(), gate_weight.float(), gate_bias.float() if gate_bias is not None else None)
     weights = torch.softmax(logits, dim=-1)
     topk_w, topk_i = torch.topk(weights, k=top_k, dim=-1)
-    topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
+    if norm_topk_prob:
+        topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
     return topk_i, topk_w
 
 
@@ -138,14 +141,20 @@ def moe(
 
     gate_w = weights[f"{p}.moe.gate.weight"]
     gate_b = weights.get(f"{p}.moe.gate.bias")
-    if kind == "gpt_oss":
+    norm_topk = bool(getattr(config, "norm_topk_prob", True))
+    logits_then_softmax = kind == "gpt_oss" or config.recipe_id in {
+        "granitemoe",
+        "granitemoeshared",
+    }
+    if logits_then_softmax:
         logits = F.linear(flat.float(), gate_w.float(), gate_b.float() if gate_b is not None else None)
         topk_v, topk_i = torch.topk(logits, k=top_k, dim=-1)
         topk_w = torch.softmax(topk_v, dim=-1)
     else:
-        topk_i, topk_w = softmax_topk(flat, gate_w, top_k, gate_b)
+        topk_i, topk_w = softmax_topk(flat, gate_w, top_k, gate_b, norm_topk_prob=norm_topk)
 
-    if kind in {"gpt_oss", "llama4"}:
+    packed = f"{p}.moe.experts.gate_up.weight" in weights
+    if kind in {"gpt_oss", "llama4"} or packed:
         routed = _packed_experts(flat, topk_i, topk_w, weights, p, n_routed, kind)
     else:
         act_gate = True
@@ -168,8 +177,16 @@ def moe(
         routed = _dispatch_experts(flat, topk_i, topk_w, n_routed, run)
 
     routed = routed.view(*orig_shape).to(dtype=x.dtype)
-    if f"{p}.moe.shared.up.weight" in weights:
-        if f"{p}.moe.shared.gate.weight" in weights:
+    if f"{p}.moe.shared.up.weight" in weights or f"{p}.moe.shared.gate_up.weight" in weights:
+        if f"{p}.moe.shared.gate_up.weight" in weights:
+            gate, up = weights[f"{p}.moe.shared.gate_up.weight"].chunk(2, dim=0)
+            shared = expert_swiglu(
+                residuals,
+                gate,
+                up,
+                weights[f"{p}.moe.shared.down.weight"],
+            )
+        elif f"{p}.moe.shared.gate.weight" in weights:
             shared = expert_swiglu(
                 residuals,
                 weights[f"{p}.moe.shared.gate.weight"],
@@ -183,6 +200,9 @@ def moe(
                 weights[f"{p}.moe.shared.down.weight"],
                 config.mlp_hidden_act or "silu",
             )
+        gate_w = weights.get(f"{p}.moe.shared_gate.weight")
+        if gate_w is not None:
+            shared = shared * torch.sigmoid(F.linear(residuals, gate_w))
         return routed + shared
     return routed
 
@@ -202,21 +222,17 @@ def _packed_experts(
     dn_bias = weights.get(f"{p}.moe.experts.down.bias")
 
     def run(idx: int, tok: torch.Tensor) -> torch.Tensor:
-        # llama4/gpt_oss: gate_up [E, H, 2I] (transposed vs Linear)
+        # llama4/gpt_oss store [E, H, 2I] / [E, I, H] (token @ weight).
+        # Qwen2/3-MoE store Linear layouts [E, 2I, H] / [E, H, I].
+        transposed = kind in {"gpt_oss", "llama4"}
         w_gu = gate_up[idx]
-        if w_gu.shape[0] == tok.shape[-1]:
-            fused = tok @ w_gu
-        else:
-            fused = F.linear(tok, w_gu)
+        fused = tok @ w_gu if transposed else F.linear(tok, w_gu)
         if gu_bias is not None:
             fused = fused + gu_bias[idx]
         gate, up = fused.chunk(2, dim=-1)
         h = F.silu(gate) * up
         w_dn = down[idx]
-        if w_dn.shape[0] == h.shape[-1]:
-            out = h @ w_dn
-        else:
-            out = F.linear(h, w_dn)
+        out = h @ w_dn if transposed else F.linear(h, w_dn)
         if dn_bias is not None:
             out = out + dn_bias[idx]
         return out

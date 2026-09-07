@@ -119,6 +119,68 @@ def test_detect_recipe_id_from_raw() -> None:
         )
         == "nemotron_h"
     )
+    assert detect_recipe_id({"model_type": "helium"}) == "llama"
+    assert detect_recipe_id({"architectures": ["HeliumForCausalLM"]}) == "llama"
+    assert detect_recipe_id({"model_type": "ernie4_5"}) == "llama"
+    assert detect_recipe_id({"model_type": "hunyuan_v1_dense"}) == "llama"
+    assert detect_recipe_id({"model_type": "seed_oss"}) == "llama"
+    assert detect_recipe_id({"model_type": "cwm"}) == "llama"
+    assert detect_recipe_id({"model_type": "ministral"}) == "mistral"
+    assert detect_recipe_id({"architectures": ["MinistralForCausalLM"]}) == "mistral"
+    assert detect_recipe_id({"model_type": "ministral3"}) == "mistral"
+    assert detect_recipe_id({"model_type": "granite"}) == "granite"
+    assert detect_recipe_id({"model_type": "olmo"}) == "olmo"
+    assert detect_recipe_id({"model_type": "olmo2"}) == "olmo2"
+    assert detect_recipe_id({"model_type": "olmo3"}) == "olmo3"
+    assert detect_recipe_id({"model_type": "olmoe"}) == "olmoe"
+    assert detect_recipe_id({"model_type": "olmo3"}) != "olmo"
+    assert detect_recipe_id({"model_type": "olmoe"}) != "olmo"
+    assert detect_recipe_id({"model_type": "phi3"}) == "phi3"
+    assert detect_recipe_id({"architectures": ["Phi3ForCausalLM"]}) == "phi3"
+    assert detect_recipe_id({"model_type": "phi"}) == "phi"
+    assert detect_recipe_id({"architectures": ["PhiForCausalLM"]}) == "phi"
+    assert detect_recipe_id({"model_type": "stablelm"}) == "stablelm"
+    assert detect_recipe_id({"model_type": "granite_swa"}) == "granite_swa"
+    assert detect_recipe_id({"model_type": "granitemoe"}) == "granitemoe"
+    assert detect_recipe_id({"model_type": "granitemoeshared"}) == "granitemoeshared"
+    assert detect_recipe_id({"model_type": "granitemoe"}) != "granite"
+    assert detect_recipe_id({"model_type": "cohere2"}) == "cohere"
+    assert detect_recipe_id({"architectures": ["Cohere2ForCausalLM"]}) == "cohere"
+    assert detect_recipe_id({"model_type": "exaone4"}) == "exaone4"
+    assert detect_recipe_id({"model_type": "arcee"}) == "arcee"
+    assert detect_recipe_id({"model_type": "mistral3"}) == "mistral"
+    assert detect_recipe_id({"architectures": ["Mistral3ForConditionalGeneration"]}) == "mistral"
+    assert detect_recipe_id({"model_type": "smollm3"}) == "smollm3"
+    assert detect_recipe_id({"model_type": "starcoder2"}) == "starcoder2"
+    assert detect_recipe_id({"model_type": "nemotron"}) == "nemotron"
+    assert detect_recipe_id({"model_type": "gemma2"}) == "gemma2"
+    assert detect_recipe_id({"model_type": "gemma2_text"}) == "gemma2"
+    assert detect_recipe_id({"model_type": "gemma3"}) == "gemma3"
+    assert detect_recipe_id({"architectures": ["Gemma3ForCausalLM"]}) == "gemma3"
+    assert detect_recipe_id({"model_type": "gemma"}) == "gemma"
+    assert detect_recipe_id({"model_type": "qwen3_moe"}) == "qwen3_moe"
+    assert detect_recipe_id({"architectures": ["Qwen3MoeForCausalLM"]}) == "qwen3_moe"
+    assert detect_recipe_id({"model_type": "qwen2_moe"}) == "qwen2_moe"
+    assert detect_recipe_id({"model_type": "cohere"}) == "cohere"
+    assert detect_recipe_id({"model_type": "glm"}) == "glm"
+    assert detect_recipe_id({"model_type": "glm4"}) == "glm"
+    with pytest.raises(UnsupportedRecipeError):
+        detect_recipe_id({"model_type": "phimoe"})
+    with pytest.raises(UnsupportedRecipeError):
+        detect_recipe_id({"model_type": "diffllama"})
+    with pytest.raises(UnsupportedRecipeError):
+        detect_recipe_id({"model_type": "granitemoehybrid"})
+    with pytest.raises(UnsupportedRecipeError):
+        detect_recipe_id({"model_type": "olmo_hybrid"})
+    with pytest.raises(UnsupportedRecipeError):
+        detect_recipe_id({"architectures": ["Phi4ForCausalLM"], "model_type": "phi4"})
+    assert detect_recipe_id({"model_type": "qwen3_moe"}) != "mixtral"
+    assert detect_recipe_id({"model_type": "gemma2"}) != "gemma"
+    assert detect_recipe_id({"model_type": "nemotron"}) != "nemotron_h"
+    with pytest.raises(UnsupportedRecipeError):
+        detect_recipe_id({"model_type": "ernie4_5_moe"})
+    with pytest.raises(UnsupportedRecipeError):
+        detect_recipe_id({"architectures": ["Ernie4_5MoeForCausalLM"], "model_type": "ernie4_5"})
 
 
 def test_generation_config_eos_overrides_config_json(tmp_path: Path) -> None:

@@ -6,6 +6,12 @@ import torch
 import torch.nn.functional as F
 
 
+def _gelu(x: torch.Tensor, act: str) -> torch.Tensor:
+    if act == "gelu_pytorch_tanh":
+        return F.gelu(x, approximate="tanh")
+    return F.gelu(x)
+
+
 def mlp(
     x: torch.Tensor,
     w_gate: torch.Tensor,
@@ -17,6 +23,7 @@ def mlp(
     b_up: torch.Tensor | None = None,
     b_down: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    gated = w_gate is not w_up
     if act in {"silu", "swiglu"}:
         return F.linear(
             F.silu(F.linear(x, w_gate, b_gate)) * F.linear(x, w_up, b_up),
@@ -24,7 +31,12 @@ def mlp(
             b_down,
         )
     if act in {"gelu", "gelu_new", "gelu_pytorch_tanh"}:
-        return F.linear(F.gelu(F.linear(x, w_up, b_up)), w_down, b_down)
+        up = F.linear(x, w_up, b_up)
+        if gated:
+            up = _gelu(F.linear(x, w_gate, b_gate), act) * up
+        else:
+            up = _gelu(up, act)
+        return F.linear(up, w_down, b_down)
     if act in {"relu2", "relu_squared", "squared_relu"}:
         h = F.linear(x, w_up, b_up)
         return F.linear(torch.square(F.relu(h)), w_down, b_down)
@@ -47,7 +59,7 @@ def mlp_from_weights(
             weights[f"{p}.mlp.c_fc.weight"],
             weights[f"{p}.mlp.c_fc.weight"],
             weights[f"{p}.mlp.c_proj.weight"],
-            act="gelu",
+            act=act or "gelu",
             b_up=weights.get(f"{p}.mlp.c_fc.bias"),
             b_down=weights.get(f"{p}.mlp.c_proj.bias"),
         )
@@ -55,7 +67,15 @@ def mlp_from_weights(
     up = weights.get(f"{p}.mlp.up.weight")
     down = weights[f"{p}.mlp.down.weight"]
     if gate is None:
-        return mlp(x, up, up, down, act=act or "relu2")
+        return mlp(
+            x,
+            up,
+            up,
+            down,
+            act=act or "relu2",
+            b_up=weights.get(f"{p}.mlp.up.bias"),
+            b_down=weights.get(f"{p}.mlp.down.bias"),
+        )
     return mlp(
         x,
         gate,

@@ -75,6 +75,20 @@ class ModelConfig:
     linear_key_head_dim: int | None = None
     linear_value_head_dim: int | None = None
     linear_conv_kernel_dim: int | None = None
+    embedding_multiplier: float = 1.0
+    residual_multiplier: float = 1.0
+    attention_multiplier: float | None = None
+    logits_scaling: float = 1.0
+    logit_scale: float = 1.0
+    attn_logit_softcapping: float | None = None
+    final_logit_softcapping: float | None = None
+    query_pre_attn_scalar: float | None = None
+    clip_qkv: float | None = None
+    residual_kind: str = "sequential"
+    no_rope_layers: tuple[int, ...] = field(default_factory=tuple)
+    layer_rope_theta: tuple[float, ...] = field(default_factory=tuple)
+    attention_out_bias: bool | None = None
+    norm_topk_prob: bool = True
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -99,7 +113,9 @@ class ModelConfig:
 
     @property
     def gemma_rms(self) -> bool:
-        return self.recipe_id == "gemma" or (self.model_type or "").startswith("gemma")
+        return self.recipe_id in {"gemma", "gemma2", "gemma3"} or (
+            self.model_type or ""
+        ).startswith("gemma")
 
     @property
     def embed_scale(self) -> float:
@@ -117,7 +133,13 @@ class ModelConfig:
 
     @property
     def norm_kind(self) -> str:
-        if self.recipe_id in {"gpt2", "gpt_neox"}:
+        if self.recipe_id == "olmo":
+            return "olmo"
+        if self.recipe_id == "cohere":
+            return "cohere"
+        if self.recipe_id == "nemotron":
+            return "layer_1p"
+        if self.recipe_id in {"gpt2", "gpt_neox", "starcoder2", "stablelm", "phi"}:
             return "layer"
         if self.gemma_rms or self.recipe_id == "qwen3_5":
             return "gemma_rms"
@@ -131,7 +153,7 @@ class ModelConfig:
             return "fused_qkv"
         if self.recipe_id == "deepseek_v3":
             return "mla"
-        if self.recipe_id == "gpt_oss":
+        if self.recipe_id in {"gpt_oss", "granite_swa"}:
             return "gqa_sinks"
         return "gqa"
 
@@ -139,7 +161,14 @@ class ModelConfig:
     def moe_kind(self) -> str:
         if self.moe_latent_size:
             return "latent"
-        if self.recipe_id == "mixtral":
+        if self.recipe_id in {
+            "mixtral",
+            "qwen3_moe",
+            "qwen2_moe",
+            "olmoe",
+            "granitemoe",
+            "granitemoeshared",
+        }:
             return "mixtral"
         if self.recipe_id == "llama4":
             return "llama4"
@@ -155,9 +184,20 @@ class ModelConfig:
     def uses_swiglu(self) -> bool:
         if self.recipe_id == "nemotron_h":
             return False
-        if self.recipe_id in {"gpt2", "gpt_neox"}:
+        if self.recipe_id in {"gpt2", "gpt_neox", "starcoder2", "nemotron", "phi", "arcee"}:
             return False
         return True
+
+    @property
+    def rope_interleaved(self) -> bool:
+        if self.recipe_id in {"cohere", "glm"}:
+            return True
+        mt = (self.model_type or "").lower().replace("-", "_")
+        if mt in {"helium"} or any(
+            "helium" in str(a).lower() for a in (self.architectures or ())
+        ):
+            return True
+        return False
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> ModelConfig:
@@ -202,19 +242,52 @@ class ModelConfig:
         arches = raw.get("architectures") or []
         num_layers = int(raw["num_hidden_layers"])
         eps = float(
-            raw.get("rms_norm_eps", raw.get("layer_norm_epsilon", raw.get("norm_eps", 1e-5)))
-        )
-        pattern = raw.get("hybrid_override_pattern")
-        if pattern is not None:
-            pattern = str(pattern)
-
-        attn_bias = bool(raw.get("attention_bias", recipe_id in {"qwen2", "qwen3", "gpt2", "gpt_neox"}))
-        qk_norm = bool(
             raw.get(
-                "qk_norm",
-                recipe_id in {"qwen3", "qwen3_5"} or raw.get("use_qk_norm", False),
+                "rms_norm_eps",
+                raw.get(
+                    "layer_norm_epsilon",
+                    raw.get(
+                        "layer_norm_eps",
+                        raw.get("norm_eps", raw.get("norm_epsilon", 1e-5)),
+                    ),
+                ),
             )
         )
+        hybrid_pattern = raw.get("hybrid_override_pattern")
+        if hybrid_pattern is not None:
+            hybrid_pattern = str(hybrid_pattern)
+
+        use_bias = bool(raw.get("use_bias", False))
+        mt = str(raw.get("model_type") or "")
+        attn_bias_default = recipe_id in {
+            "qwen2",
+            "qwen3",
+            "qwen2_moe",
+            "gpt2",
+            "gpt_neox",
+            "starcoder2",
+            "glm",
+            "phi",
+        } or use_bias or mt.lower() in {"seed_oss", "seedoss"}
+        if "attention_bias" in raw:
+            attn_bias = bool(raw["attention_bias"])
+        elif "qkv_bias" in raw:
+            attn_bias = bool(raw["qkv_bias"])
+        elif "use_qkv_bias" in raw:
+            attn_bias = bool(raw["use_qkv_bias"])
+        else:
+            attn_bias = attn_bias_default
+        qk_norm_default = recipe_id in {
+            "qwen3",
+            "qwen3_5",
+            "qwen3_moe",
+            "olmo2",
+            "olmo3",
+            "olmoe",
+            "gemma3",
+            "exaone4",
+        } or bool(raw.get("use_qk_norm", False))
+        qk_norm = bool(raw.get("qk_norm", raw.get("qk_layernorm", qk_norm_default)))
         sliding = raw.get("sliding_window")
         sliding_i = int(sliding) if sliding not in (None, False) else None
 
@@ -222,15 +295,157 @@ class ModelConfig:
         moe_inter = _opt_int(raw, "moe_intermediate_size") or (
             int(raw["intermediate_size"]) if n_routed else None
         )
-        shared_inter = _opt_int(raw, "moe_shared_expert_intermediate_size")
+        shared_inter = _opt_int(raw, "moe_shared_expert_intermediate_size") or _opt_int(
+            raw, "shared_expert_intermediate_size"
+        ) or _opt_int(raw, "shared_intermediate_size")
         if shared_inter is None and _opt_int(raw, "n_shared_experts"):
             shared_inter = (moe_inter or int(raw.get("intermediate_size", 0))) * int(
                 raw["n_shared_experts"]
             )
         partial_rotary = raw.get("partial_rotary_factor")
         if partial_rotary is None:
-            partial_rotary = 0.25 if recipe_id == "qwen3_5" else 1.0
+            if recipe_id == "qwen3_5":
+                partial_rotary = 0.25
+            elif recipe_id == "stablelm":
+                partial_rotary = 0.25
+            elif recipe_id in {"nemotron", "glm", "phi"}:
+                partial_rotary = 0.5
+            else:
+                partial_rotary = 1.0
         linear_defaults = recipe_id == "qwen3_5"
+        hidden_act = str(raw.get("hidden_act") or raw.get("hidden_activation") or "silu")
+        mlp_bias = bool(
+            raw.get(
+                "mlp_bias",
+                recipe_id in {"gpt2", "gpt_neox", "starcoder2", "phi"} or use_bias,
+            )
+        )
+        if "attention_out_bias" in raw:
+            attn_out_bias: bool | None = bool(raw["attention_out_bias"])
+        elif recipe_id == "starcoder2" or use_bias:
+            attn_out_bias = True
+        elif recipe_id == "phi":
+            attn_out_bias = True
+        elif mt.lower() in {"seed_oss", "seedoss"}:
+            attn_out_bias = False
+        else:
+            attn_out_bias = None
+
+        layer_types = tuple(str(t) for t in (raw.get("layer_types") or ()))
+        no_rope_raw = raw.get("no_rope_layers")
+        if no_rope_raw is None and recipe_id == "smollm3":
+            interval = int(raw.get("no_rope_layer_interval") or 4)
+            no_rope_raw = [
+                int((i + 1) % interval != 0) for i in range(num_layers)
+            ]
+        no_rope_layers = tuple(int(x) for x in (no_rope_raw or ()))
+        if not layer_types and recipe_id == "gemma2":
+            layer_types = tuple(
+                "sliding_attention" if (i + 1) % 2 else "full_attention"
+                for i in range(num_layers)
+            )
+        if not layer_types and recipe_id == "gemma3":
+            sw_pattern = int(raw.get("sliding_window_pattern") or 6)
+            layer_types = tuple(
+                "sliding_attention" if (i + 1) % sw_pattern else "full_attention"
+                for i in range(num_layers)
+            )
+        if not layer_types and recipe_id == "olmo3":
+            layer_types = tuple(
+                "sliding_attention" if (i + 1) % 4 != 0 else "full_attention"
+                for i in range(num_layers)
+            )
+        if not layer_types and recipe_id == "granite_swa":
+            layer_types = tuple(
+                "full_attention" if i % 4 == 0 else "sliding_attention"
+                for i in range(num_layers)
+            )
+        if not layer_types and recipe_id == "exaone4":
+            sw_pattern = raw.get("sliding_window_pattern") or 4
+            if isinstance(sw_pattern, str):
+                pattern = sw_pattern.upper()
+                cycling = (pattern * ((num_layers // max(len(pattern), 1)) + 1))[:num_layers]
+                layer_types = tuple(
+                    "sliding_attention" if ch == "L" else "full_attention" for ch in cycling
+                )
+            else:
+                step = int(sw_pattern) or 4
+                layer_types = tuple(
+                    "sliding_attention" if (i + 1) % step != 0 else "full_attention"
+                    for i in range(num_layers)
+                )
+        if not layer_types and mt.lower() in {"cohere2"}:
+            sw_pattern = int(raw.get("sliding_window_pattern") or 4)
+            layer_types = tuple(
+                "sliding_attention" if (i + 1) % sw_pattern else "full_attention"
+                for i in range(num_layers)
+            )
+        if not layer_types and recipe_id == "smollm3" and no_rope_layers:
+            sw = sliding_i
+            use_sw = bool(raw.get("use_sliding_window")) and sw is not None
+            types: list[str] = []
+            for i, has_rope in enumerate(no_rope_layers):
+                if use_sw and not has_rope:
+                    types.append("sliding_attention")
+                else:
+                    types.append("full_attention")
+            layer_types = tuple(types)
+
+        layer_rope_raw = raw.get("layer_rope_theta")
+        layer_rope_theta = tuple(float(x) for x in (layer_rope_raw or ()))
+        if not no_rope_layers and layer_rope_theta:
+            no_rope_layers = tuple(int(t != 0.0) for t in layer_rope_theta)
+        if (
+            not no_rope_layers
+            and layer_types
+            and sliding_i
+            and (mt.lower() in {"cohere2"} or recipe_id == "exaone4")
+        ):
+            no_rope_layers = tuple(
+                int("sliding" in str(t).lower()) for t in layer_types
+            )
+        if not layer_rope_theta and layer_types:
+            rp = raw.get("rope_parameters") or raw.get("rope_scaling") or {}
+            sliding_th = None
+            full_th = float(raw.get("rope_theta", 10000.0))
+            if isinstance(rp, dict):
+                sliding = rp.get("sliding_attention")
+                if isinstance(sliding, dict) and sliding.get("rope_theta") is not None:
+                    sliding_th = float(sliding["rope_theta"])
+                full = rp.get("full_attention")
+                if isinstance(full, dict) and full.get("rope_theta") is not None:
+                    full_th = float(full["rope_theta"])
+            if sliding_th is None and recipe_id == "gemma3" and any(
+                "sliding" in str(t).lower() for t in layer_types
+            ):
+                sliding_th = 10000.0
+            if sliding_th is not None:
+                layer_rope_theta = tuple(
+                    sliding_th if "sliding" in str(t).lower() else full_th
+                    for t in layer_types
+                )
+
+        mt = str(raw.get("model_type") or "")
+        if recipe_id in {"gemma2", "gemma3"} or (
+            recipe_id == "glm" and (mt.startswith("glm4") or any("glm4" in str(a).lower() for a in arches))
+        ):
+            residual_kind = "gemma2"
+        elif recipe_id in {"olmo2", "olmo3", "exaone4"}:
+            residual_kind = "post_norm"
+        elif recipe_id in {"cohere", "phi"} or bool(raw.get("use_parallel_residual")):
+            residual_kind = "parallel"
+        else:
+            residual_kind = "sequential"
+
+        granite_ids = {"granite", "granite_swa", "granitemoe", "granitemoeshared"}
+        granite_default = 1.0 if recipe_id in granite_ids else None
+        attn_mul = raw.get("attention_multiplier", granite_default)
+        q_pre = raw.get("query_pre_attn_scalar")
+        clip = raw.get("clip_qkv")
+        attn_soft = raw.get("attn_logit_softcapping")
+        final_soft = raw.get("final_logit_softcapping")
+        logit_scale_default = 0.0625 if recipe_id == "cohere" else 1.0
+        n_routed = n_routed or _opt_int(raw, "num_experts")
 
         partial = cls(
             vocab_size=int(raw["vocab_size"]),
@@ -245,9 +460,9 @@ class ModelConfig:
             max_position_embeddings=int(raw.get("max_position_embeddings", 2048)),
             tie_word_embeddings=bool(raw.get("tie_word_embeddings", recipe_id == "gpt2")),
             torch_dtype=dtype,
-            hidden_act=str(raw.get("hidden_act", "silu")),
+            hidden_act=hidden_act,
             attention_bias=attn_bias,
-            mlp_bias=bool(raw.get("mlp_bias", recipe_id in {"gpt2", "gpt_neox"})),
+            mlp_bias=mlp_bias,
             bos_token_id=raw.get("bos_token_id"),
             eos_token_id=raw.get("eos_token_id"),
             rope_scaling=raw.get("rope_scaling") or raw.get("rope_parameters"),
@@ -255,7 +470,7 @@ class ModelConfig:
             recipe_id=recipe_id,
             architectures=tuple(arches),
             layers=(),
-            hybrid_override_pattern=pattern,
+            hybrid_override_pattern=hybrid_pattern,
             mamba_num_heads=_opt_int(raw, "mamba_num_heads"),
             mamba_head_dim=_opt_int(raw, "mamba_head_dim"),
             ssm_state_size=_opt_int(raw, "ssm_state_size"),
@@ -287,7 +502,7 @@ class ModelConfig:
             sliding_window=sliding_i,
             qk_norm=qk_norm,
             intermediate_size_mlp=_opt_int(raw, "intermediate_size_mlp"),
-            layer_types=tuple(str(t) for t in (raw.get("layer_types") or ())),
+            layer_types=layer_types,
             attn_output_gate=bool(
                 raw.get("attn_output_gate", recipe_id == "qwen3_5")
             ),
@@ -302,6 +517,25 @@ class ModelConfig:
             or (128 if linear_defaults else None),
             linear_conv_kernel_dim=_opt_int(raw, "linear_conv_kernel_dim")
             or (4 if linear_defaults else None),
+            embedding_multiplier=float(raw.get("embedding_multiplier", 1.0) or 1.0),
+            residual_multiplier=float(raw.get("residual_multiplier", 1.0) or 1.0),
+            attention_multiplier=(float(attn_mul) if attn_mul is not None else None),
+            logits_scaling=float(raw.get("logits_scaling", 1.0) or 1.0),
+            logit_scale=float(raw.get("logit_scale", logit_scale_default) or logit_scale_default),
+            attn_logit_softcapping=(float(attn_soft) if attn_soft is not None else None),
+            final_logit_softcapping=(float(final_soft) if final_soft is not None else None),
+            query_pre_attn_scalar=(float(q_pre) if q_pre is not None else None),
+            clip_qkv=(float(clip) if clip is not None else None),
+            residual_kind=residual_kind,
+            no_rope_layers=no_rope_layers,
+            layer_rope_theta=layer_rope_theta,
+            attention_out_bias=attn_out_bias,
+            norm_topk_prob=bool(
+                raw.get(
+                    "norm_topk_prob",
+                    recipe_id not in {"qwen2_moe", "qwen3_moe", "olmoe"},
+                )
+            ),
             raw=raw,
         )
         schedule = build_schedule(partial)
@@ -318,24 +552,36 @@ class ModelConfig:
         nq = self.num_attention_heads
         nkv = self.num_key_value_heads
         schedule = self.layers or llama_dense_schedule(self.num_hidden_layers)
-        ln = self.norm_kind == "layer"
+        ln = self.norm_kind in {"layer", "layer_1p"}
+        skip_all_norms = self.norm_kind == "olmo"
+        residual_kind = getattr(self, "residual_kind", "sequential") or "sequential"
+        skip_input = skip_all_norms or residual_kind == "post_norm"
+        skip_post_attn = skip_all_norms or residual_kind == "parallel"
+        extra_pre_ff = residual_kind == "gemma2"
+        extra_post_ff = residual_kind in {"gemma2", "post_norm"}
         bias = self.attention_bias
         mlp_bias = self.mlp_bias
 
         shapes: dict[str, tuple[int, ...]] = {
             "embed.weight": (v, h),
-            "final_norm.weight": (h,),
         }
-        if ln:
-            shapes["final_norm.bias"] = (h,)
+        if not skip_all_norms:
+            shapes["final_norm.weight"] = (h,)
+            if ln:
+                shapes["final_norm.bias"] = (h,)
         if self.pos_kind == "learned":
             shapes["pos_embed.weight"] = (self.max_position_embeddings, h)
         if not self.tie_word_embeddings:
             shapes["lm_head.weight"] = (v, h)
+        if self.recipe_id == "phi":
+            shapes["lm_head.bias"] = (v,)
 
         for spec in schedule:
             p = f"layers.{spec.index}"
-            if spec.mixer != MixerKind.NONE or spec.ffn != FfnKind.NONE:
+            if (
+                not skip_input
+                and (spec.mixer != MixerKind.NONE or spec.ffn != FfnKind.NONE)
+            ):
                 shapes[f"{p}.input_norm.weight"] = (h,)
                 if ln:
                     shapes[f"{p}.input_norm.bias"] = (h,)
@@ -348,17 +594,28 @@ class ModelConfig:
                 shapes.update(self._gdn_shapes(p))
 
             if spec.ffn == FfnKind.DENSE_MLP:
-                if spec.mixer != MixerKind.NONE:
+                if spec.mixer != MixerKind.NONE and not skip_post_attn:
                     shapes[f"{p}.post_attn_norm.weight"] = (h,)
                     if ln:
                         shapes[f"{p}.post_attn_norm.bias"] = (h,)
+                if extra_pre_ff:
+                    shapes[f"{p}.pre_ff_norm.weight"] = (h,)
+                    if ln:
+                        shapes[f"{p}.pre_ff_norm.bias"] = (h,)
+                if extra_post_ff:
+                    shapes[f"{p}.post_ff_norm.weight"] = (h,)
+                    if ln:
+                        shapes[f"{p}.post_ff_norm.bias"] = (h,)
                 shapes.update(self._mlp_shapes(p, h, i, mlp_bias))
-                if self.recipe_id == "nemotron_h" or (
-                    self.mlp_hidden_act and self.mlp_hidden_act != "silu"
+                if (
+                    self.recipe_id in {"nemotron_h", "nemotron"}
+                    or not self.uses_swiglu
+                    or (self.mlp_hidden_act and self.mlp_hidden_act != "silu")
                 ):
                     shapes.pop(f"{p}.mlp.gate.weight", None)
+                    shapes.pop(f"{p}.mlp.gate.bias", None)
             elif spec.ffn == FfnKind.MOE:
-                if spec.mixer != MixerKind.NONE:
+                if spec.mixer != MixerKind.NONE and not skip_post_attn:
                     shapes[f"{p}.post_attn_norm.weight"] = (h,)
                     if ln:
                         shapes[f"{p}.post_attn_norm.bias"] = (h,)
@@ -428,9 +685,18 @@ class ModelConfig:
             shapes[f"{p}.attn.q.bias"] = (q_out,)
             shapes[f"{p}.attn.k.bias"] = (nkv * dh,)
             shapes[f"{p}.attn.v.bias"] = (nkv * dh,)
+        if self.attention_out_bias:
+            shapes[f"{p}.attn.o.bias"] = (h,)
         if self.qk_norm:
-            shapes[f"{p}.attn.q_norm.weight"] = (dh,)
-            shapes[f"{p}.attn.k_norm.weight"] = (dh,)
+            if self.recipe_id in {"olmo2", "olmo3", "olmoe"}:
+                shapes[f"{p}.attn.q_norm.weight"] = (nq * dh,)
+                shapes[f"{p}.attn.k_norm.weight"] = (nkv * dh,)
+            else:
+                shapes[f"{p}.attn.q_norm.weight"] = (dh,)
+                shapes[f"{p}.attn.k_norm.weight"] = (dh,)
+            if self.recipe_id == "phi":
+                shapes[f"{p}.attn.q_norm.bias"] = (dh,)
+                shapes[f"{p}.attn.k_norm.bias"] = (dh,)
         if kind == "gqa_sinks":
             shapes[f"{p}.attn.sinks"] = (nq,)
         return shapes
@@ -462,19 +728,19 @@ class ModelConfig:
     def _mlp_shapes(
         self, p: str, h: int, i: int, mlp_bias: bool
     ) -> dict[str, tuple[int, ...]]:
-        if self.recipe_id == "phi3":
+        if self.recipe_id in {"phi3", "glm"}:
             return {
                 f"{p}.mlp.gate_up.weight": (2 * i, h),
                 f"{p}.mlp.down.weight": (h, i),
             }
-        if self.recipe_id == "gpt2":
+        if self.recipe_id in {"gpt2", "starcoder2"}:
             return {
                 f"{p}.mlp.c_fc.weight": (i, h),
                 f"{p}.mlp.c_fc.bias": (i,),
                 f"{p}.mlp.c_proj.weight": (h, i),
                 f"{p}.mlp.c_proj.bias": (h,),
             }
-        if self.recipe_id == "gpt_neox":
+        if self.recipe_id in {"gpt_neox", "nemotron"}:
             out = {
                 f"{p}.mlp.up.weight": (i, h),
                 f"{p}.mlp.down.weight": (h, i),
@@ -544,6 +810,22 @@ class ModelConfig:
                     shapes[f"{p}.moe.shared.up.weight"] = (si, h)
                     shapes[f"{p}.moe.shared.down.weight"] = (h, si)
                 return shapes
+            if self.recipe_id in {"qwen3_moe", "qwen2_moe", "olmoe", "granitemoe", "granitemoeshared"}:
+                # Transformers 5.x packed expert tensors: [E, 2I, H] / [E, H, I]
+                shapes[f"{p}.moe.experts.gate_up.weight"] = (n_e, 2 * mi, h)
+                shapes[f"{p}.moe.experts.down.weight"] = (n_e, h, mi)
+                if self.recipe_id == "qwen2_moe":
+                    si = self.moe_shared_expert_intermediate_size or self.intermediate_size
+                    shapes[f"{p}.moe.shared.gate.weight"] = (si, h)
+                    shapes[f"{p}.moe.shared.up.weight"] = (si, h)
+                    shapes[f"{p}.moe.shared.down.weight"] = (h, si)
+                    shapes[f"{p}.moe.shared_gate.weight"] = (1, h)
+                if self.recipe_id == "granitemoeshared":
+                    si = self.moe_shared_expert_intermediate_size or 0
+                    if si:
+                        shapes[f"{p}.moe.shared.gate_up.weight"] = (2 * si, h)
+                        shapes[f"{p}.moe.shared.down.weight"] = (h, si)
+                return shapes
             for e in range(n_e):
                 shapes[f"{p}.moe.experts.{e}.gate.weight"] = (mi, h)
                 shapes[f"{p}.moe.experts.{e}.up.weight"] = (mi, h)
@@ -607,7 +889,7 @@ def normalize_raw(raw: dict[str, Any]) -> dict[str, Any]:
     raw = dict(raw)
     if "text_config" in raw and isinstance(raw["text_config"], dict):
         outer_model_type = str(raw.get("model_type", ""))
-        if "hidden_size" not in raw or outer_model_type.startswith("qwen3_5"):
+        if "hidden_size" not in raw or outer_model_type.startswith("qwen3_5") or outer_model_type.startswith("gemma3") or outer_model_type.startswith("mistral3"):
             text = dict(raw["text_config"])
             arches = raw.get("architectures")
             mt = raw.get("model_type")
@@ -624,6 +906,9 @@ def normalize_raw(raw: dict[str, Any]) -> dict[str, Any]:
         "n_inner": "intermediate_size",
         "num_local_experts": "n_routed_experts",
         "num_experts": "n_routed_experts",
+        "shared_expert_intermediate_size": "moe_shared_expert_intermediate_size",
+        "shared_intermediate_size": "moe_shared_expert_intermediate_size",
+        "norm_epsilon": "layer_norm_epsilon",
         "n_ctx": "max_position_embeddings",
         "d_model": "hidden_size",
         "n_embed": "hidden_size",
@@ -643,6 +928,10 @@ def normalize_raw(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(rp, dict):
         if rp.get("rope_theta") is not None:
             raw["rope_theta"] = rp["rope_theta"]
+        else:
+            nested = rp.get("full_attention")
+            if isinstance(nested, dict) and nested.get("rope_theta") is not None:
+                raw["rope_theta"] = nested["rope_theta"]
         if rp.get("partial_rotary_factor") is not None and "partial_rotary_factor" not in raw:
             raw["partial_rotary_factor"] = rp["partial_rotary_factor"]
     return raw

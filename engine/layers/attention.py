@@ -73,20 +73,41 @@ def attention(
     b_o: torch.Tensor | None = None,
     q_norm: torch.Tensor | None = None,
     k_norm: torch.Tensor | None = None,
+    q_norm_bias: torch.Tensor | None = None,
+    k_norm_bias: torch.Tensor | None = None,
     sliding_window: int | None = None,
     sinks: torch.Tensor | None = None,
     rms_eps: float = 1e-6,
     output_gate: bool = False,
     qk_gemma: bool = False,
     attention_mask: torch.Tensor | None = None,
+    attention_multiplier: float | None = None,
+    query_pre_attn_scalar: float | None = None,
+    attn_logit_softcapping: float | None = None,
+    clip_qkv: float | None = None,
+    rope_interleaved: bool = False,
 ) -> torch.Tensor:
     """Causal GQA attention. x: [B, S_new, H]."""
     b, s_new, _ = x.shape
     q = F.linear(x, w_q, b_q)
     k = F.linear(x, w_k, b_k)
     v = F.linear(x, w_v, b_v)
+    if clip_qkv is not None:
+        q = q.clamp(-clip_qkv, clip_qkv)
+        k = k.clamp(-clip_qkv, clip_qkv)
+        v = v.clamp(-clip_qkv, clip_qkv)
 
     gate = None
+    qn = gemma_rms_norm if qk_gemma else rms_norm
+    kn = gemma_rms_norm if qk_gemma else rms_norm
+    # Olmo2: RMS over the concatenated Q/K vector before the head split.
+    if q_norm is not None and q_norm.numel() == q.shape[-1]:
+        q = qn(q, q_norm, rms_eps)
+        q_norm = None
+    if k_norm is not None and k_norm.numel() == k.shape[-1]:
+        k = kn(k, k_norm, rms_eps)
+        k_norm = None
+
     if output_gate:
         q = q.view(b, s_new, nq, hd * 2)
         q, gate_h = q.split(hd, dim=-1)
@@ -98,16 +119,20 @@ def attention(
     v = v.view(b, s_new, nkv, hd).transpose(1, 2)
 
     if q_norm is not None:
-        qn = gemma_rms_norm if qk_gemma else rms_norm
-        q = qn(q, q_norm, rms_eps)
+        if q_norm_bias is not None:
+            q = F.layer_norm(q, (hd,), q_norm, q_norm_bias, rms_eps)
+        else:
+            q = qn(q, q_norm, rms_eps)
     if k_norm is not None:
-        kn = gemma_rms_norm if qk_gemma else rms_norm
-        k = kn(k, k_norm, rms_eps)
+        if k_norm_bias is not None:
+            k = F.layer_norm(k, (hd,), k_norm, k_norm_bias, rms_eps)
+        else:
+            k = kn(k, k_norm, rms_eps)
 
     if use_rope:
         if cos.numel() == 0 or sin.numel() == 0:
             raise ValueError("use_rope=True but cos/sin are empty")
-        q, k = apply_rope(q, k, cos, sin)
+        q, k = apply_rope(q, k, cos, sin, interleaved=rope_interleaved)
 
     if cache is not None:
         if layer is None:
@@ -118,8 +143,16 @@ def attention(
     k = repeat_kv(k, nq // nkv)
     v = repeat_kv(v, nq // nkv)
 
-    scale = 1.0 / math.sqrt(hd)
+    if attention_multiplier is not None:
+        scale = float(attention_multiplier)
+    elif query_pre_attn_scalar is not None:
+        scale = float(query_pre_attn_scalar) ** -0.5
+    else:
+        scale = 1.0 / math.sqrt(hd)
     scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+    if attn_logit_softcapping:
+        cap = float(attn_logit_softcapping)
+        scores = torch.tanh(scores / cap) * cap
 
     if s_new == s_total:
         causal = torch.triu(
@@ -183,6 +216,17 @@ def attention(
     return out
 
 
+def _layer_sliding_window(config: ModelConfig, layer: int) -> int | None:
+    types = getattr(config, "layer_types", ()) or ()
+    if layer < len(types):
+        kind = str(types[layer]).lower().replace("-", "_")
+        if kind in {"sliding_attention", "sliding"}:
+            return config.sliding_window
+        if kind in {"full_attention", "full"}:
+            return None
+    return config.sliding_window
+
+
 def attention_from_weights(
     x: torch.Tensor,
     weights: dict[str, torch.Tensor],
@@ -198,6 +242,7 @@ def attention_from_weights(
     p = f"layers.{spec_index}"
     nq, nkv, hd = config.num_attention_heads, config.num_key_value_heads, config.head_dim
     kind = config.attention_kind
+    sliding_window = _layer_sliding_window(config, spec_index)
 
     if kind == "gpt2":
         qkv = F.linear(x, weights[f"{p}.attn.c_attn.weight"], weights.get(f"{p}.attn.c_attn.bias"))
@@ -229,7 +274,9 @@ def attention_from_weights(
         qkv = F.linear(x, weights[f"{p}.attn.qkv.weight"], weights.get(f"{p}.attn.qkv.bias"))
         q, k, v = _split_qkv(qkv, nq, nkv, hd, gpt_neox=config.recipe_id == "gpt_neox")
         if use_rope and cos.numel():
-            q, k = apply_rope(q, k, cos, sin)
+            q, k = apply_rope(
+                q, k, cos, sin, interleaved=bool(getattr(config, "rope_interleaved", False))
+            )
         if cache is not None:
             k, v = cache.update(spec_index, k, v)
         k = repeat_kv(k, nq // max(nkv, 1)) if nkv else k
@@ -281,10 +328,17 @@ def attention_from_weights(
         b_o=weights.get(f"{p}.attn.o.bias"),
         q_norm=weights.get(f"{p}.attn.q_norm.weight"),
         k_norm=weights.get(f"{p}.attn.k_norm.weight"),
-        sliding_window=config.sliding_window,
+        q_norm_bias=weights.get(f"{p}.attn.q_norm.bias"),
+        k_norm_bias=weights.get(f"{p}.attn.k_norm.bias"),
+        sliding_window=sliding_window,
         sinks=weights.get(f"{p}.attn.sinks"),
         rms_eps=config.rms_norm_eps,
         output_gate=config.attn_output_gate,
         qk_gemma=config.norm_kind == "gemma_rms",
         attention_mask=attention_mask,
+        attention_multiplier=getattr(config, "attention_multiplier", None),
+        query_pre_attn_scalar=getattr(config, "query_pre_attn_scalar", None),
+        attn_logit_softcapping=getattr(config, "attn_logit_softcapping", None),
+        clip_qkv=getattr(config, "clip_qkv", None),
+        rope_interleaved=bool(getattr(config, "rope_interleaved", False)),
     )

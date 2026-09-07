@@ -8,7 +8,7 @@ import torch
 
 from engine.agent_api import inspect_capabilities, load_engine
 from engine.config import ModelConfig
-from engine.detect import detect_recipe_id
+from engine.detect import detect_recipe_id, detect_missing
 from engine.model import DecoderModel
 from engine.weights import load_weights, validate_name_map
 from engine.synth import random_engine_weights, write_config, write_hf_folder
@@ -346,3 +346,475 @@ def test_llama4_nested_text_config(tmp_path: Path) -> None:
     cfg = ModelConfig.from_pretrained(folder)
     assert cfg.recipe_id == "llama4"
     assert cfg.n_routed_experts == 4
+
+
+def test_granite_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GraniteForCausalLM"],
+        "model_type": "granite",
+        "embedding_multiplier": 1.0,
+        "residual_multiplier": 1.0,
+        "attention_multiplier": 0.125,
+        "logits_scaling": 1.0,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "granite")
+
+
+def test_olmo_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["OlmoForCausalLM"],
+        "model_type": "olmo",
+        "clip_qkv": 8.0,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "olmo")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "olmoshapes", raw))
+    shapes = cfg.expected_shapes()
+    assert not any("norm" in k for k in shapes)
+
+
+def test_olmo2_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Olmo2ForCausalLM"],
+        "model_type": "olmo2",
+        "qk_norm": True,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "olmo2")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "olmo2shapes", raw))
+    shapes = cfg.expected_shapes()
+    assert "layers.0.input_norm.weight" not in shapes
+    assert "layers.0.post_attn_norm.weight" in shapes
+    assert "layers.0.post_ff_norm.weight" in shapes
+    assert shapes["layers.0.attn.q_norm.weight"] == (cfg.nq * cfg.head_dim,)
+
+
+def test_smollm3_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["SmolLM3ForCausalLM"],
+        "model_type": "smollm3",
+        "no_rope_layers": [1, 0],
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "smollm3")
+
+
+def test_starcoder2_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Starcoder2ForCausalLM"],
+        "model_type": "starcoder2",
+        "hidden_act": "gelu_pytorch_tanh",
+        "use_bias": True,
+        "norm_epsilon": 1e-5,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "starcoder2")
+
+
+def test_nemotron_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["NemotronForCausalLM"],
+        "model_type": "nemotron",
+        "hidden_act": "relu2",
+        "norm_eps": 1e-5,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "nemotron")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "nemotronshapes", raw))
+    shapes = cfg.expected_shapes()
+    assert "layers.0.mlp.gate.weight" not in shapes
+    assert "layers.0.mlp.up.weight" in shapes
+    assert cfg.partial_rotary_factor == 0.5
+    assert cfg.uses_swiglu is False
+
+
+def test_gemma2_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Gemma2ForCausalLM"],
+        "model_type": "gemma2",
+        "hidden_activation": "gelu_pytorch_tanh",
+        "query_pre_attn_scalar": 8,
+        "sliding_window": 16,
+        "attn_logit_softcapping": 50.0,
+        "final_logit_softcapping": 30.0,
+        "layer_types": ["sliding_attention", "full_attention"],
+    }
+    _run_folder(tmp_path, raw, "gemma2")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "gemma2shapes", raw))
+    shapes = cfg.expected_shapes()
+    assert "layers.0.pre_ff_norm.weight" in shapes
+    assert "layers.0.post_ff_norm.weight" in shapes
+    assert "layers.0.post_attn_norm.weight" in shapes
+    assert "layers.0.input_norm.weight" in shapes
+
+
+def test_gemma3_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Gemma3ForCausalLM"],
+        "model_type": "gemma3",
+        "hidden_activation": "gelu_pytorch_tanh",
+        "query_pre_attn_scalar": 8,
+        "qk_norm": True,
+        "layer_types": ["full_attention", "full_attention"],
+    }
+    _run_folder(tmp_path, raw, "gemma3")
+
+
+def test_gemma3_mixed_sliding_full_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Gemma3ForCausalLM"],
+        "model_type": "gemma3",
+        "hidden_activation": "gelu_pytorch_tanh",
+        "query_pre_attn_scalar": 8,
+        "qk_norm": True,
+        "sliding_window": 4,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "rope_theta": 1_000_000.0,
+        "rope_parameters": {
+            "full_attention": {"rope_type": "default", "rope_theta": 1_000_000.0},
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10_000.0},
+        },
+    }
+    _run_folder(tmp_path, raw, "gemma3")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "gemma3mixedshapes", raw))
+    assert cfg.layer_types == ("sliding_attention", "full_attention")
+    assert cfg.qk_norm is True
+    assert cfg.residual_kind == "gemma2"
+
+
+def test_gemma3_nested_text_config(tmp_path: Path) -> None:
+    raw = {
+        "architectures": ["Gemma3ForConditionalGeneration"],
+        "model_type": "gemma3",
+        "text_config": {
+            **_BASE,
+            "model_type": "gemma3_text",
+            "hidden_activation": "gelu_pytorch_tanh",
+            "query_pre_attn_scalar": 8,
+            "layer_types": ["full_attention", "full_attention"],
+        },
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "gemma3nested", raw))
+    assert cfg.recipe_id == "gemma3"
+    assert cfg.qk_norm is True
+    assert cfg.hidden_size == _H
+
+
+def test_qwen3_moe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "model_type": "qwen3_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": [],
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "qwen3_moe")
+
+
+def test_qwen2_moe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Qwen2MoeForCausalLM"],
+        "model_type": "qwen2_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "shared_expert_intermediate_size": 64,
+        "qkv_bias": True,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "qwen2_moe")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "qwen2moeshapes", raw))
+    shapes = cfg.expected_shapes()
+    assert "layers.0.moe.shared.gate.weight" in shapes
+    assert "layers.0.moe.shared_gate.weight" in shapes
+    assert shapes["layers.0.moe.shared_gate.weight"] == (1, cfg.hidden_size)
+
+
+def test_cohere_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["CohereForCausalLM"],
+        "model_type": "cohere",
+        "logit_scale": 0.0625,
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "cohere")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "cohereshapes", raw))
+    assert "layers.0.post_attn_norm.weight" not in cfg.expected_shapes()
+    assert "layers.0.input_norm.weight" in cfg.expected_shapes()
+
+
+def test_glm_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GlmForCausalLM"],
+        "model_type": "glm",
+        "attention_bias": True,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "glm")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "glmshapes", raw))
+    assert "layers.0.mlp.gate_up.weight" in cfg.expected_shapes()
+    assert cfg.partial_rotary_factor == 0.5
+
+
+def test_glm4_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Glm4ForCausalLM"],
+        "model_type": "glm4",
+        "attention_bias": True,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "glm")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "glm4shapes", raw))
+    assert cfg.recipe_id == "glm"
+    assert cfg.residual_kind == "gemma2"
+    shapes = cfg.expected_shapes()
+    assert "layers.0.pre_ff_norm.weight" in shapes
+    assert "layers.0.post_ff_norm.weight" in shapes
+
+
+def test_helium_alias_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["HeliumForCausalLM"],
+        "model_type": "helium",
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "llama")
+
+
+def test_seed_oss_alias_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["SeedOssForCausalLM"],
+        "model_type": "seed_oss",
+        "attention_bias": True,
+        "attention_out_bias": False,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "llama")
+
+
+def test_ministral_alias_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["MinistralForCausalLM"],
+        "model_type": "ministral",
+        "sliding_window": 16,
+    }
+    _run_folder(tmp_path, raw, "mistral")
+
+
+def test_phi_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["PhiForCausalLM"],
+        "model_type": "phi",
+        "hidden_act": "gelu_new",
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "phi")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "phishapes", raw))
+    assert cfg.residual_kind == "parallel"
+    assert cfg.partial_rotary_factor == 0.5
+    shapes = cfg.expected_shapes()
+    assert "layers.0.mlp.gate.weight" not in shapes
+    assert "layers.0.mlp.up.weight" in shapes
+    assert "layers.0.post_attn_norm.weight" not in shapes
+    assert "layers.0.attn.o.weight" in shapes
+
+
+def test_olmo3_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Olmo3ForCausalLM"],
+        "model_type": "olmo3",
+        "layer_types": ["sliding_attention", "full_attention"],
+        "sliding_window": 4,
+        "qk_norm": True,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "olmo3")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "olmo3shapes", raw))
+    assert cfg.residual_kind == "post_norm"
+    assert cfg.qk_norm is True
+    shapes = cfg.expected_shapes()
+    assert "layers.0.input_norm.weight" not in shapes
+    assert "layers.0.post_attn_norm.weight" in shapes
+    assert "layers.0.post_ff_norm.weight" in shapes
+    assert shapes["layers.0.attn.q_norm.weight"] == (cfg.num_attention_heads * cfg.head_dim,)
+
+
+def test_stablelm_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["StableLmForCausalLM"],
+        "model_type": "stablelm",
+        "use_parallel_residual": True,
+        "use_qkv_bias": True,
+        "qk_layernorm": False,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "stablelm")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "stablelmshapes", raw))
+    assert cfg.residual_kind == "parallel"
+    assert cfg.partial_rotary_factor == 0.25
+    assert cfg.attention_bias is True
+    assert "layers.0.post_attn_norm.weight" not in cfg.expected_shapes()
+
+
+def test_olmoe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["OlmoeForCausalLM"],
+        "model_type": "olmoe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": False,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "olmoe")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "olmoeshapes", raw))
+    shapes = cfg.expected_shapes()
+    assert "layers.0.moe.experts.gate_up.weight" in shapes
+    assert cfg.qk_norm is True
+
+
+def test_granite_swa_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GraniteSWAForCausalLM"],
+        "model_type": "granite_swa",
+        "attention_multiplier": 0.25,
+        "residual_multiplier": 1.0,
+        "embedding_multiplier": 1.0,
+        "logits_scaling": 1.0,
+        "sliding_window": 4,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "layer_rope_theta": [10000.0, 0.0],
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "granite_swa")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "graniteswashapes", raw))
+    assert cfg.no_rope_layers == (1, 0)
+    assert "layers.0.attn.sinks" in cfg.expected_shapes()
+
+
+def test_granitemoe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GraniteMoeForCausalLM"],
+        "model_type": "granitemoe",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "attention_multiplier": 1.0,
+        "residual_multiplier": 1.0,
+        "embedding_multiplier": 1.0,
+        "logits_scaling": 1.0,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "granitemoe")
+
+
+def test_granitemoeshared_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GraniteMoeSharedForCausalLM"],
+        "model_type": "granitemoeshared",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "shared_intermediate_size": 64,
+        "attention_multiplier": 1.0,
+        "residual_multiplier": 1.0,
+        "embedding_multiplier": 1.0,
+        "logits_scaling": 1.0,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "granitemoeshared")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "granitemoesharedshapes", raw))
+    shapes = cfg.expected_shapes()
+    assert "layers.0.moe.shared.gate_up.weight" in shapes
+    assert shapes["layers.0.moe.shared.gate_up.weight"][0] == 128
+
+
+def test_cohere2_alias_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Cohere2ForCausalLM"],
+        "model_type": "cohere2",
+        "logit_scale": 0.0625,
+        "sliding_window": 4,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "cohere")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "cohere2shapes", raw))
+    assert cfg.no_rope_layers == (1, 0)
+    assert cfg.residual_kind == "parallel"
+    assert cfg.rope_interleaved is True
+
+
+def test_exaone4_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Exaone4ForCausalLM"],
+        "model_type": "exaone4",
+        "qk_norm": True,
+        "sliding_window": 4,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "exaone4")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "exaone4shapes", raw))
+    assert cfg.residual_kind == "post_norm"
+    assert cfg.no_rope_layers == (1, 0)
+    assert cfg.qk_norm is True
+
+
+def test_arcee_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["ArceeForCausalLM"],
+        "model_type": "arcee",
+        "hidden_act": "relu2",
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "arcee")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "arceeshapes", raw))
+    assert cfg.uses_swiglu is False
+    assert "layers.0.mlp.gate.weight" not in cfg.expected_shapes()
+    assert "layers.0.mlp.up.weight" in cfg.expected_shapes()
+
+
+def test_mistral3_nested_text_config(tmp_path: Path) -> None:
+    raw = {
+        "architectures": ["Mistral3ForConditionalGeneration"],
+        "model_type": "mistral3",
+        "text_config": {
+            **_BASE,
+            "model_type": "mistral",
+            "sliding_window": 16,
+        },
+        "vision_config": {"hidden_size": 16},
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "mistral3nested", raw))
+    assert cfg.recipe_id == "mistral"
+    missing = detect_missing(raw, "mistral3")
+    assert "vision" in missing

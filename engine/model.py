@@ -32,6 +32,8 @@ class DecoderModel:
         )
         rope_dim = config.qk_rope_head_dim if config.attention_kind == "mla" else None
         self._inv_freq = None
+        self._local_inv_freq = None
+        self._theta_inv_freq: dict[float, torch.Tensor] = {}
         if self.use_rope:
             self._inv_freq = build_inv_freq(config, device=self.device)
             if rope_dim and self._inv_freq.numel() * 2 != rope_dim:
@@ -41,6 +43,32 @@ class DecoderModel:
                 self._inv_freq = _inv_freq_default(
                     rope_dim, float(config.rope_theta), self.device
                 )
+            from engine.layers.rope import _inv_freq_default
+
+            rotary_dim = int(
+                (rope_dim or config.head_dim)
+                * float(getattr(config, "partial_rotary_factor", 1.0) or 1.0)
+            )
+            if rotary_dim < 2:
+                rotary_dim = rope_dim or config.head_dim
+            self._theta_inv_freq[float(config.rope_theta)] = self._inv_freq
+            for theta in getattr(config, "layer_rope_theta", ()) or ():
+                t = float(theta)
+                if t and t not in self._theta_inv_freq:
+                    self._theta_inv_freq[t] = _inv_freq_default(rotary_dim, t, self.device)
+            if any("sliding" in str(t).lower() for t in (config.layer_types or ())):
+                local_theta = 10000.0 if config.recipe_id == "gemma3" else None
+                rp = (config.rope_scaling or config.raw.get("rope_parameters") or {})
+                if isinstance(rp, dict):
+                    sliding = rp.get("sliding_attention")
+                    if isinstance(sliding, dict) and sliding.get("rope_theta") is not None:
+                        local_theta = float(sliding["rope_theta"])
+                if local_theta is not None:
+                    if local_theta not in self._theta_inv_freq:
+                        self._theta_inv_freq[local_theta] = _inv_freq_default(
+                            rotary_dim, local_theta, self.device
+                        )
+                    self._local_inv_freq = self._theta_inv_freq[local_theta]
 
     def make_cache(
         self,
@@ -103,6 +131,9 @@ class DecoderModel:
         scale = self.config.embed_scale
         if scale != 1.0:
             x = x * scale
+        emb_mul = float(getattr(self.config, "embedding_multiplier", 1.0) or 1.0)
+        if emb_mul != 1.0:
+            x = x * emb_mul
         if self.config.pos_kind == "learned":
             pos = torch.arange(
                 start_pos, start_pos + s, device=x.device, dtype=torch.long
@@ -132,16 +163,44 @@ class DecoderModel:
                 cos, sin = build_rope_cos_sin(
                     self._inv_freq, position_ids, dtype=x.dtype
                 )
+            local_cos = local_sin = None
+            theta_tables: dict[float, tuple[torch.Tensor, torch.Tensor]] = {
+                float(self.config.rope_theta): (cos, sin),
+            }
+            if self._local_inv_freq is not None and position_ids.dim() != 3:
+                local_cos, local_sin = build_rope_cos_sin(
+                    self._local_inv_freq, position_ids, dtype=x.dtype
+                )
+            for theta, inv in self._theta_inv_freq.items():
+                if theta not in theta_tables:
+                    theta_tables[theta] = build_rope_cos_sin(inv, position_ids, dtype=x.dtype)
         else:
             cos = sin = torch.empty(0, device=x.device, dtype=x.dtype)
+            local_cos = local_sin = None
+            theta_tables = {}
 
+        types = getattr(self.config, "layer_types", ()) or ()
+        layer_thetas = getattr(self.config, "layer_rope_theta", ()) or ()
         for spec in self.layers:
+            layer_cos, layer_sin = cos, sin
+            if spec.index < len(layer_thetas):
+                theta = float(layer_thetas[spec.index])
+                if theta == 0.0:
+                    layer_cos = layer_sin = torch.empty(0, device=x.device, dtype=x.dtype)
+                elif theta in theta_tables:
+                    layer_cos, layer_sin = theta_tables[theta]
+            elif (
+                local_cos is not None
+                and spec.index < len(types)
+                and "sliding" in str(types[spec.index]).lower()
+            ):
+                layer_cos, layer_sin = local_cos, local_sin
             x = decoder_block(
                 x,
                 self.weights,
                 spec,
-                cos,
-                sin,
+                layer_cos,
+                layer_sin,
                 self.config,
                 cache=cache,
                 use_rope=self.use_rope,
@@ -163,7 +222,21 @@ class DecoderModel:
             self.config.rms_norm_eps,
             self.config.norm_kind,
         )
-        logits = F.linear(hidden, self.weights["lm_head.weight"])
+        logits = F.linear(
+            hidden,
+            self.weights["lm_head.weight"],
+            self.weights.get("lm_head.bias"),
+        )
+        logits_scaling = float(getattr(self.config, "logits_scaling", 1.0) or 1.0)
+        if logits_scaling != 1.0:
+            logits = logits / logits_scaling
+        logit_scale = float(getattr(self.config, "logit_scale", 1.0) or 1.0)
+        if logit_scale != 1.0:
+            logits = logits * logit_scale
+        cap = getattr(self.config, "final_logit_softcapping", None)
+        if cap:
+            cap_f = float(cap)
+            logits = torch.tanh(logits / cap_f) * cap_f
         if return_hidden:
             return logits, pre_norm_hidden
         return logits

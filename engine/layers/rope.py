@@ -111,26 +111,39 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
+    """GPT-J / Cohere / GLM: rotate even/odd pairs instead of halves."""
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    *,
+    interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """q/k: [B, heads, S, hd]; cos/sin: [B, S, rotary_dim] (may be < hd)."""
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
+    if interleaved:
+        # Llama-style cat(freqs, freqs) → interleaved [f0, f0, f1, f1, ...]
+        half = cos.shape[-1] // 2
+        cos = cos[..., :half].repeat_interleave(2, dim=-1)
+        sin = sin[..., :half].repeat_interleave(2, dim=-1)
+        rotate = rotate_half_interleaved
+    else:
+        rotate = rotate_half
     rotary_dim = cos.shape[-1]
     if rotary_dim < q.shape[-1]:
         q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
         k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-        q_embed = torch.cat(
-            ((q_rot * cos) + (rotate_half(q_rot) * sin), q_pass), dim=-1
-        )
-        k_embed = torch.cat(
-            ((k_rot * cos) + (rotate_half(k_rot) * sin), k_pass), dim=-1
-        )
+        q_embed = torch.cat(((q_rot * cos) + (rotate(q_rot) * sin), q_pass), dim=-1)
+        k_embed = torch.cat(((k_rot * cos) + (rotate(k_rot) * sin), k_pass), dim=-1)
         return q_embed, k_embed
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos) + (rotate(q) * sin)
+    k_embed = (k * cos) + (rotate(k) * sin)
     return q_embed, k_embed

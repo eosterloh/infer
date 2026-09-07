@@ -131,8 +131,18 @@ def build_schedule(config: ModelConfig) -> tuple[LayerSpec, ...]:
             )
         return hybrid_pattern_schedule(pattern)
 
-    if recipe in {"mixtral", "gpt_oss"}:
+    if recipe in {"mixtral", "gpt_oss", "olmoe", "granitemoe", "granitemoeshared"}:
         return tuple(LayerSpec(i, MixerKind.ATTENTION, FfnKind.MOE) for i in range(n))
+
+    if recipe in {"qwen3_moe", "qwen2_moe"}:
+        mlp_only = {int(x) for x in (raw.get("mlp_only_layers") or [])}
+        step = int(raw.get("decoder_sparse_step") or 1)
+        moe_set = {
+            i
+            for i in range(n)
+            if i not in mlp_only and step > 0 and (i + 1) % step == 0
+        }
+        return dense_or_moe_schedule(n, moe_set)
 
     if recipe == "llama4":
         listed = raw.get("moe_layers")
@@ -173,9 +183,25 @@ def build_schedule(config: ModelConfig) -> tuple[LayerSpec, ...]:
         "qwen3",
         "yi",
         "gemma",
+        "gemma2",
+        "gemma3",
         "phi3",
+        "phi",
         "gpt2",
         "gpt_neox",
+        "granite",
+        "granite_swa",
+        "olmo",
+        "olmo2",
+        "olmo3",
+        "smollm3",
+        "starcoder2",
+        "nemotron",
+        "cohere",
+        "glm",
+        "stablelm",
+        "exaone4",
+        "arcee",
         None,
         "",
     } or (config.model_type or "").lower() in {"llama", ""}:
