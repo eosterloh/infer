@@ -8,6 +8,7 @@ dist/
 build/
 .ruff_cache/
 .huggingface/
+engine/kernels/_build/
 models/
 *.pt
 *.bin

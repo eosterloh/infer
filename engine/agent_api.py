@@ -21,6 +21,7 @@ from engine.detect import (
     detect_missing,
     detect_quant_flags,
     detect_recipe_id,
+    detect_vision_family,
 )
 from engine.generate import (
     generate_greedy,
@@ -28,10 +29,11 @@ from engine.generate import (
     generate_multimodal_greedy,
 )
 from engine.model import DecoderModel
-from engine.mtp import Qwen35MTP
+from engine.mtp import NativeMTP, build_mtp
 from engine.schedule import FfnKind, MixerKind
 from engine.tokenizer import Tokenizer
 from engine.vision import validate_qwen35_vision_weights
+from engine.vision_mm import validate_vision_weights, vision_prefixes
 from engine.weights import count_params, load_hf_prefixes, load_weights
 
 
@@ -100,10 +102,13 @@ def inspect_capabilities(model_dir: str | Path) -> Capabilities:
         notes.append("generation_config.json eos/stop ids used automatically")
     if "mtp_decode" in missing:
         notes.append("MTP advertised — greedy still works; speculative decode not wired")
-    elif mtp and recipe_id == "qwen3_5":
+    elif mtp:
         notes.append("native MTP available — lossless greedy speculative decode")
-    if config.raw.get("vision_config") and recipe_id == "qwen3_5":
+    vision_family = detect_vision_family(config.raw or {}, recipe_id)
+    if vision_family == "qwen3_5":
         notes.append("image/video tower and multimodal M-RoPE available")
+    elif vision_family is not None:
+        notes.append("image/video tower and multimodal generate available")
     if nvfp4:
         notes.append("NVFP4 advertised — dequant-on-load (not fused)")
     if fp8:
@@ -144,7 +149,7 @@ class Engine:
     n_params: int
     vision_weights: dict[str, torch.Tensor] | None = None
     processor: Any | None = None
-    mtp: Qwen35MTP | None = None
+    mtp: NativeMTP | None = None
     last_mtp_stats: dict[str, int] | None = None
 
     def generate(
@@ -156,10 +161,16 @@ class Engine:
         apply_chat_template: bool | None = None,
         enable_thinking: bool = False,
         num_speculative_tokens: int = 0,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
     ) -> str:
         if num_speculative_tokens:
             if self.mtp is None:
                 raise RuntimeError("this engine was not loaded with an MTP head")
+            if temperature > 0:
+                raise ValueError("sampled MTP is not implemented; use temperature=0")
             self.last_mtp_stats = {}
             return "".join(
                 generate_mtp_greedy(
@@ -183,6 +194,10 @@ class Engine:
                 use_cache=use_cache,
                 apply_chat_template=apply_chat_template,
                 enable_thinking=enable_thinking,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
             )
         )
 
@@ -195,10 +210,16 @@ class Engine:
         apply_chat_template: bool | None = None,
         enable_thinking: bool = False,
         num_speculative_tokens: int = 0,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
     ) -> Iterator[str]:
         if num_speculative_tokens:
             if self.mtp is None:
                 raise RuntimeError("this engine was not loaded with an MTP head")
+            if temperature > 0:
+                raise ValueError("sampled MTP is not implemented; use temperature=0")
             self.last_mtp_stats = {}
             yield from generate_mtp_greedy(
                 self.model,
@@ -220,6 +241,10 @@ class Engine:
             use_cache=use_cache,
             apply_chat_template=apply_chat_template,
             enable_thinking=enable_thinking,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
         )
 
     def generate_messages(
@@ -229,6 +254,10 @@ class Engine:
         max_new_tokens: int = 32,
         enable_thinking: bool = False,
         num_speculative_tokens: int = 0,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
     ) -> str:
         """Generate from Qwen processor-compatible text/image/video messages."""
         if self.processor is None or self.vision_weights is None:
@@ -244,6 +273,8 @@ class Engine:
         if num_speculative_tokens:
             if self.mtp is None:
                 raise RuntimeError("this engine was not loaded with an MTP head")
+            if temperature > 0:
+                raise ValueError("sampled MTP is not implemented; use temperature=0")
             self.last_mtp_stats = {}
             return "".join(
                 generate_mtp_greedy(
@@ -265,6 +296,10 @@ class Engine:
                 self.vision_weights,
                 dict(inputs),
                 max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
             )
         )
 
@@ -307,23 +342,27 @@ def load_engine(
     vision_weights = None
     processor = None
     mtp = None
-    if config.recipe_id == "qwen3_5" and isinstance(
-        config.raw.get("vision_config"), dict
-    ):
+    vision_family = detect_vision_family(config.raw or {}, config.recipe_id)
+    if vision_family is not None:
         vision_weights = load_hf_prefixes(
-            model_dir, ("model.visual.",), device=device, dtype=dtype
+            model_dir, vision_prefixes(vision_family), device=device, dtype=dtype
         )
-        validate_qwen35_vision_weights(
-            vision_weights, config.raw["vision_config"]
-        )
+        if vision_family == "qwen3_5":
+            validate_qwen35_vision_weights(
+                vision_weights, config.raw["vision_config"]
+            )
+        else:
+            validate_vision_weights(vision_family, vision_weights, config.raw)
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(str(model_dir))
-    if config.recipe_id == "qwen3_5" and config.num_nextn_predict_layers:
-        mtp_weights = load_hf_prefixes(
-            model_dir, ("mtp.",), device=device, dtype=dtype
-        )
-        mtp = Qwen35MTP(config, weights, mtp_weights)
+    if config.num_nextn_predict_layers:
+        hf_mtp = None
+        if config.recipe_id == "qwen3_5":
+            hf_mtp = load_hf_prefixes(
+                model_dir, ("mtp.",), device=device, dtype=dtype
+            )
+        mtp = build_mtp(config, weights, hf_mtp)
     total_params = count_params(weights)
     if vision_weights:
         total_params += count_params(vision_weights)

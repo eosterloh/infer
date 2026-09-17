@@ -9,6 +9,7 @@ import torch
 from engine.config import ModelConfig
 from engine.layers.attention import attention_from_weights
 from engine.layers.gdn import gated_delta_net
+from engine.layers.mamba1 import mamba1
 from engine.layers.mamba2 import mamba2
 from engine.layers.mlp import mlp_from_weights
 from engine.layers.moe import moe
@@ -61,6 +62,8 @@ def decoder_block(
             )
         if spec.mixer == MixerKind.MAMBA2:
             return mamba2(h, weights, layer, config, cache=cache)
+        if spec.mixer == MixerKind.MAMBA1:
+            return mamba1(h, weights, layer, config, cache=cache)
         if spec.mixer == MixerKind.GATED_DELTANET:
             return gated_delta_net(
                 h, weights, layer, config, cache=cache, attention_mask=attention_mask
@@ -87,6 +90,23 @@ def decoder_block(
         if spec.ffn != FfnKind.NONE:
             delta = delta + run_ffn(h)
         return x + delta * scale
+
+    if residual_kind == "parallel_dual":
+        delta = torch.zeros_like(x)
+        if spec.mixer != MixerKind.NONE:
+            h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
+            delta = delta + run_mixer(h)
+        if spec.ffn != FfnKind.NONE:
+            ff_key = f"{p}.post_attn_norm" if f"{p}.post_attn_norm.weight" in weights else f"{p}.input_norm"
+            h = apply_norm(x, weights, ff_key, config.rms_norm_eps, kind)
+            delta = delta + run_ffn(h)
+        return x + delta * scale
+
+    if residual_kind == "olmo_hybrid":
+        if spec.mixer == MixerKind.GATED_DELTANET:
+            residual_kind = "sequential"
+        else:
+            residual_kind = "post_norm"
 
     if residual_kind == "post_norm":
         if spec.mixer != MixerKind.NONE:
@@ -122,6 +142,10 @@ def decoder_block(
         h = run_mixer(h)
         x = x + h * scale
     elif spec.mixer == MixerKind.MAMBA2:
+        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
+        h = run_mixer(h)
+        x = x + h * scale
+    elif spec.mixer == MixerKind.MAMBA1:
         h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
         h = run_mixer(h)
         x = x + h * scale

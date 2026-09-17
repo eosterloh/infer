@@ -449,3 +449,18 @@ def qwen35_multimodal_embeddings(
         attention_mask=attention_mask,
     )
     return x, positions, delta
+
+
+def multimodal_embeddings(
+    raw_config: dict[str, Any],
+    input_ids: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    vision_weights: dict[str, torch.Tensor],
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Dispatch vision+text embedding fusion for every implemented family."""
+    from engine.vision_mm import multimodal_embeddings as _dispatch
+
+    return _dispatch(
+        raw_config, input_ids, text_embeddings, vision_weights, **kwargs
+    )

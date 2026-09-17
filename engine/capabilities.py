@@ -21,7 +21,12 @@ def describe_capabilities(config: ModelConfig) -> dict[str, Any]:
 
     # MTP is Super-only; present when config advertises MTP layers / heads.
     raw = config.raw or {}
-    mtp_layers = raw.get("num_nextn_predict_layers") or raw.get("mtp_num_layers")
+    mtp_layers = (
+        raw.get("num_nextn_predict_layers")
+        or raw.get("mtp_num_layers")
+        or raw.get("mtp_num_hidden_layers")
+        or raw.get("num_mtp_layers")
+    )
     has_mtp = bool(mtp_layers) and int(mtp_layers) > 0
 
     quant = "bf16"

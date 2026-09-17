@@ -49,6 +49,8 @@ class KVCache:
     def truncate(self, seq_len: int) -> None:
         """Discard cached positions at and after ``seq_len``."""
         seq_len = int(seq_len)
+        if self._seq_len == 0:
+            return
         if seq_len < 0 or seq_len > self._seq_len:
             raise ValueError(f"cannot truncate KV length {self._seq_len} to {seq_len}")
         self.k = [
@@ -129,6 +131,32 @@ class KVCache:
         self._seq_len = int(self.k[layer].shape[2])
         return self.k[layer], self.v[layer]
 
+    def begin_speculative(self) -> None:
+        if getattr(self, "_spec_len", None) is not None:
+            raise RuntimeError("speculative transaction already active")
+        self._spec_len = self._seq_len
+
+    def commit_speculative(self, accepted_tokens: int) -> None:
+        if getattr(self, "_spec_len", None) is None:
+            raise RuntimeError("no speculative transaction active")
+        accepted_tokens = int(accepted_tokens)
+        if accepted_tokens < 1:
+            raise ValueError("verification must commit at least its target seed")
+        self.truncate(int(self._spec_len) + accepted_tokens)
+        self._spec_len = None
+
+    def finish_speculative(self) -> None:
+        if getattr(self, "_spec_len", None) is None:
+            raise RuntimeError("no speculative transaction active")
+        self._spec_len = None
+
+    def cancel_speculative(self) -> None:
+        spec_len = getattr(self, "_spec_len", None)
+        if spec_len is None:
+            return
+        self.truncate(int(spec_len))
+        self._spec_len = None
+
 
 class RuntimeState:
     """Unified decode state for hybrid models (attention KV + Mamba conv/SSM).
@@ -186,6 +214,19 @@ class RuntimeState:
                 self.ssm_states[i] = torch.zeros(
                     batch_size, n_heads, hd, n, device=self.device, dtype=ssm_dtype
                 )
+            elif spec.mixer == MixerKind.MAMBA1:
+                raw = config.raw or {}
+                expand = int(raw.get("mamba_expand") or 2)
+                inter = expand * config.hidden_size
+                k = int(raw.get("mamba_d_conv") or config.conv_kernel or 4)
+                n = int(raw.get("mamba_d_state") or config.ssm_state_size or 16)
+                i = spec.index
+                self.conv_states[i] = torch.zeros(
+                    batch_size, inter, k, device=self.device, dtype=dtype
+                )
+                self.ssm_states[i] = torch.zeros(
+                    batch_size, inter, n, device=self.device, dtype=ssm_dtype
+                )
             elif spec.mixer == MixerKind.GATED_DELTANET:
                 if (
                     config.linear_num_key_heads is None
@@ -238,6 +279,13 @@ class RuntimeState:
         """Record that `n_tokens` were consumed (prefill sets absolute via replace)."""
         self._token_len += int(n_tokens)
 
+    def truncate(self, seq_len: int) -> None:
+        """Discard cached positions at and after ``seq_len``."""
+        seq_len = int(seq_len)
+        if self.kv.seq_len() > 0:
+            self.kv.truncate(seq_len)
+        self._token_len = seq_len
+
     @property
     def is_speculating(self) -> bool:
         return self._spec_base is not None
@@ -277,7 +325,9 @@ class RuntimeState:
         if accepted_tokens < 1:
             raise ValueError("verification must commit at least its target seed")
         base = self._spec_base
-        self.kv.truncate(int(base["kv_len"]) + accepted_tokens)
+        kv_target = int(base["kv_len"]) + accepted_tokens
+        if self.kv.seq_len() > 0:
+            self.kv.truncate(kv_target)
         self._token_len = int(base["token_len"]) + accepted_tokens
         base_conv = list(base["conv"])  # type: ignore[arg-type]
         for layer, (states, mixed) in self._spec_gdn.items():

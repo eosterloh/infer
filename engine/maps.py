@@ -37,14 +37,28 @@ _LLAMA_LAYER = {
     "self_attn.k_norm.bias": "attn.k_norm.bias",
     "self_attn.sinks": "attn.sinks",
     "linear_attn.in_proj_qkv.weight": "gdn.in_proj_qkv.weight",
+    "linear_attn.in_proj_qkvz.weight": "gdn.in_proj_qkvz.weight",
+    "linear_attn.in_proj_ba.weight": "gdn.in_proj_ba.weight",
     "linear_attn.in_proj_z.weight": "gdn.in_proj_z.weight",
     "linear_attn.in_proj_b.weight": "gdn.in_proj_b.weight",
     "linear_attn.in_proj_a.weight": "gdn.in_proj_a.weight",
+    "linear_attn.q_proj.weight": "gdn.q.weight",
+    "linear_attn.k_proj.weight": "gdn.k.weight",
+    "linear_attn.v_proj.weight": "gdn.v.weight",
+    "linear_attn.a_proj.weight": "gdn.in_proj_a.weight",
+    "linear_attn.b_proj.weight": "gdn.in_proj_b.weight",
+    "linear_attn.g_proj.weight": "gdn.in_proj_z.weight",
     "linear_attn.conv1d.weight": "gdn.conv1d.weight",
     "linear_attn.A_log": "gdn.A_log",
     "linear_attn.dt_bias": "gdn.dt_bias",
     "linear_attn.norm.weight": "gdn.norm.weight",
+    "linear_attn.o_norm.weight": "gdn.norm.weight",
     "linear_attn.out_proj.weight": "gdn.out_proj.weight",
+    "linear_attn.o_proj.weight": "gdn.out_proj.weight",
+    "self_attn.lambda_q1": "attn.lambda_q1",
+    "self_attn.lambda_k1": "attn.lambda_k1",
+    "self_attn.lambda_q2": "attn.lambda_q2",
+    "self_attn.lambda_k2": "attn.lambda_k2",
     "mlp.gate_proj.weight": "mlp.gate.weight",
     "mlp.up_proj.weight": "mlp.up.weight",
     "mlp.down_proj.weight": "mlp.down.weight",
@@ -63,6 +77,10 @@ _LLAMA_LAYER = {
     "self_attn.k_layernorm.weight": "attn.k_norm.weight",
     "self_attn.k_layernorm.bias": "attn.k_norm.bias",
     "self_attn.qkv_proj.weight": "attn.qkv.weight",
+    "self_attn.attn_sub_norm.weight": "attn.sub_norm.weight",
+    "self_attn.query_layernorm.weight": "attn.q_norm.weight",
+    "self_attn.key_layernorm.weight": "attn.k_norm.weight",
+    "mlp.ffn_sub_norm.weight": "mlp.sub_norm.weight",
     "mlp.c_fc.weight": "mlp.c_fc.weight",
     "mlp.c_fc.bias": "mlp.c_fc.bias",
     "mlp.c_proj.weight": "mlp.c_proj.weight",
@@ -118,9 +136,23 @@ def _map_llama_family(hf_name: str, config: ModelConfig | None = None) -> str | 
             "model.",
         ),
     )
-    if not hit:
+    if hit is None:
+        mtp_hit = re.match(r"^mtp\.layers\.(\d+)\.(.+)$", hf_name)
+        if mtp_hit:
+            return _map_mtp_decoder_rest(int(mtp_hit.group(1)), mtp_hit.group(2), config)
         return None
     _, i, rest = hit
+    i_int = int(i)
+    n_layers = getattr(config, "num_hidden_layers", None) if config is not None else None
+    n_mtp = (
+        getattr(config, "num_nextn_predict_layers", None) or 0
+        if config is not None
+        else 0
+    )
+    if n_layers is not None and n_mtp and i_int >= int(n_layers):
+        mtp_index = i_int - int(n_layers)
+        if 0 <= mtp_index < int(n_mtp):
+            return _map_mtp_decoder_rest(mtp_index, rest, config)
 
     if rest in _LLAMA_LAYER:
         mapped = _LLAMA_LAYER[rest]
@@ -128,12 +160,16 @@ def _map_llama_family(hf_name: str, config: ModelConfig | None = None) -> str | 
         if rest == "post_attention_layernorm.weight" and config is not None:
             mt = str(getattr(config, "model_type", "") or "").lower()
             arches = " ".join(getattr(config, "architectures", ()) or ()).lower()
-            if mt.startswith("glm4") or "glm4" in arches:
+            if (mt.startswith("glm4") or "glm4" in arches) and (
+                config.recipe_id or ""
+            ) != "glm4_moe":
                 mapped = "pre_ff_norm.weight"
         if rest == "post_attention_layernorm.bias" and config is not None:
             mt = str(getattr(config, "model_type", "") or "").lower()
             arches = " ".join(getattr(config, "architectures", ()) or ()).lower()
-            if mt.startswith("glm4") or "glm4" in arches:
+            if (mt.startswith("glm4") or "glm4" in arches) and (
+                config.recipe_id or ""
+            ) != "glm4_moe":
                 mapped = "pre_ff_norm.bias"
         return f"layers.{i}.{mapped}"
 
@@ -167,6 +203,18 @@ def _map_llama_family(hf_name: str, config: ModelConfig | None = None) -> str | 
     # Llama 4 packed MoE
     if rest == "feed_forward.router.weight":
         return f"layers.{i}.moe.gate.weight"
+    if rest in {
+        "feed_forward.experts.gate_up_proj",
+        "feed_forward.experts.gate_up_proj.weight",
+    }:
+        return f"layers.{i}.moe.experts.gate_up.weight"
+    if rest in {
+        "feed_forward.experts.down_proj",
+        "feed_forward.experts.down_proj.weight",
+    }:
+        return f"layers.{i}.moe.experts.down.weight"
+    if rest == "pre_ff_layernorm.weight":
+        return f"layers.{i}.post_attn_norm.weight"
     if rest == "feed_forward.experts.gate_up_proj":
         return f"layers.{i}.moe.experts.gate_up.weight"
     if rest == "feed_forward.experts.down_proj":
@@ -183,6 +231,16 @@ def _map_llama_family(hf_name: str, config: ModelConfig | None = None) -> str | 
         return f"layers.{i}.moe.shared.up.weight"
     if rest == "mlp.shared_expert.down_proj.weight":
         return f"layers.{i}.moe.shared.down.weight"
+    if rest == "mlp.gate.wg.weight":
+        return f"layers.{i}.moe.gate.weight"
+    if rest == "mlp.shared_mlp.gate_proj.weight":
+        return f"layers.{i}.moe.shared.gate.weight"
+    if rest == "mlp.shared_mlp.up_proj.weight":
+        return f"layers.{i}.moe.shared.up.weight"
+    if rest == "mlp.shared_mlp.down_proj.weight":
+        return f"layers.{i}.moe.shared.down.weight"
+    if rest == "mlp.gate.moe_statics.e_score_correction_bias":
+        return f"layers.{i}.moe.gate.e_score_correction_bias"
     if rest == "mlp.shared_expert_gate.weight":
         return f"layers.{i}.moe.shared_gate.weight"
     if rest == "feed_forward.gate_proj.weight":
@@ -233,6 +291,28 @@ def _map_llama_family(hf_name: str, config: ModelConfig | None = None) -> str | 
         return f"layers.{i}.moe.experts.{e}.{short}.weight"
 
     return None
+
+
+_MTP_ROOT = {
+    "enorm.weight": "enorm.weight",
+    "hnorm.weight": "hnorm.weight",
+    "eh_proj.weight": "eh_proj.weight",
+    "shared_head.norm.weight": "shared_head.norm.weight",
+}
+
+
+def _map_mtp_decoder_rest(
+    index: int, rest: str, config: ModelConfig | None
+) -> str | None:
+    """Map an extra DeepSeek-style MTP decoder layer onto mtp.layers.*."""
+    if rest in {"embed_tokens.weight", "shared_head.head.weight"}:
+        return None
+    if rest in _MTP_ROOT:
+        return f"mtp.layers.{index}.{_MTP_ROOT[rest]}"
+    mapped = _map_llama_family(f"model.layers.0.{rest}", config)
+    if mapped is not None and mapped.startswith("layers.0."):
+        return f"mtp.layers.{index}." + mapped[len("layers.0.") :]
+    return f"mtp.layers.{index}.{rest}"
 
 
 def _map_nemotron_h_hf_name(hf_name: str) -> str | None:
@@ -344,6 +424,269 @@ def _map_gpt2(hf_name: str) -> str | None:
     return f"layers.{i}.{mapped}" if mapped else None
 
 
+def _map_gptj(hf_name: str) -> str | None:
+    if hf_name in {"transformer.wte.weight", "wte.weight"}:
+        return "embed.weight"
+    if hf_name in {"transformer.ln_f.weight", "ln_f.weight"}:
+        return "final_norm.weight"
+    if hf_name in {"transformer.ln_f.bias", "ln_f.bias"}:
+        return "final_norm.bias"
+    if hf_name in {"lm_head.weight", "transformer.lm_head.weight"}:
+        return "lm_head.weight"
+    if hf_name in {"lm_head.bias", "transformer.lm_head.bias"}:
+        return "lm_head.bias"
+    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    if not m:
+        return None
+    i, rest = m.group(1), m.group(2)
+    table = {
+        "ln_1.weight": "input_norm.weight",
+        "ln_1.bias": "input_norm.bias",
+        "attn.q_proj.weight": "attn.q.weight",
+        "attn.k_proj.weight": "attn.k.weight",
+        "attn.v_proj.weight": "attn.v.weight",
+        "attn.out_proj.weight": "attn.o.weight",
+        "mlp.fc_in.weight": "mlp.up.weight",
+        "mlp.fc_in.bias": "mlp.up.bias",
+        "mlp.fc_out.weight": "mlp.down.weight",
+        "mlp.fc_out.bias": "mlp.down.bias",
+    }
+    mapped = table.get(rest)
+    return f"layers.{i}.{mapped}" if mapped else None
+
+
+def _map_gpt_neo(hf_name: str) -> str | None:
+    if hf_name in {"transformer.wte.weight", "wte.weight"}:
+        return "embed.weight"
+    if hf_name in {"transformer.wpe.weight", "wpe.weight"}:
+        return "pos_embed.weight"
+    if hf_name in {"transformer.ln_f.weight", "ln_f.weight"}:
+        return "final_norm.weight"
+    if hf_name in {"transformer.ln_f.bias", "ln_f.bias"}:
+        return "final_norm.bias"
+    if hf_name == "lm_head.weight":
+        return "lm_head.weight"
+    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    if not m:
+        return None
+    i, rest = m.group(1), m.group(2)
+    table = {
+        "ln_1.weight": "input_norm.weight",
+        "ln_1.bias": "input_norm.bias",
+        "ln_2.weight": "post_attn_norm.weight",
+        "ln_2.bias": "post_attn_norm.bias",
+        "attn.attention.q_proj.weight": "attn.q.weight",
+        "attn.attention.k_proj.weight": "attn.k.weight",
+        "attn.attention.v_proj.weight": "attn.v.weight",
+        "attn.attention.out_proj.weight": "attn.o.weight",
+        "attn.attention.out_proj.bias": "attn.o.bias",
+        "mlp.c_fc.weight": "mlp.up.weight",
+        "mlp.c_fc.bias": "mlp.up.bias",
+        "mlp.c_proj.weight": "mlp.down.weight",
+        "mlp.c_proj.bias": "mlp.down.bias",
+    }
+    mapped = table.get(rest)
+    return f"layers.{i}.{mapped}" if mapped else None
+
+
+def _map_opt(hf_name: str) -> str | None:
+    if hf_name in {
+        "model.decoder.embed_tokens.weight",
+        "decoder.embed_tokens.weight",
+    }:
+        return "embed.weight"
+    if hf_name in {
+        "model.decoder.embed_positions.weight",
+        "decoder.embed_positions.weight",
+    }:
+        return "pos_embed.weight"
+    if hf_name in {
+        "model.decoder.final_layer_norm.weight",
+        "decoder.final_layer_norm.weight",
+    }:
+        return "final_norm.weight"
+    if hf_name in {
+        "model.decoder.final_layer_norm.bias",
+        "decoder.final_layer_norm.bias",
+    }:
+        return "final_norm.bias"
+    if hf_name == "lm_head.weight":
+        return "lm_head.weight"
+    m = re.match(r"^(?:model\.)?decoder\.layers\.(\d+)\.(.+)$", hf_name)
+    if not m:
+        return None
+    i, rest = m.group(1), m.group(2)
+    table = {
+        "self_attn_layer_norm.weight": "input_norm.weight",
+        "self_attn_layer_norm.bias": "input_norm.bias",
+        "final_layer_norm.weight": "post_attn_norm.weight",
+        "final_layer_norm.bias": "post_attn_norm.bias",
+        "self_attn.q_proj.weight": "attn.q.weight",
+        "self_attn.k_proj.weight": "attn.k.weight",
+        "self_attn.v_proj.weight": "attn.v.weight",
+        "self_attn.out_proj.weight": "attn.o.weight",
+        "self_attn.q_proj.bias": "attn.q.bias",
+        "self_attn.k_proj.bias": "attn.k.bias",
+        "self_attn.v_proj.bias": "attn.v.bias",
+        "self_attn.out_proj.bias": "attn.o.bias",
+        "fc1.weight": "mlp.up.weight",
+        "fc1.bias": "mlp.up.bias",
+        "fc2.weight": "mlp.down.weight",
+        "fc2.bias": "mlp.down.bias",
+    }
+    mapped = table.get(rest)
+    return f"layers.{i}.{mapped}" if mapped else None
+
+
+def _map_bloom(hf_name: str) -> str | None:
+    if hf_name in {"transformer.word_embeddings.weight", "word_embeddings.weight"}:
+        return "embed.weight"
+    if hf_name in {
+        "transformer.word_embeddings_layernorm.weight",
+        "word_embeddings_layernorm.weight",
+    }:
+        return "embed_norm.weight"
+    if hf_name in {
+        "transformer.word_embeddings_layernorm.bias",
+        "word_embeddings_layernorm.bias",
+    }:
+        return "embed_norm.bias"
+    if hf_name in {"transformer.ln_f.weight", "ln_f.weight"}:
+        return "final_norm.weight"
+    if hf_name in {"transformer.ln_f.bias", "ln_f.bias"}:
+        return "final_norm.bias"
+    if hf_name == "lm_head.weight":
+        return "lm_head.weight"
+    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    if not m:
+        return None
+    i, rest = m.group(1), m.group(2)
+    table = {
+        "input_layernorm.weight": "input_norm.weight",
+        "input_layernorm.bias": "input_norm.bias",
+        "post_attention_layernorm.weight": "post_attn_norm.weight",
+        "post_attention_layernorm.bias": "post_attn_norm.bias",
+        "self_attention.query_key_value.weight": "attn.qkv.weight",
+        "self_attention.query_key_value.bias": "attn.qkv.bias",
+        "self_attention.dense.weight": "attn.o.weight",
+        "self_attention.dense.bias": "attn.o.bias",
+        "mlp.dense_h_to_4h.weight": "mlp.up.weight",
+        "mlp.dense_h_to_4h.bias": "mlp.up.bias",
+        "mlp.dense_4h_to_h.weight": "mlp.down.weight",
+        "mlp.dense_4h_to_h.bias": "mlp.down.bias",
+    }
+    mapped = table.get(rest)
+    return f"layers.{i}.{mapped}" if mapped else None
+
+
+def _map_falcon(hf_name: str) -> str | None:
+    if hf_name in {"transformer.word_embeddings.weight", "word_embeddings.weight"}:
+        return "embed.weight"
+    if hf_name in {"transformer.ln_f.weight", "ln_f.weight"}:
+        return "final_norm.weight"
+    if hf_name in {"transformer.ln_f.bias", "ln_f.bias"}:
+        return "final_norm.bias"
+    if hf_name == "lm_head.weight":
+        return "lm_head.weight"
+    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    if not m:
+        return None
+    i, rest = m.group(1), m.group(2)
+    table = {
+        "input_layernorm.weight": "input_norm.weight",
+        "input_layernorm.bias": "input_norm.bias",
+        "ln_attn.weight": "input_norm.weight",
+        "ln_attn.bias": "input_norm.bias",
+        "ln_mlp.weight": "post_attn_norm.weight",
+        "ln_mlp.bias": "post_attn_norm.bias",
+        "post_attention_layernorm.weight": "post_attn_norm.weight",
+        "post_attention_layernorm.bias": "post_attn_norm.bias",
+        "self_attention.query_key_value.weight": "attn.qkv.weight",
+        "self_attention.query_key_value.bias": "attn.qkv.bias",
+        "self_attention.dense.weight": "attn.o.weight",
+        "self_attention.dense.bias": "attn.o.bias",
+        "mlp.dense_h_to_4h.weight": "mlp.up.weight",
+        "mlp.dense_h_to_4h.bias": "mlp.up.bias",
+        "mlp.dense_4h_to_h.weight": "mlp.down.weight",
+        "mlp.dense_4h_to_h.bias": "mlp.down.bias",
+    }
+    mapped = table.get(rest)
+    return f"layers.{i}.{mapped}" if mapped else None
+
+
+def _map_mpt(hf_name: str) -> str | None:
+    if hf_name in {"transformer.wte.weight", "wte.weight"}:
+        return "embed.weight"
+    if hf_name in {"transformer.norm_f.weight", "norm_f.weight"}:
+        return "final_norm.weight"
+    if hf_name == "lm_head.weight":
+        return "lm_head.weight"
+    m = re.match(r"^transformer\.blocks\.(\d+)\.(.+)$", hf_name)
+    if not m:
+        return None
+    i, rest = m.group(1), m.group(2)
+    table = {
+        "norm_1.weight": "input_norm.weight",
+        "norm_2.weight": "post_attn_norm.weight",
+        "attn.Wqkv.weight": "attn.qkv.weight",
+        "attn.out_proj.weight": "attn.o.weight",
+        "ffn.up_proj.weight": "mlp.up.weight",
+        "ffn.down_proj.weight": "mlp.down.weight",
+    }
+    mapped = table.get(rest)
+    return f"layers.{i}.{mapped}" if mapped else None
+
+
+def _map_dbrx(hf_name: str) -> str | None:
+    if hf_name in {"transformer.wte.weight", "wte.weight"}:
+        return "embed.weight"
+    if hf_name in {"transformer.norm_f.weight", "norm_f.weight"}:
+        return "final_norm.weight"
+    if hf_name == "lm_head.weight":
+        return "lm_head.weight"
+    m = re.match(r"^transformer\.blocks\.(\d+)\.(.+)$", hf_name)
+    if not m:
+        return None
+    i, rest = m.group(1), m.group(2)
+    table = {
+        "norm_attn_norm.norm_1.weight": "input_norm.weight",
+        "norm_attn_norm.norm_2.weight": "post_attn_norm.weight",
+        "norm_attn_norm.attn.Wqkv.weight": "attn.qkv.weight",
+        "norm_attn_norm.attn.out_proj.weight": "attn.o.weight",
+        "ffn.router.layer.weight": "moe.gate.weight",
+        "ffn.experts.mlp.w1": "moe.experts.w1.weight",
+        "ffn.experts.mlp.v1": "moe.experts.v1.weight",
+        "ffn.experts.mlp.w2": "moe.experts.w2.weight",
+    }
+    mapped = table.get(rest)
+    return f"layers.{i}.{mapped}" if mapped else None
+
+
+def _map_jamba(hf_name: str) -> str | None:
+    hit = _layer_rest(hf_name, ("model.",))
+    if hit is None:
+        return None
+    _, i, rest = hit
+    table = {
+        "mamba.in_proj.weight": "mamba1.in_proj.weight",
+        "mamba.in_proj.bias": "mamba1.in_proj.bias",
+        "mamba.out_proj.weight": "mamba1.out_proj.weight",
+        "mamba.out_proj.bias": "mamba1.out_proj.bias",
+        "mamba.conv1d.weight": "mamba1.conv1d.weight",
+        "mamba.conv1d.bias": "mamba1.conv1d.bias",
+        "mamba.x_proj.weight": "mamba1.x_proj.weight",
+        "mamba.dt_proj.weight": "mamba1.dt_proj.weight",
+        "mamba.dt_proj.bias": "mamba1.dt_proj.bias",
+        "mamba.A_log": "mamba1.A_log",
+        "mamba.D": "mamba1.D",
+        "mamba.dt_layernorm.weight": "mamba1.dt_norm.weight",
+        "mamba.b_layernorm.weight": "mamba1.b_norm.weight",
+        "mamba.c_layernorm.weight": "mamba1.c_norm.weight",
+    }
+    mapped = table.get(rest)
+    return f"layers.{i}.{mapped}" if mapped else None
+
+
 def _map_gpt_neox(hf_name: str) -> str | None:
     if hf_name in {"gpt_neox.embed_in.weight", "embed_in.weight"}:
         return "embed.weight"
@@ -425,10 +768,29 @@ def map_hf_name(hf_name: str, config: ModelConfig | None = None) -> str | None:
     if hf_name.startswith(("blk.", "token_embd", "output_norm", "output.")):
         return map_gguf_name(hf_name)
 
-    if recipe == "gpt2":
+    if recipe == "gpt2" or recipe == "gpt_bigcode":
         return _map_gpt2(hf_name)
+    if recipe == "gptj":
+        return _map_gptj(hf_name)
+    if recipe == "gpt_neo":
+        return _map_gpt_neo(hf_name)
+    if recipe == "opt":
+        return _map_opt(hf_name)
+    if recipe == "bloom":
+        return _map_bloom(hf_name)
+    if recipe == "falcon":
+        return _map_falcon(hf_name)
+    if recipe == "mpt":
+        return _map_mpt(hf_name)
     if recipe == "gpt_neox":
         return _map_gpt_neox(hf_name)
+    if recipe == "dbrx":
+        return _map_dbrx(hf_name)
+    if recipe == "jamba":
+        mapped = _map_jamba(hf_name)
+        if mapped is not None:
+            return mapped
+        return _map_llama_family(hf_name, config)
     if recipe == "nemotron_h" or (
         hf_name.startswith("backbone.") and recipe != "llama"
     ):
@@ -438,7 +800,32 @@ def map_hf_name(hf_name: str, config: ModelConfig | None = None) -> str | None:
 
 def is_ignored_hf_name(hf_name: str, config: ModelConfig | None = None) -> bool:
     """Vision / unused MTP tensors on a text greedy path."""
-    if hf_name.startswith(("model.visual.", "visual.", "model.vision_tower.")):
+    if hf_name.startswith(
+        (
+            "model.visual.",
+            "visual.",
+            "model.vision_tower.",
+            "vision_tower.",
+            "model.vision_model.",
+            "vision_model.",
+            "model.multi_modal_projector.",
+            "multi_modal_projector.",
+            "model.vision_encoder.",
+            "vision_encoder.",
+        )
+    ):
+        return True
+    if hf_name.endswith("shared_head.head.weight"):
+        return True
+    if hf_name.endswith("embed_tokens.weight") and ".layers." in hf_name:
+        return True
+    if "embed_positions" in hf_name and "inv_freq" in hf_name:
+        return True
+    if hf_name.endswith((".bias",)) and "alibi" in hf_name:
+        return True
+    if ".attn.embed_positions" in hf_name:
+        return True
+    if hf_name.endswith(".attn.attention.bias") or hf_name.endswith(".attn.bias"):
         return True
     recipe = getattr(config, "recipe_id", "") if config is not None else ""
     if recipe == "qwen3_5" and (

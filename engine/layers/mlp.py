@@ -5,9 +5,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from engine.kernels import silu_mul
+
 
 def _gelu(x: torch.Tensor, act: str) -> torch.Tensor:
-    if act == "gelu_pytorch_tanh":
+    if act in {"gelu_pytorch_tanh", "gelu_new", "gelu_fast"}:
         return F.gelu(x, approximate="tanh")
     return F.gelu(x)
 
@@ -26,7 +28,7 @@ def mlp(
     gated = w_gate is not w_up
     if act in {"silu", "swiglu"}:
         return F.linear(
-            F.silu(F.linear(x, w_gate, b_gate)) * F.linear(x, w_up, b_up),
+            silu_mul(F.linear(x, w_gate, b_gate), F.linear(x, w_up, b_up)),
             w_down,
             b_down,
         )
@@ -40,6 +42,9 @@ def mlp(
     if act in {"relu2", "relu_squared", "squared_relu"}:
         h = F.linear(x, w_up, b_up)
         return F.linear(torch.square(F.relu(h)), w_down, b_down)
+    if act == "relu":
+        h = F.linear(x, w_up, b_up)
+        return F.linear(F.relu(h), w_down, b_down)
     raise ValueError(f"unsupported mlp act {act!r}")
 
 
@@ -50,9 +55,15 @@ def mlp_from_weights(
     act: str,
 ) -> torch.Tensor:
     p = f"layers.{layer}"
+    sub = weights.get(f"{p}.mlp.sub_norm.weight")
     if f"{p}.mlp.gate_up.weight" in weights:
         gate, up = weights[f"{p}.mlp.gate_up.weight"].chunk(2, dim=0)
-        return mlp(x, gate, up, weights[f"{p}.mlp.down.weight"], act="silu")
+        h = F.silu(F.linear(x, gate)) * F.linear(x, up)
+        if sub is not None:
+            from engine.layers.norm import rms_norm
+
+            h = rms_norm(h, sub, 1e-5)
+        return F.linear(h, weights[f"{p}.mlp.down.weight"])
     if f"{p}.mlp.c_fc.weight" in weights:
         return mlp(
             x,
@@ -76,6 +87,14 @@ def mlp_from_weights(
             b_up=weights.get(f"{p}.mlp.up.bias"),
             b_down=weights.get(f"{p}.mlp.down.bias"),
         )
+    if sub is not None:
+        from engine.layers.norm import rms_norm
+
+        h = F.silu(F.linear(x, gate, weights.get(f"{p}.mlp.gate.bias"))) * F.linear(
+            x, up, weights.get(f"{p}.mlp.up.bias")
+        )
+        h = rms_norm(h, sub, 1e-5)
+        return F.linear(h, down, weights.get(f"{p}.mlp.down.bias"))
     return mlp(
         x,
         gate,

@@ -1,4 +1,4 @@
-"""Greedy generation — KV / hybrid RuntimeState; optional full recompute."""
+"""Token generation — greedy or sampled; KV / hybrid RuntimeState."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ from collections.abc import Iterator
 import torch
 
 from engine.model import DecoderModel
-from engine.mtp import Qwen35MTP
+from engine.mtp import NativeMTP
+from engine.sample import SamplingParams, make_generator, select_next_id
 from engine.tokenizer import Tokenizer
-from engine.vision import qwen35_multimodal_embeddings
+from engine.vision import multimodal_embeddings
 
 
 def _eos_id_set(eos_token_id: int | list[int] | None) -> set[int]:
@@ -28,6 +29,15 @@ def _delta_piece(tokenizer: Tokenizer, gen_ids: list[int], prev: str) -> tuple[s
     return text, text if not prev else text
 
 
+def _sampling_params(
+    temperature: float = 0.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    seed: int | None = None,
+) -> SamplingParams:
+    return SamplingParams(temperature=temperature, top_k=top_k, top_p=top_p, seed=seed)
+
+
 @torch.inference_mode()
 def generate_greedy(
     model: DecoderModel,
@@ -38,12 +48,18 @@ def generate_greedy(
     use_cache: bool = True,
     apply_chat_template: bool | None = None,
     enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    seed: int | None = None,
 ) -> Iterator[str]:
-    """Yield decoded text pieces (greedy / argmax).
+    """Yield decoded text pieces. temperature <= 0 is greedy argmax.
 
     If the folder shipped a chat template and `prompt` is a raw user string,
     wrap it automatically. Pass apply_chat_template=False to send raw tokens.
     """
+    params = _sampling_params(temperature, top_k, top_p, seed)
+    generator = make_generator(params.seed, model.device)
     text, templated = tokenizer.format_for_generate(
         prompt,
         apply_chat_template=apply_chat_template,
@@ -66,10 +82,13 @@ def generate_greedy(
         prev, piece = _delta_piece(tokenizer, gen_ids, prev)
         return piece
 
+    def _pick(logits: torch.Tensor) -> int:
+        return select_next_id(logits[0, -1, :], params, generator)
+
     if not use_cache:
         for _ in range(max_new_tokens):
             logits = model.forward(tokens, cache=None)
-            next_id = int(torch.argmax(logits[0, -1, :]).item())
+            next_id = _pick(logits)
             tokens = torch.cat(
                 [tokens, torch.tensor([[next_id]], dtype=torch.long, device=device)],
                 dim=1,
@@ -82,7 +101,7 @@ def generate_greedy(
     cache = model.make_cache(batch_size=1, device=device, dtype=model.dtype)
 
     logits = model.forward(tokens, cache=cache)
-    next_id = int(torch.argmax(logits[0, -1, :]).item())
+    next_id = _pick(logits)
     if next_id in eos_ids:
         return
     yield _emit(next_id)
@@ -90,7 +109,7 @@ def generate_greedy(
     for _ in range(max_new_tokens - 1):
         step = torch.tensor([[next_id]], dtype=torch.long, device=device)
         logits = model.forward(step, cache=cache)
-        next_id = int(torch.argmax(logits[0, -1, :]).item())
+        next_id = _pick(logits)
         if next_id in eos_ids:
             break
         yield _emit(next_id)
@@ -104,7 +123,10 @@ def generate(
     use_cache: bool = True,
     apply_chat_template: bool | None = None,
     enable_thinking: bool = False,
-    **_knobs,
+    temperature: float = 0.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    seed: int | None = None,
 ) -> Iterator[str]:
     yield from generate_greedy(
         model,
@@ -114,6 +136,10 @@ def generate(
         use_cache=use_cache,
         apply_chat_template=apply_chat_template,
         enable_thinking=enable_thinking,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        seed=seed,
     )
 
 
@@ -125,12 +151,14 @@ def generate_multimodal_greedy(
     processor_inputs: dict[str, torch.Tensor],
     *,
     max_new_tokens: int = 32,
+    temperature: float = 0.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    seed: int | None = None,
 ) -> Iterator[str]:
-    """Greedy Qwen image/video generation from official processor tensors."""
-    required = {"input_ids", "mm_token_type_ids"}
-    missing = required - set(processor_inputs)
-    if missing:
-        raise ValueError(f"processor inputs missing {sorted(missing)}")
+    """Qwen image/video generation from official processor tensors."""
+    if "input_ids" not in processor_inputs:
+        raise ValueError("processor inputs missing ['input_ids']")
 
     device = model.device
     batch = {
@@ -142,24 +170,28 @@ def generate_multimodal_greedy(
         raise ValueError("multimodal greedy currently supports batch_size=1")
 
     embeds = model.weights["embed.weight"][input_ids]
-    embeds, position_ids, rope_delta = qwen35_multimodal_embeddings(
+    embeds, position_ids, rope_delta = multimodal_embeddings(
+        model.config.raw,
         input_ids,
         embeds,
         vision_weights,
-        model.config.raw,
         pixel_values=batch.get("pixel_values"),
         pixel_values_videos=batch.get("pixel_values_videos"),
         image_grid_thw=batch.get("image_grid_thw"),
         video_grid_thw=batch.get("video_grid_thw"),
-        mm_token_type_ids=batch["mm_token_type_ids"],
+        mm_token_type_ids=batch.get("mm_token_type_ids"),
         attention_mask=batch.get("attention_mask"),
+        image_sizes=batch.get("image_sizes"),
+        recipe_id=model.config.recipe_id,
     )
+    params = _sampling_params(temperature, top_k, top_p, seed)
+    generator = make_generator(params.seed, device)
     cache = model.make_cache(batch_size=1, device=device, dtype=model.dtype)
     logits = model.forward(
         cache=cache, inputs_embeds=embeds, position_ids=position_ids
     )
     assert isinstance(logits, torch.Tensor)
-    next_id = int(torch.argmax(logits[0, -1]).item())
+    next_id = select_next_id(logits[0, -1], params, generator)
     eos_ids = _eos_id_set(model.config.eos_token_id)
     generated: list[int] = []
     previous = ""
@@ -174,19 +206,22 @@ def generate_multimodal_greedy(
             break
 
         step = torch.tensor([[next_id]], dtype=torch.long, device=device)
-        position = torch.arange(
-            cache.seq_len(), cache.seq_len() + 1, device=device, dtype=torch.long
-        ).view(1, 1, 1)
-        position = position.expand(3, 1, 1) + rope_delta.to(device).view(1, 1, 1)
-        logits = model.forward(step, cache=cache, position_ids=position)
+        if rope_delta is None:
+            logits = model.forward(step, cache=cache)
+        else:
+            position = torch.arange(
+                cache.seq_len(), cache.seq_len() + 1, device=device, dtype=torch.long
+            ).view(1, 1, 1)
+            position = position.expand(3, 1, 1) + rope_delta.to(device).view(1, 1, 1)
+            logits = model.forward(step, cache=cache, position_ids=position)
         assert isinstance(logits, torch.Tensor)
-        next_id = int(torch.argmax(logits[0, -1]).item())
+        next_id = select_next_id(logits[0, -1], params, generator)
 
 
 @torch.inference_mode()
 def generate_mtp_greedy(
     model: DecoderModel,
-    mtp: Qwen35MTP,
+    mtp: NativeMTP,
     tokenizer: Tokenizer,
     prompt: str,
     *,
@@ -235,19 +270,19 @@ def generate_mtp_greedy(
         if tokens.shape[0] != 1:
             raise ValueError("multimodal MTP currently supports batch_size=1")
         prefill_embeddings = model.weights["embed.weight"][tokens]
-        prefill_embeddings, prefill_positions, rope_delta = (
-            qwen35_multimodal_embeddings(
-                tokens,
-                prefill_embeddings,
-                vision_weights,
-                model.config.raw,
-                pixel_values=batch.get("pixel_values"),
-                pixel_values_videos=batch.get("pixel_values_videos"),
-                image_grid_thw=batch.get("image_grid_thw"),
-                video_grid_thw=batch.get("video_grid_thw"),
-                mm_token_type_ids=batch["mm_token_type_ids"],
-                attention_mask=batch.get("attention_mask"),
-            )
+        prefill_embeddings, prefill_positions, rope_delta = multimodal_embeddings(
+            model.config.raw,
+            tokens,
+            prefill_embeddings,
+            vision_weights,
+            pixel_values=batch.get("pixel_values"),
+            pixel_values_videos=batch.get("pixel_values_videos"),
+            image_grid_thw=batch.get("image_grid_thw"),
+            video_grid_thw=batch.get("video_grid_thw"),
+            mm_token_type_ids=batch.get("mm_token_type_ids"),
+            attention_mask=batch.get("attention_mask"),
+            image_sizes=batch.get("image_sizes"),
+            recipe_id=model.config.recipe_id,
         )
         prime_embeddings = prefill_embeddings[:, 1:]
         prefill_mask = batch.get("attention_mask")
@@ -276,7 +311,9 @@ def generate_mtp_greedy(
 
     mtp_cache = mtp.make_cache()
     if tokens.shape[1] > 1:
-        prime_positions = prefill_positions[..., 1:]
+        prime_positions = (
+            None if prefill_positions is None else prefill_positions[..., 1:]
+        )
         mtp.forward(
             tokens[:, 1:],
             target_hidden[:, :-1],

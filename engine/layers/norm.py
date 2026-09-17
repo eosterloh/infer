@@ -6,13 +6,12 @@ import torch
 import torch.nn.functional as F
 
 
+from engine.kernels import rms_norm as kernel_rms_norm
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """RMSNorm in fp32 reduce, cast back to x.dtype."""
-    orig_dtype = x.dtype
-    x_f = x.float()
-    var = x_f.pow(2).mean(dim=-1, keepdim=True)
-    x_f = x_f * torch.rsqrt(var + eps)
-    return (x_f * weight.float()).to(orig_dtype)
+    return kernel_rms_norm(x, weight, eps)
 
 
 def gemma_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

@@ -82,7 +82,8 @@ class DecoderModel:
         dtype = dtype or self.dtype
         mt = (self.config.recipe_id or self.config.model_type or "").lower()
         hybrid = any(
-            s.mixer in {MixerKind.MAMBA2, MixerKind.GATED_DELTANET} for s in self.layers
+            s.mixer in {MixerKind.MAMBA2, MixerKind.MAMBA1, MixerKind.GATED_DELTANET}
+            for s in self.layers
         )
         if mt in {"nemotron_h", "nemotronh", "qwen3_5", "qwen3_5_text"} or hybrid:
             return RuntimeState(
@@ -134,11 +135,16 @@ class DecoderModel:
         emb_mul = float(getattr(self.config, "embedding_multiplier", 1.0) or 1.0)
         if emb_mul != 1.0:
             x = x * emb_mul
+        if self.config.embed_norm:
+            x = apply_norm(
+                x, self.weights, "embed_norm", self.config.rms_norm_eps, self.config.norm_kind
+            )
         if self.config.pos_kind == "learned":
             pos = torch.arange(
                 start_pos, start_pos + s, device=x.device, dtype=torch.long
             )
-            x = x + self.weights["pos_embed.weight"][pos]
+            offset = int(getattr(self.config, "pos_offset", 0) or 0)
+            x = x + self.weights["pos_embed.weight"][pos + offset]
 
         if self.use_rope:
             assert self._inv_freq is not None

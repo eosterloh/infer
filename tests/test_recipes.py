@@ -204,8 +204,10 @@ def test_deepseek_v3_dropin(tmp_path: Path) -> None:
         "moe_intermediate_size": 32,
         "tie_word_embeddings": False,
         "num_hidden_layers": 2,
+        "num_nextn_predict_layers": 1,
     }
     _run_folder(tmp_path, raw, "deepseek_v3")
+    assert "mtp_decode" not in detect_missing(raw, "deepseek")
 
 
 def test_super_latent_mtp_dropin(tmp_path: Path) -> None:
@@ -733,6 +735,27 @@ def test_granitemoe_dropin(tmp_path: Path) -> None:
     _run_folder(tmp_path, raw, "granitemoe")
 
 
+def test_granitemoe_swa_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GraniteMoeSWAForCausalLM"],
+        "model_type": "granitemoe_swa",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "attention_multiplier": 0.25,
+        "residual_multiplier": 1.0,
+        "embedding_multiplier": 1.0,
+        "logits_scaling": 1.0,
+        "sliding_window": 4,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "granitemoe_swa")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "gmswashapes", raw))
+    assert "layers.0.attn.sinks" in cfg.expected_shapes()
+    assert cfg.attention_kind == "gqa_sinks"
+
+
 def test_granitemoeshared_dropin(tmp_path: Path) -> None:
     raw = {
         **_BASE,
@@ -788,6 +811,31 @@ def test_exaone4_dropin(tmp_path: Path) -> None:
     assert cfg.qk_norm is True
 
 
+def test_exaone_moe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["ExaoneMoeForCausalLM"],
+        "model_type": "exaone_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "num_shared_experts": 1,
+        "moe_intermediate_size": 16,
+        "first_k_dense_replace": 1,
+        "n_group": 1,
+        "topk_group": 1,
+        "routed_scaling_factor": 1.0,
+        "sliding_window": 4,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "exaone_moe")
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "exaonemoeshapes", raw))
+    assert cfg.qk_norm is True
+    assert cfg.no_rope_layers == (1, 0)
+    assert "layers.1.moe.experts.gate_up.weight" in cfg.expected_shapes()
+    assert "layers.0.mlp.gate.weight" in cfg.expected_shapes()
+
+
 def test_arcee_dropin(tmp_path: Path) -> None:
     raw = {
         **_BASE,
@@ -817,4 +865,370 @@ def test_mistral3_nested_text_config(tmp_path: Path) -> None:
     cfg = ModelConfig.from_pretrained(write_config(tmp_path / "mistral3nested", raw))
     assert cfg.recipe_id == "mistral"
     missing = detect_missing(raw, "mistral3")
-    assert "vision" in missing
+    assert "vision" not in missing
+
+
+def test_gptj_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GPTJForCausalLM"],
+        "model_type": "gptj",
+        "rotary_dim": 4,
+        "activation_function": "gelu_new",
+        "n_inner": 64,
+        "tie_word_embeddings": False,
+        "num_key_value_heads": 4,
+    }
+    _run_folder(tmp_path, raw, "gptj")
+
+
+def test_gpt_neo_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GPTNeoForCausalLM"],
+        "model_type": "gpt_neo",
+        "attention_types": [[["global", "local"], 1]],
+        "window_size": 4,
+        "activation_function": "gelu_new",
+        "num_key_value_heads": 4,
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "gpt_neo")
+
+
+def test_opt_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["OPTForCausalLM"],
+        "model_type": "opt",
+        "ffn_dim": 64,
+        "enable_bias": True,
+        "activation_function": "relu",
+        "do_layer_norm_before": True,
+        "num_key_value_heads": 4,
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "opt")
+
+
+def test_bloom_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["BloomForCausalLM"],
+        "model_type": "bloom",
+        "n_head": 4,
+        "num_key_value_heads": 4,
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "bloom")
+
+
+def test_falcon_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["FalconForCausalLM"],
+        "model_type": "falcon",
+        "multi_query": True,
+        "parallel_attn": True,
+        "alibi": False,
+        "bias": False,
+        "num_key_value_heads": 1,
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "falcon")
+
+
+def test_mpt_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["MptForCausalLM"],
+        "model_type": "mpt",
+        "n_heads": 4,
+        "d_model": 32,
+        "expansion_ratio": 2,
+        "max_seq_len": 64,
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "mpt")
+
+
+def test_gpt_bigcode_dropin(tmp_path: Path) -> None:
+    raw = {
+        "architectures": ["GPTBigCodeForCausalLM"],
+        "model_type": "gpt_bigcode",
+        "vocab_size": 64,
+        "n_embd": 32,
+        "n_head": 4,
+        "n_layer": 2,
+        "n_inner": 64,
+        "n_positions": 64,
+        "multi_query": True,
+        "layer_norm_epsilon": 1e-5,
+        "torch_dtype": "float32",
+        "tie_word_embeddings": True,
+    }
+    _run_folder(tmp_path, raw, "gpt_bigcode")
+
+
+def test_phi4_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Phi3ForCausalLM"],
+        "model_type": "phi4",
+        "attention_bias": False,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "phi4")
+    assert detect_recipe_id(raw) != "phi"
+
+
+def test_bitnet_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["BitNetForCausalLM"],
+        "model_type": "bitnet",
+        "attention_bias": False,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "bitnet")
+
+
+def test_deepseek_v2_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["DeepseekV2ForCausalLM"],
+        "model_type": "deepseek_v2",
+        "kv_lora_rank": 8,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 4,
+        "v_head_dim": 8,
+        "q_lora_rank": None,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "moe_intermediate_size": 16,
+        "first_k_dense_replace": 1,
+        "n_group": 1,
+        "topk_group": 1,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "deepseek_v2")
+
+
+def test_glm4_moe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Glm4MoeForCausalLM"],
+        "model_type": "glm4_moe",
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "moe_intermediate_size": 16,
+        "first_k_dense_replace": 1,
+        "n_group": 1,
+        "topk_group": 1,
+        "e_score_correction_bias": True,
+        "routed_scaling_factor": 1.0,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "glm4_moe")
+
+
+def test_phimoe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["PhimoeForCausalLM"],
+        "model_type": "phimoe",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "router_jitter_noise": 0.01,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "phimoe")
+
+
+def test_flex_olmo_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["FlexOlmoForCausalLM"],
+        "model_type": "flex_olmo",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": False,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "flex_olmo")
+
+
+def test_hunyuan_v1_moe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["HunYuanMoEV1ForCausalLM"],
+        "model_type": "hunyuan_v1_moe",
+        "num_experts": 4,
+        "moe_topk": 2,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "hunyuan_v1_moe")
+
+
+def test_ernie4_5_moe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Ernie4_5_MoeForCausalLM"],
+        "model_type": "ernie4_5_moe",
+        "moe_num_experts": 4,
+        "moe_k": 2,
+        "moe_num_shared_experts": 1,
+        "moe_layer_start_index": 0,
+        "moe_intermediate_size": 16,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "ernie4_5_moe")
+
+
+def test_dbrx_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["DbrxForCausalLM"],
+        "model_type": "dbrx",
+        "d_model": 32,
+        "n_heads": 4,
+        "n_layers": 2,
+        "max_seq_len": 64,
+        "attn_config": {"kv_n_heads": 2, "clip_qkv": 8.0},
+        "ffn_config": {
+            "ffn_hidden_size": 32,
+            "moe_num_experts": 4,
+            "moe_top_k": 2,
+            "moe_normalize_expert_weights": 1.0,
+        },
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "dbrx")
+
+
+def test_cohere2_moe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Cohere2MoeForCausalLM"],
+        "model_type": "cohere2_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "num_shared_experts": 1,
+        "shared_expert_combination_strategy": "average",
+        "expert_selection_fn": "softmax",
+        "first_k_dense_replace": 1,
+        "mlp_layer_types": ["dense", "sparse"],
+        "layer_types": ["sliding_attention", "full_attention"],
+        "sliding_window": 4,
+        "sliding_window_pattern": 2,
+        "rms_norm_eps": 1e-5,
+        "logit_scale": 0.0625,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "cohere2_moe")
+
+
+def test_diffllama_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["DiffLlamaForCausalLM"],
+        "model_type": "diffllama",
+        "num_key_value_heads": 2,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "diffllama")
+
+
+def test_jamba_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["JambaForCausalLM"],
+        "model_type": "jamba",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "attn_layer_period": 2,
+        "attn_layer_offset": 0,
+        "expert_layer_period": 2,
+        "expert_layer_offset": 1,
+        "mamba_d_state": 8,
+        "mamba_d_conv": 4,
+        "mamba_expand": 2,
+        "mamba_dt_rank": 2,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "jamba")
+
+
+def test_olmo_hybrid_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["OlmoHybridForCausalLM"],
+        "model_type": "olmo_hybrid",
+        "layer_types": ["linear_attention", "full_attention"],
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "linear_conv_kernel_dim": 4,
+        "linear_allow_neg_eigval": True,
+        "qk_norm": True,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "olmo_hybrid")
+
+
+def test_qwen3_next_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Qwen3NextForCausalLM"],
+        "model_type": "qwen3_next",
+        "layer_types": ["linear_attention", "full_attention"],
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 16,
+        "shared_expert_intermediate_size": 16,
+        "decoder_sparse_step": 1,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "linear_conv_kernel_dim": 4,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "qwen3_next")
+
+
+def test_qwen3_5_moe_dropin(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Qwen3_5MoeForCausalLM"],
+        "model_type": "qwen3_5_moe",
+        "layer_types": ["linear_attention", "full_attention"],
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 16,
+        "shared_expert_intermediate_size": 16,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "linear_conv_kernel_dim": 4,
+        "tie_word_embeddings": False,
+    }
+    _run_folder(tmp_path, raw, "qwen3_5_moe")
+
+
+def test_qwen2_vl_text_alias(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Qwen2VLForConditionalGeneration"],
+        "model_type": "qwen2_vl",
+        "text_config": {**_BASE, "model_type": "qwen2"},
+        "vision_config": {"hidden_size": 16},
+    }
+    folder = write_config(tmp_path / "qwen2vl", raw)
+    cfg = ModelConfig.from_pretrained(folder)
+    assert cfg.recipe_id == "qwen2"
+    assert "vision" not in detect_missing(raw, "qwen2vl")

@@ -64,7 +64,7 @@ def route_topk(
         .expand(-1, n_group, n_routed // n_group)
         .reshape(-1, n_routed)
     )
-    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
     topk_indices = torch.topk(scores_for_choice, k=top_k, dim=-1, sorted=False)[1]
     topk_weights = scores.gather(1, topk_indices)
     if norm_topk_prob:
@@ -96,6 +96,32 @@ def softmax_topk(
     if norm_topk_prob:
         topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
     return topk_i, topk_w
+
+
+def _phimoe_sparsemixer(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    top_k: int,
+    jitter: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PhiMoE eval-mode SparseMixer (no Gumbel)."""
+    scores = F.linear(x.float(), gate_weight.float())
+    indices = []
+    weights = []
+    remaining = scores
+    for _ in range(top_k):
+        with torch.no_grad():
+            thresh, max_ind = remaining.max(dim=-1, keepdim=True)
+            factor = remaining.abs().clamp(min=thresh)
+            mask = ((thresh - remaining) / factor) > (2 * jitter)
+        masked = remaining.masked_fill(mask, float("-inf"))
+        selected = max_ind
+        probs = torch.softmax(masked, dim=-1)
+        w = probs.gather(1, selected)
+        indices.append(selected)
+        weights.append(w)
+        remaining = remaining.scatter(-1, selected, float("-inf"))
+    return torch.cat(indices, dim=-1), torch.cat(weights, dim=-1)
 
 
 def _dispatch_experts(
@@ -144,17 +170,72 @@ def moe(
     norm_topk = bool(getattr(config, "norm_topk_prob", True))
     logits_then_softmax = kind == "gpt_oss" or config.recipe_id in {
         "granitemoe",
+        "granitemoe_swa",
         "granitemoeshared",
+        "cohere2_moe",
     }
-    if logits_then_softmax:
+    if config.recipe_id == "phimoe":
+        topk_i, topk_w = _phimoe_sparsemixer(
+            flat, gate_w, top_k, jitter=float((config.raw or {}).get("router_jitter_noise") or 0.01)
+        )
+    elif kind == "deepseek" and (
+        config.recipe_id in {"glm4_moe", "exaone_moe"}
+        or (
+            config.recipe_id == "deepseek_v3"
+            and f"{p}.moe.gate.e_score_correction_bias" in weights
+        )
+    ):
+        n_group = int((config.raw or {}).get("n_group", 1) or 1)
+        topk_group = int((config.raw or {}).get("topk_group", 1) or 1)
+        scale = float(config.routed_scaling_factor or 1.0)
+        bias = weights.get(f"{p}.moe.gate.e_score_correction_bias")
+        if bias is None:
+            bias = torch.zeros(n_routed, device=flat.device, dtype=torch.float32)
+        topk_i, topk_w = route_topk(
+            flat,
+            gate_w,
+            bias.reshape(-1),
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            norm_topk_prob=norm_topk,
+            routed_scaling_factor=scale,
+        )
+    elif config.recipe_id == "ernie4_5_moe":
+        logits = F.linear(flat.float(), gate_w.float())
+        probs = torch.softmax(logits, dim=-1)
+        choice = probs
+        bias = weights.get(f"{p}.moe.gate.e_score_correction_bias")
+        if bias is not None:
+            choice = choice + bias.reshape(-1).float()
+        topk_w, topk_i = torch.topk(choice, k=top_k, dim=-1)
+        topk_w = probs.gather(1, topk_i)
+        min_norm = float((config.raw or {}).get("moe_norm_min") or 1e-12)
+        topk_w = topk_w / torch.clamp(topk_w.sum(dim=-1, keepdim=True), min=min_norm)
+    elif config.recipe_id == "dbrx":
+        logits = F.linear(flat.float(), gate_w.float())
+        scores = torch.softmax(logits, dim=-1)
+        topk_w, topk_i = torch.topk(scores, k=top_k, dim=-1)
+        p_norm = (config.raw or {}).get("moe_normalize_expert_weights", 1.0)
+        if p_norm is not None:
+            topk_w = topk_w / torch.norm(topk_w, p=float(p_norm), dim=-1, keepdim=True)
+    elif logits_then_softmax:
         logits = F.linear(flat.float(), gate_w.float(), gate_b.float() if gate_b is not None else None)
         topk_v, topk_i = torch.topk(logits, k=top_k, dim=-1)
-        topk_w = torch.softmax(topk_v, dim=-1)
+        sel = str((config.raw or {}).get("expert_selection_fn") or "softmax")
+        if config.recipe_id == "cohere2_moe" and sel == "sigmoid":
+            topk_w = torch.sigmoid(topk_v)
+            if norm_topk:
+                topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
+        else:
+            topk_w = torch.softmax(topk_v, dim=-1)
     else:
         topk_i, topk_w = softmax_topk(flat, gate_w, top_k, gate_b, norm_topk_prob=norm_topk)
 
     packed = f"{p}.moe.experts.gate_up.weight" in weights
-    if kind in {"gpt_oss", "llama4"} or packed:
+    if kind == "dbrx" or f"{p}.moe.experts.w1.weight" in weights:
+        routed = _dbrx_experts(flat, topk_i, topk_w, weights, p, n_routed)
+    elif kind in {"gpt_oss", "llama4"} or packed:
         routed = _packed_experts(flat, topk_i, topk_w, weights, p, n_routed, kind)
     else:
         act_gate = True
@@ -203,8 +284,36 @@ def moe(
         gate_w = weights.get(f"{p}.moe.shared_gate.weight")
         if gate_w is not None:
             shared = shared * torch.sigmoid(F.linear(residuals, gate_w))
+        combo = str((config.raw or {}).get("shared_expert_combination_strategy") or "sum")
+        if config.recipe_id == "cohere2_moe" and combo == "average":
+            return (routed + shared) / 2
         return routed + shared
     return routed
+
+
+def _dbrx_experts(
+    flat: torch.Tensor,
+    topk_i: torch.Tensor,
+    topk_w: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+    p: str,
+    n_routed: int,
+) -> torch.Tensor:
+    w1 = weights[f"{p}.moe.experts.w1.weight"]
+    v1 = weights[f"{p}.moe.experts.v1.weight"]
+    w2 = weights[f"{p}.moe.experts.w2.weight"]
+    hidden = flat.shape[-1]
+    inter = w1.shape[0] // n_routed
+    w1 = w1.view(n_routed, inter, hidden)
+    v1 = v1.view(n_routed, inter, hidden)
+    w2 = w2.view(n_routed, inter, hidden)
+
+    def run(idx: int, tok: torch.Tensor) -> torch.Tensor:
+        gate = F.silu(F.linear(tok, w1[idx]))
+        up = F.linear(tok, v1[idx])
+        return (gate * up) @ w2[idx]
+
+    return _dispatch_experts(flat, topk_i, topk_w, n_routed, run)
 
 
 def _packed_experts(

@@ -232,6 +232,52 @@ def test_granite_swa_sinks_change_outputs(tmp_path: Path) -> None:
     assert not torch.allclose(with_sinks, without)
 
 
+def test_exaone_moe_nope_on_full_layers(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["ExaoneMoeForCausalLM"],
+        "model_type": "exaone_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "num_shared_experts": 1,
+        "moe_intermediate_size": 16,
+        "first_k_dense_replace": 0,
+        "sliding_window": 4,
+        "layer_types": ["full_attention"],
+        "num_hidden_layers": 1,
+        "tie_word_embeddings": False,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "exmoeu", raw))
+    torch.manual_seed(14)
+    weights = random_engine_weights(cfg, seed=14)
+    ids = torch.randint(0, cfg.vocab_size, (1, 5))
+    nope = DecoderModel(cfg, weights).forward(ids)
+    roped = DecoderModel(replace(cfg, no_rope_layers=(1,)), weights).forward(ids)
+    assert not torch.allclose(nope, roped)
+
+
+def test_granitemoe_swa_sliding_changes_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GraniteMoeSWAForCausalLM"],
+        "model_type": "granitemoe_swa",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "attention_multiplier": 0.25,
+        "sliding_window": 3,
+        "layer_types": ["sliding_attention"],
+        "num_hidden_layers": 1,
+        "tie_word_embeddings": False,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "gmswau", raw))
+    torch.manual_seed(13)
+    weights = random_engine_weights(cfg, seed=13)
+    ids = torch.randint(0, cfg.vocab_size, (1, 6))
+    slid = DecoderModel(cfg, weights).forward(ids)
+    full = DecoderModel(replace(cfg, layer_types=("full_attention",)), weights).forward(ids)
+    assert not torch.allclose(slid, full)
+
+
 def test_stablelm_partial_rope_changes_outputs(tmp_path: Path) -> None:
     raw = {
         **_BASE,
@@ -249,3 +295,272 @@ def test_stablelm_partial_rope_changes_outputs(tmp_path: Path) -> None:
     partial = DecoderModel(cfg, weights).forward(ids)
     full = DecoderModel(replace(cfg, partial_rotary_factor=1.0), weights).forward(ids)
     assert not torch.allclose(partial, full)
+
+
+def test_bloom_alibi_and_embed_norm_change_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["BloomForCausalLM"],
+        "model_type": "bloom",
+        "num_key_value_heads": 4,
+        "tie_word_embeddings": True,
+        "num_hidden_layers": 1,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "bloomu", raw))
+    torch.manual_seed(9)
+    weights = random_engine_weights(cfg, seed=9)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    base = DecoderModel(cfg, weights).forward(ids)
+    no_alibi = DecoderModel(replace(cfg, alibi=False), weights).forward(ids)
+    assert not torch.allclose(base, no_alibi)
+    no_en = dict(weights)
+    no_en["embed_norm.weight"] = weights["embed_norm.weight"] * 2
+    ones = DecoderModel(cfg, no_en).forward(ids)
+    assert not torch.allclose(base, ones)
+
+
+def test_mpt_alibi_differs_from_bloom(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["MptForCausalLM"],
+        "model_type": "mpt",
+        "expansion_ratio": 2,
+        "num_key_value_heads": 4,
+        "tie_word_embeddings": True,
+        "num_hidden_layers": 1,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "mptu", raw))
+    torch.manual_seed(10)
+    weights = random_engine_weights(cfg, seed=10)
+    ids = torch.randint(0, cfg.vocab_size, (1, 5))
+    from engine.layers.attention import build_alibi
+
+    mpt_b = build_alibi(cfg.num_attention_heads, 5, 5, torch.device("cpu"), "mpt")
+    bloom_b = build_alibi(cfg.num_attention_heads, 5, 5, torch.device("cpu"), "bloom")
+    assert not torch.allclose(mpt_b, bloom_b)
+    DecoderModel(cfg, weights).forward(ids)  # still runnable
+
+
+def test_opt_pos_offset_changes_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["OPTForCausalLM"],
+        "model_type": "opt",
+        "ffn_dim": 64,
+        "activation_function": "relu",
+        "num_key_value_heads": 4,
+        "tie_word_embeddings": True,
+        "num_hidden_layers": 1,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "optu", raw))
+    torch.manual_seed(11)
+    weights = random_engine_weights(cfg, seed=11)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    base = DecoderModel(cfg, weights).forward(ids)
+    no_off = DecoderModel(replace(cfg, pos_offset=0), weights).forward(ids)
+    assert not torch.allclose(base, no_off)
+
+
+def test_gpt_neo_unscaled_attention(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GPTNeoForCausalLM"],
+        "model_type": "gpt_neo",
+        "attention_types": [[["global"], 1]],
+        "num_key_value_heads": 4,
+        "tie_word_embeddings": True,
+        "num_hidden_layers": 1,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "neou", raw))
+    torch.manual_seed(12)
+    weights = random_engine_weights(cfg, seed=12)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    base = DecoderModel(cfg, weights).forward(ids)
+    scaled = DecoderModel(replace(cfg, attention_multiplier=None), weights).forward(ids)
+    assert not torch.allclose(base, scaled)
+
+
+def test_gptj_parallel_residual(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["GPTJForCausalLM"],
+        "model_type": "gptj",
+        "rotary_dim": 4,
+        "num_key_value_heads": 4,
+        "tie_word_embeddings": False,
+        "num_hidden_layers": 1,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "gptju", raw))
+    torch.manual_seed(13)
+    weights = random_engine_weights(cfg, seed=13)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    parallel = DecoderModel(cfg, weights).forward(ids)
+    no_mlp = dict(weights)
+    no_mlp["layers.0.mlp.up.weight"] = torch.zeros_like(weights["layers.0.mlp.up.weight"])
+    no_mlp["layers.0.mlp.down.weight"] = torch.zeros_like(weights["layers.0.mlp.down.weight"])
+    attn_only = DecoderModel(cfg, no_mlp).forward(ids)
+    assert not torch.allclose(parallel, attn_only)
+
+
+def test_dbrx_lp_normalize_changes_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["DbrxForCausalLM"],
+        "model_type": "dbrx",
+        "d_model": 32,
+        "n_heads": 4,
+        "n_layers": 1,
+        "max_seq_len": 64,
+        "attn_config": {"kv_n_heads": 2, "clip_qkv": 8.0},
+        "ffn_config": {
+            "ffn_hidden_size": 32,
+            "moe_num_experts": 4,
+            "moe_top_k": 2,
+            "moe_normalize_expert_weights": 1.0,
+        },
+        "tie_word_embeddings": False,
+        "num_hidden_layers": 1,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "dbrxu", raw))
+    torch.manual_seed(20)
+    weights = random_engine_weights(cfg, seed=20)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    base = DecoderModel(cfg, weights).forward(ids)
+    raw2 = dict(raw)
+    raw2["ffn_config"] = {**raw["ffn_config"], "moe_normalize_expert_weights": None}
+    cfg2 = ModelConfig.from_pretrained(write_config(tmp_path / "dbrxu2", raw2))
+    off = DecoderModel(cfg2, weights).forward(ids)
+    assert not torch.allclose(base, off)
+
+
+def test_diffllama_lambda_changes_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["DiffLlamaForCausalLM"],
+        "model_type": "diffllama",
+        "num_key_value_heads": 2,
+        "num_hidden_layers": 1,
+        "tie_word_embeddings": False,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "diffu", raw))
+    torch.manual_seed(21)
+    weights = random_engine_weights(cfg, seed=21)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    base = DecoderModel(cfg, weights).forward(ids)
+    zero = dict(weights)
+    for name in (
+        "layers.0.attn.lambda_q1",
+        "layers.0.attn.lambda_k1",
+        "layers.0.attn.lambda_q2",
+        "layers.0.attn.lambda_k2",
+    ):
+        zero[name] = torch.zeros_like(weights[name])
+    flat = DecoderModel(cfg, zero).forward(ids)
+    assert not torch.allclose(base, flat)
+
+
+def test_jamba_mamba1_schedule_changes_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["JambaForCausalLM"],
+        "model_type": "jamba",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "attn_layer_period": 2,
+        "attn_layer_offset": 0,
+        "expert_layer_period": 2,
+        "expert_layer_offset": 1,
+        "mamba_d_state": 8,
+        "mamba_d_conv": 4,
+        "mamba_expand": 2,
+        "mamba_dt_rank": 2,
+        "num_hidden_layers": 2,
+        "tie_word_embeddings": False,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "jambau", raw))
+    from engine.schedule import MixerKind
+
+    assert cfg.layers[0].mixer == MixerKind.ATTENTION
+    assert cfg.layers[1].mixer == MixerKind.MAMBA1
+    torch.manual_seed(22)
+    weights = random_engine_weights(cfg, seed=22)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    base = DecoderModel(cfg, weights).forward(ids)
+    raw2 = {**raw, "attn_layer_offset": 1}
+    cfg2 = ModelConfig.from_pretrained(write_config(tmp_path / "jambau2", raw2))
+    swapped = DecoderModel(cfg2, random_engine_weights(cfg2, seed=22)).forward(ids)
+    assert not torch.allclose(base, swapped)
+
+
+def test_cohere2_moe_shared_average_changes_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["Cohere2MoeForCausalLM"],
+        "model_type": "cohere2_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "num_shared_experts": 1,
+        "shared_expert_combination_strategy": "average",
+        "first_k_dense_replace": 0,
+        "mlp_layer_types": ["sparse"],
+        "layer_types": ["sliding_attention"],
+        "sliding_window": 4,
+        "rms_norm_eps": 1e-5,
+        "num_hidden_layers": 1,
+        "tie_word_embeddings": False,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "c2moeu", raw))
+    torch.manual_seed(23)
+    weights = random_engine_weights(cfg, seed=23)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    avg = DecoderModel(cfg, weights).forward(ids)
+    raw2 = {**raw, "shared_expert_combination_strategy": "sum"}
+    cfg2 = ModelConfig.from_pretrained(write_config(tmp_path / "c2moeu2", raw2))
+    summed = DecoderModel(cfg2, weights).forward(ids)
+    assert not torch.allclose(avg, summed)
+
+
+def test_olmo_hybrid_neg_eigval_changes_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["OlmoHybridForCausalLM"],
+        "model_type": "olmo_hybrid",
+        "layer_types": ["linear_attention", "full_attention"],
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "linear_conv_kernel_dim": 4,
+        "linear_allow_neg_eigval": True,
+        "num_hidden_layers": 2,
+        "tie_word_embeddings": False,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "olmh", raw))
+    torch.manual_seed(24)
+    weights = random_engine_weights(cfg, seed=24)
+    ids = torch.randint(0, cfg.vocab_size, (1, 5))
+    allow = DecoderModel(cfg, weights).forward(ids)
+    raw2 = {**raw, "linear_allow_neg_eigval": False}
+    cfg2 = ModelConfig.from_pretrained(write_config(tmp_path / "olmh2", raw2))
+    deny = DecoderModel(cfg2, weights).forward(ids)
+    assert not torch.allclose(allow, deny)
+
+
+def test_bitnet_sub_norms_change_outputs(tmp_path: Path) -> None:
+    raw = {
+        **_BASE,
+        "architectures": ["BitNetForCausalLM"],
+        "model_type": "bitnet",
+        "num_hidden_layers": 1,
+        "tie_word_embeddings": False,
+    }
+    cfg = ModelConfig.from_pretrained(write_config(tmp_path / "bitnetu", raw))
+    torch.manual_seed(14)
+    weights = random_engine_weights(cfg, seed=14)
+    ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    base = DecoderModel(cfg, weights).forward(ids)
+    ones = dict(weights)
+    ones["layers.0.attn.sub_norm.weight"] = weights["layers.0.attn.sub_norm.weight"] * 2
+    ones["layers.0.mlp.sub_norm.weight"] = weights["layers.0.mlp.sub_norm.weight"] * 2
+    flat = DecoderModel(cfg, ones).forward(ids)
+    assert not torch.allclose(base, flat)

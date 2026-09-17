@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 class MixerKind(str, Enum):
     ATTENTION = "attention"
     MAMBA2 = "mamba2"
+    MAMBA1 = "mamba1"
     GATED_DELTANET = "gated_deltanet"
     NONE = "none"
 
@@ -74,15 +75,22 @@ def hybrid_pattern_schedule(pattern: str) -> tuple[LayerSpec, ...]:
     return tuple(specs)
 
 
-def layer_types_schedule(layer_types: list[str] | tuple[str, ...]) -> tuple[LayerSpec, ...]:
-    """Qwen3.5 / Qwen3.8 hybrid: layer_types[i] is linear_attention or full_attention."""
+def layer_types_schedule(
+    layer_types: list[str] | tuple[str, ...],
+    *,
+    moe_layers: set[int] | None = None,
+    linear_mixer: MixerKind = MixerKind.GATED_DELTANET,
+) -> tuple[LayerSpec, ...]:
+    """Hybrid layer_types: linear_attention / full_attention, optional MoE FFN."""
     specs: list[LayerSpec] = []
+    moe_layers = moe_layers or set()
     for i, kind in enumerate(layer_types):
         k = str(kind).lower().replace("-", "_")
-        if k in {"linear_attention", "gated_deltanet", "linear"}:
-            specs.append(LayerSpec(i, MixerKind.GATED_DELTANET, FfnKind.DENSE_MLP))
+        ffn = FfnKind.MOE if i in moe_layers else FfnKind.DENSE_MLP
+        if k in {"linear_attention", "gated_deltanet", "linear", "mamba"}:
+            specs.append(LayerSpec(i, linear_mixer, ffn))
         elif k in {"full_attention", "attention", "full"}:
-            specs.append(LayerSpec(i, MixerKind.ATTENTION, FfnKind.DENSE_MLP))
+            specs.append(LayerSpec(i, MixerKind.ATTENTION, ffn))
         else:
             raise ValueError(
                 f"unknown layer_types[{i}]={kind!r}; "
@@ -131,7 +139,17 @@ def build_schedule(config: ModelConfig) -> tuple[LayerSpec, ...]:
             )
         return hybrid_pattern_schedule(pattern)
 
-    if recipe in {"mixtral", "gpt_oss", "olmoe", "granitemoe", "granitemoeshared"}:
+    if recipe in {
+        "mixtral",
+        "gpt_oss",
+        "olmoe",
+        "flex_olmo",
+        "granitemoe",
+        "granitemoe_swa",
+        "granitemoeshared",
+        "phimoe",
+        "hunyuan_v1_moe",
+    }:
         return tuple(LayerSpec(i, MixerKind.ATTENTION, FfnKind.MOE) for i in range(n))
 
     if recipe in {"qwen3_moe", "qwen2_moe"}:
@@ -144,6 +162,75 @@ def build_schedule(config: ModelConfig) -> tuple[LayerSpec, ...]:
         }
         return dense_or_moe_schedule(n, moe_set)
 
+    if recipe == "dbrx":
+        return tuple(LayerSpec(i, MixerKind.ATTENTION, FfnKind.MOE) for i in range(n))
+
+    if recipe == "cohere2_moe":
+        mlp_types = [str(t).lower() for t in (raw.get("mlp_layer_types") or ())]
+        first_k = int(raw.get("first_k_dense_replace") or 0)
+        if not mlp_types:
+            mlp_types = ["dense" if i < first_k else "sparse" for i in range(n)]
+        moe_set = {i for i, t in enumerate(mlp_types) if t != "dense"}
+        return dense_or_moe_schedule(n, moe_set)
+
+    if recipe == "qwen3_next":
+        types = getattr(config, "layer_types", None) or raw.get("layer_types")
+        if not types:
+            interval = int(raw.get("full_attention_interval") or 4)
+            types = [
+                "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                for i in range(n)
+            ]
+        mlp_only = {int(x) for x in (raw.get("mlp_only_layers") or [])}
+        step = int(raw.get("decoder_sparse_step") or 1)
+        moe_set = {
+            i
+            for i in range(n)
+            if i not in mlp_only and step > 0 and (i + 1) % step == 0
+        }
+        return layer_types_schedule(types, moe_layers=moe_set)
+
+    if recipe == "qwen3_5_moe":
+        types = getattr(config, "layer_types", None) or raw.get("layer_types")
+        if not types:
+            interval = int(raw.get("full_attention_interval") or 4)
+            types = [
+                "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                for i in range(n)
+            ]
+        return layer_types_schedule(types, moe_layers=set(range(n)))
+
+    if recipe == "olmo_hybrid":
+        types = getattr(config, "layer_types", None) or raw.get("layer_types")
+        if not types:
+            raise ValueError("olmo_hybrid config missing layer_types")
+        return layer_types_schedule(types)
+
+    if recipe == "jamba":
+        def _ival(key: str, default: int) -> int:
+            val = raw.get(key)
+            return default if val is None else int(val)
+
+        attn_period = _ival("attn_layer_period", 8)
+        attn_offset = _ival("attn_layer_offset", 4)
+        expert_period = _ival("expert_layer_period", 2)
+        expert_offset = _ival("expert_layer_offset", 1)
+        n_experts = int(raw.get("num_experts") or raw.get("n_routed_experts") or 1)
+        specs = []
+        for i in range(n):
+            mixer = (
+                MixerKind.ATTENTION
+                if attn_period > 0 and i % attn_period == attn_offset
+                else MixerKind.MAMBA1
+            )
+            use_moe = (
+                n_experts > 1
+                and expert_period > 0
+                and i % expert_period == expert_offset
+            )
+            specs.append(LayerSpec(i, mixer, FfnKind.MOE if use_moe else FfnKind.DENSE_MLP))
+        return tuple(specs)
+
     if recipe == "llama4":
         listed = raw.get("moe_layers")
         if listed is not None:
@@ -153,9 +240,21 @@ def build_schedule(config: ModelConfig) -> tuple[LayerSpec, ...]:
             moe_set = {i for i in range(n) if step > 0 and (i + 1) % step == 0}
         return dense_or_moe_schedule(n, moe_set)
 
-    if recipe == "deepseek_v3":
+    if recipe in {"deepseek_v3", "deepseek_v2", "glm4_moe", "exaone_moe"}:
         first = int(raw.get("first_k_dense_replace") or 0)
         moe_set = {i for i in range(n) if i >= first}
+        return dense_or_moe_schedule(n, moe_set)
+
+    if recipe == "ernie4_5_moe":
+        start = int(raw.get("moe_layer_start_index") or 0)
+        end = raw.get("moe_layer_end_index")
+        end_i = n - 1 if end in (None, -1) else int(end)
+        interval = int(raw.get("moe_layer_interval") or 1)
+        moe_set = {
+            i
+            for i in range(n)
+            if start <= i <= end_i and interval > 0 and (i - start) % interval == 0
+        }
         return dense_or_moe_schedule(n, moe_set)
 
     if recipe == "qwen3_5" or (config.model_type or "").lower() in {
@@ -202,6 +301,16 @@ def build_schedule(config: ModelConfig) -> tuple[LayerSpec, ...]:
         "stablelm",
         "exaone4",
         "arcee",
+        "gptj",
+        "gpt_neo",
+        "gpt_bigcode",
+        "opt",
+        "bloom",
+        "falcon",
+        "mpt",
+        "phi4",
+        "bitnet",
+        "diffllama",
         None,
         "",
     } or (config.model_type or "").lower() in {"llama", ""}:

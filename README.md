@@ -1,8 +1,8 @@
 # infer — DIY hybrid decoder
 
-From-scratch inference: HuggingFace folder in (`config.json` + safetensors) → logits → greedy tokens.
+From-scratch inference: HuggingFace folder in (`config.json` + safetensors) → logits → greedy or sampled tokens.
 
-Works today: drop in `config.json` + weights (safetensors or GGUF). Recipes: Llama, Mistral, Qwen2/3, Qwen2-MoE, Qwen3-MoE, Qwen3.5/Qwen3.8 (hybrid text, image/video, native MTP), Yi, Gemma / Gemma2 / Gemma3, Phi / Phi-3, Mixtral, Llama 4, GPT-2, GPT-NeoX, GPT-OSS, DeepSeek V3, Granite / Granite SWA / GraniteMoE / GraniteMoE-Shared, OLMo / OLMo2 / OLMo3 / OLMoE, SmolLM3, StarCoder2, Nemotron (dense), Cohere / Cohere2, GLM / GLM4, StableLM, EXAONE 4, Arcee, Nemotron-H (Nano + Super LatentMoE). Llama-identical checkpoints (Helium, ERNIE 4.5 dense, Hunyuan dense, Seed-OSS, CWM, Ministral / Mistral3 text) auto-detect onto Llama/Mistral. NVFP4/FP8 dequant on load.
+Works today: drop in `config.json` + weights (safetensors or GGUF). Recipes: Llama, Mistral, Qwen2/3, Qwen2-MoE, Qwen3-MoE, Qwen3.5/Qwen3.8 (hybrid text, image/video, native MTP), Qwen3-Next, Qwen3.5-MoE, Yi, Gemma / Gemma2 / Gemma3, Phi / Phi-3 / Phi-4, Mixtral, Llama 4, GPT-2 / GPT-J / GPT-Neo / GPT-NeoX / GPT-BigCode, OPT, Bloom, Falcon, MPT, BitNet, GPT-OSS, DeepSeek V2 / V3, Granite / Granite SWA / GraniteMoE / GraniteMoE-SWA / GraniteMoE-Shared, OLMo / OLMo2 / OLMo3 / OLMoE / FlexOlmo / OLMo-Hybrid, SmolLM3, StarCoder2, Nemotron (dense), Cohere / Cohere2 / Cohere2-MoE, GLM / GLM4 / GLM4-MoE, StableLM, EXAONE 4 / EXAONE MoE, Arcee, PhiMoE, Hunyuan V1 MoE, ERNIE 4.5 MoE, DBRX, DiffLlama, Jamba (Mamba-1), Nemotron-H (Nano + Super LatentMoE). Llama-identical checkpoints (Helium, ERNIE 4.5 dense, Hunyuan dense, Seed-OSS, CWM, Ministral / Mistral3 text) auto-detect onto Llama/Mistral. Qwen2-VL / InternVL / Kimi text backbones alias onto Qwen2 / Llama / DeepSeek V3. Native MTP on Qwen3.5, DeepSeek V3, and Nemotron Super. Vision generate for Qwen3.5, Qwen2-VL / Qwen2.5-VL, Gemma3, Llama 4, and Mistral3. Sampling (`temperature`, `top_k`, `top_p`, `seed`) on decode. C++ RMSNorm / SiLU-mul kernels with a Python fallback. NVFP4/FP8 dequant on load.
 North star: **Nemotron NVFP4 fused on DGX Spark**, agent-runnable.
 
 ## How to read `engine/`
@@ -59,7 +59,7 @@ export PYTHONPATH=~/Projects/infer
 python -m engine.chat --model testdata/nemotron3-nano-30b-a3b --inspect
 
 python -m engine.chat --model ~/models/Llama-3.2-1B-Instruct --device cuda \
-  --prompt "The capital of France is" --max-new-tokens 32
+  --prompt "The capital of France is" --max-new-tokens 32 --temperature 0.8 --top-p 0.9 --seed 0
 
 python -m engine.chat --model ~/models/Qwen3.8-27B --device cuda \
   --prompt "Write one sentence." --max-new-tokens 32 --mtp-draft-tokens 3
@@ -71,6 +71,7 @@ from engine.agent_api import inspect_capabilities, load_engine
 print(inspect_capabilities("testdata/nemotron3-nano-30b-a3b").to_dict())
 eng = load_engine("~/models/Llama-3.2-1B-Instruct", device="cuda")
 print(eng.generate("The capital of France is", max_new_tokens=16))
+print(eng.generate("The capital of France is", max_new_tokens=16, temperature=0.8, top_p=0.9, seed=0))
 
 # Qwen image/video messages use the checkpoint's official AutoProcessor.
 # content may contain PIL images, local paths, URLs, or videos accepted by it.

@@ -108,6 +108,8 @@ def load_hf_prefixes(
 
 def _maybe_transpose(name: str, tensor: torch.Tensor, config: ModelConfig) -> torch.Tensor:
     """GPT-2 Conv1D is stored [in, out]; engine Linear wants [out, in]."""
+    if name.endswith("e_score_correction_bias") and tensor.dim() > 1:
+        tensor = tensor.reshape(-1)
     if config.recipe_id != "gpt2":
         return tensor
     if name.endswith((".attn.c_attn.weight", ".attn.c_proj.weight", ".mlp.c_fc.weight", ".mlp.c_proj.weight")):

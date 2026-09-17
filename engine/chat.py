@@ -47,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--prompt",
         default=None,
-        help="If set, run greedy generate on this prompt",
+        help="If set, generate on this prompt (greedy unless --temperature > 0)",
     )
     p.add_argument(
         "--max-new-tokens",
@@ -76,6 +76,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Use native MTP with this many speculative tokens per verify step",
     )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature; <= 0 is greedy argmax",
+    )
+    p.add_argument("--top-k", type=int, default=None, help="Top-k filter (0 disables)")
+    p.add_argument("--top-p", type=float, default=None, help="Nucleus probability mass")
+    p.add_argument("--seed", type=int, default=None, help="RNG seed for sampling")
     return p
 
 
@@ -132,6 +141,10 @@ def main(argv: list[str] | None = None) -> int:
         apply_chat_template=apply_tmpl,
         enable_thinking=args.enable_thinking,
         num_speculative_tokens=args.mtp_draft_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        seed=args.seed,
     ):
         pieces.append(piece)
         print(piece, end="", flush=True)

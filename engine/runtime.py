@@ -38,6 +38,10 @@ class EngineHandle:
         *,
         max_new_tokens: int = 32,
         use_cache: bool = True,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
     ) -> str:
         pieces = list(
             generate_greedy(
@@ -46,6 +50,10 @@ class EngineHandle:
                 prompt,
                 max_new_tokens=max_new_tokens,
                 use_cache=use_cache,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
             )
         )
         return "".join(pieces)
@@ -56,6 +64,10 @@ class EngineHandle:
         *,
         max_new_tokens: int = 32,
         use_cache: bool = True,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        seed: int | None = None,
     ) -> Iterator[str]:
         yield from generate_greedy(
             self.model,
@@ -63,6 +75,10 @@ class EngineHandle:
             prompt,
             max_new_tokens=max_new_tokens,
             use_cache=use_cache,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
         )
 
     def num_params(self) -> int:

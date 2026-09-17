@@ -99,10 +99,10 @@ def test_detect_recipe_id_from_raw() -> None:
     assert detect_recipe_id({"model_type": "llama"}) == "llama"
     assert detect_recipe_id({"model_type": "qwen3"}) == "qwen3"
     assert detect_recipe_id({"model_type": "qwen3_5"}) == "qwen3_5"
-    with pytest.raises(UnsupportedRecipeError, match="fused GDN"):
-        detect_recipe_id({"model_type": "qwen3_next"})
-    with pytest.raises(UnsupportedRecipeError, match="MoE"):
-        detect_recipe_id({"model_type": "qwen3_5_moe"})
+    assert detect_recipe_id({"model_type": "qwen3_next"}) == "qwen3_next"
+    assert detect_recipe_id({"model_type": "qwen3_5_moe"}) == "qwen3_5_moe"
+    assert detect_recipe_id({"model_type": "qwen3_next"}) != "qwen3_5"
+    assert detect_recipe_id({"model_type": "qwen3_5_moe"}) != "qwen3_5"
     assert (
         detect_recipe_id(
             {
@@ -142,11 +142,16 @@ def test_detect_recipe_id_from_raw() -> None:
     assert detect_recipe_id({"model_type": "stablelm"}) == "stablelm"
     assert detect_recipe_id({"model_type": "granite_swa"}) == "granite_swa"
     assert detect_recipe_id({"model_type": "granitemoe"}) == "granitemoe"
+    assert detect_recipe_id({"model_type": "granitemoe_swa"}) == "granitemoe_swa"
+    assert detect_recipe_id({"model_type": "granitemoe_swa"}) != "granitemoe"
+    assert detect_recipe_id({"model_type": "granitemoe_swa"}) != "granite_swa"
     assert detect_recipe_id({"model_type": "granitemoeshared"}) == "granitemoeshared"
     assert detect_recipe_id({"model_type": "granitemoe"}) != "granite"
     assert detect_recipe_id({"model_type": "cohere2"}) == "cohere"
     assert detect_recipe_id({"architectures": ["Cohere2ForCausalLM"]}) == "cohere"
     assert detect_recipe_id({"model_type": "exaone4"}) == "exaone4"
+    assert detect_recipe_id({"model_type": "exaone_moe"}) == "exaone_moe"
+    assert detect_recipe_id({"model_type": "exaone_moe"}) != "exaone4"
     assert detect_recipe_id({"model_type": "arcee"}) == "arcee"
     assert detect_recipe_id({"model_type": "mistral3"}) == "mistral"
     assert detect_recipe_id({"architectures": ["Mistral3ForConditionalGeneration"]}) == "mistral"
@@ -164,23 +169,43 @@ def test_detect_recipe_id_from_raw() -> None:
     assert detect_recipe_id({"model_type": "cohere"}) == "cohere"
     assert detect_recipe_id({"model_type": "glm"}) == "glm"
     assert detect_recipe_id({"model_type": "glm4"}) == "glm"
-    with pytest.raises(UnsupportedRecipeError):
-        detect_recipe_id({"model_type": "phimoe"})
-    with pytest.raises(UnsupportedRecipeError):
-        detect_recipe_id({"model_type": "diffllama"})
+    assert detect_recipe_id({"model_type": "phimoe"}) == "phimoe"
+    assert detect_recipe_id({"model_type": "diffllama"}) == "diffllama"
     with pytest.raises(UnsupportedRecipeError):
         detect_recipe_id({"model_type": "granitemoehybrid"})
-    with pytest.raises(UnsupportedRecipeError):
-        detect_recipe_id({"model_type": "olmo_hybrid"})
-    with pytest.raises(UnsupportedRecipeError):
-        detect_recipe_id({"architectures": ["Phi4ForCausalLM"], "model_type": "phi4"})
+    assert detect_recipe_id({"model_type": "olmo_hybrid"}) == "olmo_hybrid"
+    assert detect_recipe_id({"model_type": "olmo_hybrid"}) != "olmo"
+    assert detect_recipe_id({"architectures": ["Phi4ForCausalLM"], "model_type": "phi4"}) == "phi4"
+    assert detect_recipe_id({"model_type": "phi4"}) != "phi"
     assert detect_recipe_id({"model_type": "qwen3_moe"}) != "mixtral"
     assert detect_recipe_id({"model_type": "gemma2"}) != "gemma"
     assert detect_recipe_id({"model_type": "nemotron"}) != "nemotron_h"
-    with pytest.raises(UnsupportedRecipeError):
-        detect_recipe_id({"model_type": "ernie4_5_moe"})
-    with pytest.raises(UnsupportedRecipeError):
-        detect_recipe_id({"architectures": ["Ernie4_5MoeForCausalLM"], "model_type": "ernie4_5"})
+    assert detect_recipe_id({"model_type": "ernie4_5_moe"}) == "ernie4_5_moe"
+    assert detect_recipe_id({"architectures": ["Ernie4_5MoeForCausalLM"], "model_type": "ernie4_5"}) == "ernie4_5_moe"
+    assert detect_recipe_id({"model_type": "deepseek_v2"}) == "deepseek_v2"
+    assert detect_recipe_id({"model_type": "deepseek_v2"}) != "deepseek_v3"
+    assert detect_recipe_id({"model_type": "gptj"}) == "gptj"
+    assert detect_recipe_id({"model_type": "gpt_neo"}) == "gpt_neo"
+    assert detect_recipe_id({"model_type": "opt"}) == "opt"
+    assert detect_recipe_id({"model_type": "bloom"}) == "bloom"
+    assert detect_recipe_id({"model_type": "falcon"}) == "falcon"
+    assert detect_recipe_id({"model_type": "mpt"}) == "mpt"
+    assert detect_recipe_id({"model_type": "gpt_bigcode"}) == "gpt_bigcode"
+    assert detect_recipe_id({"model_type": "bitnet"}) == "bitnet"
+    assert detect_recipe_id({"model_type": "glm4_moe"}) == "glm4_moe"
+    assert detect_recipe_id({"model_type": "glm4_moe"}) != "glm"
+    assert detect_recipe_id({"model_type": "flex_olmo"}) == "flex_olmo"
+    assert detect_recipe_id({"model_type": "hunyuan_v1_moe"}) == "hunyuan_v1_moe"
+    assert detect_recipe_id({"model_type": "qwen2_vl"}) == "qwen2"
+    assert detect_recipe_id({"model_type": "internvl", "text_config": {"model_type": "qwen2"}}) == "qwen2"
+    with pytest.raises(UnsupportedRecipeError, match="PLE"):
+        detect_recipe_id({"model_type": "gemma4"})
+    assert detect_recipe_id({"model_type": "jamba"}) == "jamba"
+    assert detect_recipe_id({"model_type": "dbrx"}) == "dbrx"
+    with pytest.raises(UnsupportedRecipeError, match="minimax"):
+        detect_recipe_id({"model_type": "minimax"})
+    with pytest.raises(UnsupportedRecipeError, match="glm_moe_dsa"):
+        detect_recipe_id({"model_type": "glm_moe_dsa"})
 
 
 def test_generation_config_eos_overrides_config_json(tmp_path: Path) -> None:

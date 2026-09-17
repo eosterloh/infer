@@ -25,6 +25,30 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
+def _split_fused_qkvz_ba(
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    n_k: int,
+    n_v: int,
+    dk: int,
+    dv: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Undo Qwen3-Next per-key-head packing of q/k/v/z and b/a."""
+    ratio = n_v // n_k
+    qkvz = mixed_qkvz.view(*mixed_qkvz.shape[:-1], n_k, 2 * dk + 2 * ratio * dv)
+    ba = mixed_ba.view(*mixed_ba.shape[:-1], n_k, 2 * ratio)
+    query, key, value, z = torch.split(qkvz, (dk, dk, ratio * dv, ratio * dv), dim=-1)
+    b, a = torch.split(ba, (ratio, ratio), dim=-1)
+    bsz, seq = mixed_qkvz.shape[:2]
+    query = query.reshape(bsz, seq, n_k * dk)
+    key = key.reshape(bsz, seq, n_k * dk)
+    value = value.reshape(bsz, seq, n_v * dv)
+    z = z.reshape(bsz, seq, n_v * dv)
+    b = b.reshape(bsz, seq, n_v)
+    a = a.reshape(bsz, seq, n_v)
+    return query, key, value, z, b, a
+
+
 def _gated_delta_recurrent(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -171,10 +195,31 @@ def gated_delta_net(
     if attention_mask is not None:
         x = x * attention_mask[:, -s:, None].to(device=x.device, dtype=x.dtype)
 
-    mixed = F.linear(x, weights[f"{p}.gdn.in_proj_qkv.weight"])
-    z = F.linear(x, weights[f"{p}.gdn.in_proj_z.weight"]).view(b, s, n_v, dv)
-    beta_raw = F.linear(x, weights[f"{p}.gdn.in_proj_b.weight"])
-    a_raw = F.linear(x, weights[f"{p}.gdn.in_proj_a.weight"])
+    if f"{p}.gdn.in_proj_qkvz.weight" in weights:
+        mixed_qkvz = F.linear(x, weights[f"{p}.gdn.in_proj_qkvz.weight"])
+        mixed_ba = F.linear(x, weights[f"{p}.gdn.in_proj_ba.weight"])
+        query, key, value, z, beta_raw, a_raw = _split_fused_qkvz_ba(
+            mixed_qkvz, mixed_ba, n_k, n_v, dk, dv
+        )
+        mixed = torch.cat((query, key, value), dim=-1)
+        z = z.view(b, s, n_v, dv)
+    elif f"{p}.gdn.q.weight" in weights:
+        mixed = torch.cat(
+            (
+                F.linear(x, weights[f"{p}.gdn.q.weight"]),
+                F.linear(x, weights[f"{p}.gdn.k.weight"]),
+                F.linear(x, weights[f"{p}.gdn.v.weight"]),
+            ),
+            dim=-1,
+        )
+        z = F.linear(x, weights[f"{p}.gdn.in_proj_z.weight"]).view(b, s, n_v, dv)
+        beta_raw = F.linear(x, weights[f"{p}.gdn.in_proj_b.weight"])
+        a_raw = F.linear(x, weights[f"{p}.gdn.in_proj_a.weight"])
+    else:
+        mixed = F.linear(x, weights[f"{p}.gdn.in_proj_qkv.weight"])
+        z = F.linear(x, weights[f"{p}.gdn.in_proj_z.weight"]).view(b, s, n_v, dv)
+        beta_raw = F.linear(x, weights[f"{p}.gdn.in_proj_b.weight"])
+        a_raw = F.linear(x, weights[f"{p}.gdn.in_proj_a.weight"])
     conv_w = weights[f"{p}.gdn.conv1d.weight"]
     a_log = weights[f"{p}.gdn.A_log"]
     dt_bias = weights[f"{p}.gdn.dt_bias"]
@@ -220,6 +265,8 @@ def gated_delta_net(
         key = key.repeat_interleave(n_v // n_k, dim=2)
 
     beta = torch.sigmoid(beta_raw)
+    if bool((config.raw or {}).get("linear_allow_neg_eigval", False)):
+        beta = beta * 2.0
     g_log = -a_log.float().exp() * F.softplus(a_raw.float() + dt_bias.float())
 
     initial = None
@@ -233,8 +280,7 @@ def gated_delta_net(
         [] if cache is not None and cache.is_speculating else None
     )
     use_chunk = (
-        x.is_cuda
-        and s >= 64
+        s > 1
         and trajectory is None
         and os.environ.get("INFER_GDN_CHUNK", "1") != "0"
     )
@@ -250,6 +296,7 @@ def gated_delta_net(
             cache.record_gdn_speculation(layer, trajectory, mixed)
 
     core = core.reshape(b, s, n_v, dv)
-    core_n = rms_norm(core, norm_w, config.rms_norm_eps)
+    norm_eps = 1e-5 if config.recipe_id == "olmo_hybrid" else config.rms_norm_eps
+    core_n = rms_norm(core, norm_w, norm_eps)
     core_n = core_n * F.silu(z.float()).to(dtype=dtype)
     return F.linear(core_n.reshape(b, s, value_dim), out_proj)
