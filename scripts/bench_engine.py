@@ -196,7 +196,12 @@ def main() -> int:
     if getattr(engine, "quantization", None):
         record["quantization"] = engine.quantization
     if not args.skip_fingerprint:
-        record["fingerprint"] = fingerprint(engine, args.fingerprint_tokens)
+        try:
+            record["fingerprint"] = fingerprint(engine, args.fingerprint_tokens)
+        except Exception as exc:
+            # A missing tokenizer should cost this model its correctness check,
+            # not its timings; the report marks the row "no fingerprint".
+            record["fingerprint_error"] = f"{type(exc).__name__}: {exc}"
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("a") as fh:

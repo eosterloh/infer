@@ -103,3 +103,45 @@ Parity vs HuggingFace:
 python scripts/parity_check.py --model ~/models/Llama-3.2-1B-Instruct --device cuda
 python scripts/cache_parity_check.py --model ~/models/Llama-3.2-1B-Instruct --device cuda
 ```
+
+## Kernels
+
+`engine/kernels/` compiles a CUDA extension on first use and registers
+`torch.ops.infer.*`. Every wrapper falls back to the PyTorch expression it
+replaces, so a machine without nvcc runs the same, only slower.
+
+| kernel | replaces |
+|---|---|
+| `rms_norm`, `fused_add_rms_norm`, `gated_rms_norm` | the norm expressions, residual add fused in |
+| `rope_inplace` | `apply_rope`'s cat/mul chain, written in place |
+| `act_mul`, `act_and_mul` | SwiGLU / GELU / ReLU² gate-times-up |
+| `gemv`, `qgemv` | batch-1 projections; packed weights dequantize in registers |
+| `dequant` | unpack a packed weight for cuBLAS during prefill |
+| `attn_decode` | single-query attention over the KV cache, online softmax |
+| `moe_gemv`, `qmoe_gemv`, `moe_combine` | the MoE dispatch loop, routing on device |
+| `mamba2_scan`, `gdn_decode` | the recurrent mixers' Python step loops |
+
+Knobs, all off-by-default unless noted:
+
+| variable | effect |
+|---|---|
+| `INFER_KERNELS=0` | never load the extension (this is the benchmark baseline) |
+| `INFER_KERNELS_VERBOSE=1` | print the build log |
+| `INFER_CUDA_GRAPH=1` | capture and replay the decode step |
+| `INFER_QUANT=int4\|nvfp4\|fp8` | pack weights while loading (`INFER_QUANT_GROUP`, `INFER_QUANT_MIN_NUMEL`) |
+| `INFER_MOE_STACK=0` | keep per-expert tensors instead of one `[E, N, K]` block (default on) |
+| `INFER_QGEMV_MAX_ROWS` | rows the fused packed GEMV keeps before unpacking wins (default 32, max 32) |
+| `INFER_MOE_FUSED_ROWS_PER_EXPERT` | rows per expert above which prefill leaves the grouped GEMV (default 2) |
+| `INFER_MEM_FLOOR_GB` | abort a load with this much of the pool left (default 6, `0` disables) |
+| `INFER_SKIP_PREFLIGHT=1` | load anyway when the size estimate says it will not fit |
+| `INFER_ATTENTION=sdpa\|eager\|auto` | force an attention path |
+| `INFER_GDN_CHUNK=0` | use the step recurrence instead of chunked Gated DeltaNet |
+
+The whole evidence set — build for sm_121, every op checked on the GPU, parity,
+the suite three ways, the fused-vs-unpack crossover, a five-way sweep against a
+worktree of the pre-kernel revision, decode roofline, and a strict report that
+fails if a faster run changed the answer — runs in one command on the Spark:
+
+```bash
+scripts/verify_spark.sh all     # writes bench/REPORT.md and bench/*.txt
+```
