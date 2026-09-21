@@ -282,3 +282,25 @@ def test_fused_path_declines_shapes_it_cannot_pack() -> None:
     qw = quantize(torch.randn(64, 512, dtype=torch.bfloat16) * 0.02, kind="int4", group_size=128)
     assert fused_qlinear(torch.randn(4, 256, dtype=torch.bfloat16), qw) is None  # wrong width
     assert fused_qlinear(torch.randn(4, 512, dtype=torch.float32), qw) is None  # wrong dtype
+
+
+@pytest.mark.parametrize("kind", ["int4", "nvfp4", "fp8"])
+def test_dequantize_honors_the_dtype_it_was_asked_for(kind: str) -> None:
+    """out_dtype is a request, not a hint.
+
+    The unpack kernel writes bf16 or fp16 and takes a single flag to choose, so
+    asking it for fp32 used to return bf16 silently — which quietly rounds every
+    weight in what callers use as their exact reference.
+    """
+    from engine.qweight import quantize
+
+    torch.manual_seed(7)
+    w = torch.randn(64, 128, dtype=torch.bfloat16) * 0.05
+    qw = quantize(w, kind=kind, group_size=64)
+    for dtype in (torch.float32, torch.float64, torch.bfloat16):
+        assert qw.dequantize(out_dtype=dtype).dtype is dtype
+    # And the fp32 unpack has to be the exact one, not a widened bf16 copy.
+    exact = qw.dequantize(out_dtype=torch.float32)
+    assert not torch.equal(exact, exact.to(torch.bfloat16).float()), (
+        "fp32 unpack came back through bf16"
+    )

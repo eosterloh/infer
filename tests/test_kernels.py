@@ -46,7 +46,7 @@ def registered_op(name: str):
 
 
 def assert_no_worse_than_python(
-    got: torch.Tensor, python: torch.Tensor, exact: torch.Tensor
+    got: torch.Tensor, python: torch.Tensor, exact: torch.Tensor, *, slack: float = 1.5
 ) -> None:
     """Judge a kernel against fp32 truth, not against a lossy bf16 expression.
 
@@ -58,10 +58,10 @@ def assert_no_worse_than_python(
     exact = exact.float()
     kernel_err = (got.float() - exact).abs()
     python_err = (python.float() - exact).abs()
-    assert kernel_err.max() <= python_err.max() * 1.5 + 1e-6, (
+    assert kernel_err.max() <= python_err.max() * slack + 1e-6, (
         f"kernel max error {kernel_err.max():.3e} vs python {python_err.max():.3e}"
     )
-    assert kernel_err.mean() <= python_err.mean() * 1.5 + 1e-9, (
+    assert kernel_err.mean() <= python_err.mean() * slack + 1e-9, (
         f"kernel mean error {kernel_err.mean():.3e} vs python {python_err.mean():.3e}"
     )
 
@@ -334,8 +334,13 @@ def test_gemv_adds_bias_and_keeps_shape() -> None:
     bias = torch.randn(512, device=device, dtype=torch.bfloat16)
     got = op(x, w, bias)
     assert got.shape == (1, 512)
-    torch.testing.assert_close(
-        got.float(), (op(x, w, None).float() + bias.float()), **BF16_TOL
+    # The kernel adds the bias in fp32 and rounds once, so where the bias nearly
+    # cancels the dot product it beats rounding first and adding after by the
+    # whole BF16 ulp of the larger number. fp32 is the reference for both.
+    assert_no_worse_than_python(
+        got,
+        op(x, w, None).float() + bias.float(),
+        x.float() @ w.float().T + bias.float(),
     )
 
 
@@ -766,17 +771,23 @@ def test_quantized_expert_stack_matches_dense_dispatch() -> None:
     got = fused_dispatch(x, idx, wts, stack, "relu2")
     assert got is not None
 
-    # The packed path must reproduce what the same weights produce once
-    # unpacked; the gap to the original bf16 block is 4-bit rounding, which
-    # relu2 squares, so only the unpacked comparison is a kernel assertion.
-    unpacked = {
-        field: value.dequantize().reshape(experts, -1, value.in_features)
-        for field, value in stack.items()
-    }
-    exact = fused_dispatch(x, idx, wts, unpacked, "relu2")
-    assert exact is not None
-    rel = (got.float() - exact.float()).norm() / exact.float().norm()
-    assert rel < 5e-3, f"packed vs unpacked dispatch rel error {rel:.2e}"
+    # fused_dispatch only accepts BF16/FP16, so the fp32 answer is spelled out
+    # here. The kernel dequantizes into registers and keeps fp32 to the store,
+    # which makes the BF16 unpacked dispatch the lossier path rather than the
+    # target — relu2 squares its weight rounding into ~5e-3. Both are judged
+    # against the fp32 answer for the same packed weights.
+    def reference(dtype: torch.dtype) -> torch.Tensor:
+        up = stack["up"].dequantize(out_dtype=dtype).reshape(experts, inter, hidden)
+        down = stack["down"].dequantize(out_dtype=dtype).reshape(experts, hidden, inter)
+        out = torch.zeros(tokens, hidden, device=device, dtype=dtype)
+        for t in range(tokens):
+            for j in range(topk):
+                e = int(idx[t, j])
+                hidden_act = torch.relu(x[t].to(dtype) @ up[e].T) ** 2
+                out[t] += wts[t, j].to(dtype) * (hidden_act @ down[e].T)
+        return out
+
+    assert_no_worse_than_python(got, reference(torch.bfloat16), reference(torch.float32))
     drift = (got.float() - want.float()).norm() / want.float().norm()
     assert drift < 0.3, f"int4 experts drifted too far from bf16: {drift:.2e}"
 
@@ -1046,17 +1057,31 @@ def test_gdn_decode_matches_recurrence(b: int, heads: int, dk: int, dv: int) -> 
     beta = torch.rand(b, heads, device=device)
     state = torch.randn(b, heads, dk, dv, device=device)
 
-    rec = state.clone() * g_log.exp()[:, :, None, None]
-    kv_mem = (rec * k[..., None]).sum(-2)
-    delta = (v - kv_mem) * beta[..., None]
-    rec = rec + k[..., None] * delta[..., None, :]
-    want = (rec * q[..., None]).sum(-2)
+    def recurrence(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        rec = state.to(dtype) * g_log.to(dtype).exp()[:, :, None, None]
+        kv_mem = (rec * k.to(dtype)[..., None]).sum(-2)
+        delta = (v.to(dtype) - kv_mem) * beta.to(dtype)[..., None]
+        rec = rec + k.to(dtype)[..., None] * delta[..., None, :]
+        return (rec * q.to(dtype)[..., None]).sum(-2), rec
 
+    truth, truth_state = recurrence(torch.float64)
     got = gdn_decode(q, k, v, g_log, beta, state)
     assert got is not None
-    torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
+
+    # Both sums run over dk terms, and the kernel adds them in shared memory in
+    # order while PyTorch sums pairwise — at dk=4096 that is legitimately ~10x
+    # more absolute error, and an output near zero has unbounded relative error.
+    # So the bar is the classical forward-error bound for summing dk fp32 terms,
+    # which the kernel uses under 5% of. A real defect misses it by orders.
+    def within_summation_error(out: torch.Tensor, exact: torch.Tensor) -> None:
+        eps = torch.finfo(torch.float32).eps
+        budget = 0.1 * eps * dk * exact.abs().max()
+        err = (out.float() - exact.float()).abs().max()
+        assert err <= budget, f"{err:.3e} exceeds the fp32 summation budget {budget:.3e}"
+
+    within_summation_error(got, truth)
     # The state carries the next token, so it has to be updated in place.
-    torch.testing.assert_close(state, rec, atol=2e-5, rtol=2e-5)
+    within_summation_error(state, truth_state)
 
 
 @compiled_only

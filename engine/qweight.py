@@ -94,7 +94,11 @@ class QuantWeight:
         """Unpack to a dense [out, in] tensor (prefill and reference path)."""
         dtype = out_dtype or self.compute_dtype
         ops = _ops()
-        if ops is not None:
+        # The kernel writes bf16 or fp16 and nothing else, and its dtype argument
+        # is a single flag, so asking it for fp32 used to hand back bf16 without
+        # complaint. Other dtypes go through the reference unpack, which works in
+        # fp32 throughout and is the only way to get an exact answer out of this.
+        if ops is not None and dtype in (torch.bfloat16, torch.float16):
             try:
                 return ops.dequant(
                     self.qweight,
