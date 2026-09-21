@@ -126,10 +126,19 @@ def main() -> int:
             model.forward(step, cache=cache, logits_to_keep=1)
         torch.cuda.synchronize()
 
-    events = [e for e in prof.key_averages() if e.device_type.name == "CUDA" or e.self_device_time_total]
-    events.sort(key=lambda e: e.self_device_time_total, reverse=True)
-    launches = sum(e.count for e in events if e.self_device_time_total > 0)
-    gpu_us = sum(e.self_device_time_total for e in events)
+    # The attribute was renamed across torch versions, and this script runs on
+    # whatever the box has; a missing name should not cost the whole profile.
+    def device_us(event) -> float:
+        for attr in ("self_device_time_total", "self_cuda_time_total"):
+            value = getattr(event, attr, None)
+            if value:
+                return float(value)
+        return 0.0
+
+    events = [e for e in prof.key_averages() if device_us(e) > 0]
+    events.sort(key=device_us, reverse=True)
+    launches = sum(e.count for e in events)
+    gpu_us = sum(device_us(e) for e in events)
 
     # What the step is obliged to read: the weights it touches plus the cache.
     # For a sparse model only the routed experts are read, so the dense param
@@ -156,11 +165,8 @@ def main() -> int:
     print()
     print(f"{'kernel':<62}{'ms/step':>9}{'count/step':>12}")
     for e in events[: args.top]:
-        if e.self_device_time_total <= 0:
-            continue
-        name = e.key[:60]
         print(
-            f"{name:<62}{e.self_device_time_total / 1000 / args.steps:>9.3f}"
+            f"{e.key[:60]:<62}{device_us(e) / 1000 / args.steps:>9.3f}"
             f"{e.count / args.steps:>12.1f}"
         )
     return 0
