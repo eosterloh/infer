@@ -37,6 +37,63 @@ def latest_by_model(rows: list[dict], tag: str) -> dict[str, dict]:
     return out
 
 
+# What each recipe puts under load. A model can sit in more than one bucket —
+# Nemotron-H is both a Mamba-2 hybrid and a sparse MoE — and the point of the
+# grouping is to show which kernels the sweep actually exercised.
+FAMILIES: tuple[tuple[str, frozenset[str]], ...] = (
+    (
+        "hybrid recurrent (Mamba2 / GDN scan)",
+        frozenset({"nemotron_h", "jamba", "qwen3_next", "olmo_hybrid", "qwen3_5", "qwen3_5_moe"}),
+    ),
+    ("MLA (compressed KV cache)", frozenset({"deepseek_v2", "deepseek_v3"})),
+    (
+        "sparse MoE dispatch",
+        frozenset({
+            "mixtral", "qwen2_moe", "qwen3_moe", "qwen3_5_moe", "gpt_oss", "llama4", "dbrx",
+            "olmoe", "flex_olmo", "granitemoe", "granitemoe_swa", "granitemoeshared",
+            "phimoe", "hunyuan_v1_moe", "ernie4_5_moe", "cohere2_moe", "glm4_moe",
+            "exaone_moe", "nemotron_h", "nemotron",
+        }),
+    ),
+    (
+        "legacy attention (learned norms / parallel residual)",
+        frozenset({
+            "gpt2", "gptj", "gpt_neo", "gpt_neox", "gpt_bigcode", "opt", "bloom",
+            "falcon", "mpt",
+        }),
+    ),
+    ("sliding window / soft-capped attention", frozenset({"gemma2", "gemma3", "gpt_oss"})),
+)
+DENSE = "dense attention + MLP"
+
+
+def families_for(recipe: str | None) -> list[str]:
+    """Every bucket this recipe belongs to; dense is the fallback, not a bucket."""
+    hits = [name for name, ids in FAMILIES if recipe in ids]
+    return hits or [DENSE]
+
+
+def coverage(rows: list[dict], tag: str | None = None) -> list[str]:
+    """Which model families the sweep measured, and which it did not.
+
+    Across every tag, not one of them: a family counts as covered if any run
+    reached it, and a quantized sweep that skipped a model should not erase it.
+    """
+    seen: dict[str, set[str]] = {name: set() for name, _ in FAMILIES}
+    seen[DENSE] = set()
+    measured = latest_by_model(rows, tag).values() if tag else rows
+    for row in measured:
+        for family in families_for(row.get("recipe")):
+            seen[family].add(row["model"])
+    lines = ["## family coverage", ""]
+    lines.append("| family | models measured |")
+    lines.append("|---|---|")
+    for family, models in seen.items():
+        lines.append(f"| {family} | {', '.join(sorted(models)) if models else '**none**'} |")
+    lines.append("")
+    return lines
+
+
 def _ids(row: dict) -> list[int] | None:
     fp = row.get("fingerprint")
     return fp.get("greedy_ids") if fp else None
@@ -118,6 +175,7 @@ def main() -> int:
     host = next((r.get("host") for r in rows if r.get("host")), "unknown")
     lines.append(f"# infer benchmarks — {host}")
     lines.append("")
+    lines.extend(coverage(rows))
     for tag in tags:
         new = latest_by_model(rows, tag)
         if not new:
@@ -133,7 +191,7 @@ def main() -> int:
             b = base.get(model)
             if b is None:
                 lines.append(
-                    f"| {model} | {row.get('params', 0) / 1e9:.2f}B | — | "
+                    f"| {model} | {(row.get('params') or 0) / 1e9:.2f}B | — | "
                     f"{row['decode_tok_s']} | — | — | {row['prefill_tok_s']} | — | "
                     "no baseline |"
                 )
@@ -146,7 +204,7 @@ def main() -> int:
             if bad and not row.get("quant"):
                 drifted.append(f"{tag}/{model}: {verdict}")
             lines.append(
-                f"| {model} | {row.get('params', 0) / 1e9:.2f}B "
+                f"| {model} | {(row.get('params') or 0) / 1e9:.2f}B "
                 f"| {b['decode_tok_s']} | {row['decode_tok_s']} | {d_gain:.2f}x "
                 f"| {b['prefill_tok_s']} | {row['prefill_tok_s']} | {p_gain:.2f}x "
                 f"| {verdict} |"

@@ -92,3 +92,23 @@ def test_strict_run_fails_on_drift(tmp_path: Path, capsys, monkeypatch) -> None:
         for row in (BASE, quantized):
             fh.write(json.dumps(row) + "\n")
     assert report.main() == 0, "quantization is allowed to change the answer"
+
+
+def test_family_coverage_names_every_kernel_group() -> None:
+    """A sweep that missed a family should say so, not stay quiet about it."""
+    assert report.families_for("nemotron_h") == [
+        "hybrid recurrent (Mamba2 / GDN scan)",
+        "sparse MoE dispatch",
+    ]
+    assert report.families_for("llama") == ["dense attention + MLP"]
+    assert report.families_for("deepseek_v3") == ["MLA (compressed KV cache)"]
+    assert "sliding window / soft-capped attention" in report.families_for("gemma3")
+
+    rows = [
+        dict(BASE, model="llama1b", recipe="llama", tag="kernels"),
+        dict(BASE, model="nano30b", recipe="nemotron_h", tag="kernels"),
+    ]
+    text = "\n".join(report.coverage(rows, "kernels"))
+    assert "| dense attention + MLP | llama1b |" in text
+    assert "nano30b" in text
+    assert "| MLA (compressed KV cache) | **none** |" in text
