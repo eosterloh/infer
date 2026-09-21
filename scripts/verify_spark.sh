@@ -46,11 +46,14 @@ INFER_CUDA_GRAPH=1 "$PY" -m pytest tests -q || fail=1
 step "3c. full suite with the extension off (the fallbacks the baseline uses)"
 INFER_KERNELS=0 "$PY" -m pytest tests -q || fail=1
 
-step "3d. decode roofline, one model per shape class"
-for m in Llama-3.2-1B-Instruct Qwen2.5-1.5B-Instruct Mistral-7B-Instruct-v0.3; do
-  [ -d "$HOME/models/$m" ] || continue
-  "$PY" scripts/profile_decode.py --model "$HOME/models/$m" --steps 16 \
-    | tee "bench/roofline.$m.txt" | sed -n '1,12p'
+step "3d. decode roofline — achieved bandwidth against the 273 GB/s bus"
+MODELS="${MODELS_DIR:-$HOME/models}"
+for dir in "$MODELS"/*/; do
+  [ -f "$dir/config.json" ] || continue
+  name="$(basename "$dir")"
+  "$PY" scripts/profile_decode.py --model "$dir" --steps 16 \
+    >"bench/roofline.$name.txt" 2>&1 || continue
+  sed -n '1,12p' "bench/roofline.$name.txt"
 done
 
 step "4a. baseline sweep (kernels off)"
