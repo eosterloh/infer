@@ -36,6 +36,14 @@ compiled_only = pytest.mark.skipif(
 
 BF16_TOL = dict(atol=6e-3, rtol=6e-3)
 
+def registered_op(name: str):
+    """The raw op, bypassing the wrapper's device guard and its fallback."""
+    load_extension()
+    namespace = getattr(torch.ops, "infer", None)
+    return getattr(namespace, name, None) if namespace is not None else None
+
+
+
 
 def assert_no_worse_than_python(
     got: torch.Tensor, python: torch.Tensor, exact: torch.Tensor
@@ -172,6 +180,26 @@ def test_cuda_act_mul_matches_python(act: str) -> None:
     )
 
 
+@compiled_only
+@pytest.mark.parametrize("act", ["silu", "gelu_tanh", "gelu", "relu2"])
+@pytest.mark.parametrize("inter", [4096, 4051])
+def test_act_and_mul_every_activation_and_the_scalar_tail(act: str, inter: int) -> None:
+    """Four near-identical switch arms, and a width the vector path cannot take."""
+    op = registered_op("act_and_mul")
+    if op is None:
+        pytest.skip("extension unavailable")
+    torch.manual_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    gate = torch.randn(1, 3, inter, device=device, dtype=torch.bfloat16)
+    up = torch.randn(1, 3, inter, device=device, dtype=torch.bfloat16)
+    got = op(torch.cat([gate, up], dim=-1).contiguous(), act)
+    assert_no_worse_than_python(
+        got,
+        python_act_mul(gate, up, act),
+        python_act_mul(gate.float(), up.float(), act),
+    )
+
+
 @cuda_only
 def test_cuda_act_and_mul_splits_packed_projection() -> None:
     torch.manual_seed(7)
@@ -213,9 +241,16 @@ def _rope_reference(
 @cuda_only
 @pytest.mark.parametrize("interleaved", [False, True])
 @pytest.mark.parametrize("seq", [1, 37, 512])
-def test_cuda_rope_matches_python(interleaved: bool, seq: int) -> None:
+@pytest.mark.parametrize("b", [1, 3])
+def test_cuda_rope_matches_python(interleaved: bool, seq: int, b: int) -> None:
+    """A batch of one leaves the per-row angle stride at zero, i.e. broadcast.
+
+    With more than one sequence in flight the rows sit at different positions, so
+    each needs its own angles; getting that wrong gives every row sequence 0's
+    rotation, which looks right until two requests share a batch.
+    """
     torch.manual_seed(9)
-    b, nq, nkv, hd = 1, 32, 8, 128
+    nq, nkv, hd = 32, 8, 128
     # Shapes the engine actually produces: a transposed view of the projection.
     q = torch.randn(b, seq, nq, hd, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
     k = torch.randn(b, seq, nkv, hd, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
@@ -259,6 +294,51 @@ def test_cuda_rope_partial_rotary_leaves_tail_untouched() -> None:
 QUANT_KINDS = ["int4", "nvfp4", "fp8"]
 
 
+
+# --- dense GEMV ------------------------------------------------------
+
+
+@compiled_only
+@pytest.mark.parametrize("k", [512, 1024, 1032, 2560, 4104, 8192])
+@pytest.mark.parametrize("n", [1, 7, 4096])
+def test_gemv_matches_linear(k: int, n: int) -> None:
+    """The decode GEMV: widths that cross both unroll thresholds and the tail.
+
+    launch_gemv picks among three unroll factors at 128 and 64 vectors, so these
+    widths straddle the boundaries, and 1032 and 4104 leave a remainder the
+    vector loop cannot cover.
+    """
+    op = registered_op("gemv")
+    if op is None:
+        pytest.skip("extension unavailable")
+    torch.manual_seed(40)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    x = torch.randn(1, k, device=device, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=device, dtype=torch.bfloat16) * 0.05
+
+    got = op(x, w, None)
+    exact = torch.nn.functional.linear(x.float(), w.float())
+    python = torch.nn.functional.linear(x, w)
+    assert_no_worse_than_python(got, python, exact)
+
+
+@compiled_only
+def test_gemv_adds_bias_and_keeps_shape() -> None:
+    op = registered_op("gemv")
+    if op is None:
+        pytest.skip("extension unavailable")
+    torch.manual_seed(41)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    x = torch.randn(1, 2048, device=device, dtype=torch.bfloat16)
+    w = torch.randn(512, 2048, device=device, dtype=torch.bfloat16) * 0.05
+    bias = torch.randn(512, device=device, dtype=torch.bfloat16)
+    got = op(x, w, bias)
+    assert got.shape == (1, 512)
+    torch.testing.assert_close(
+        got.float(), (op(x, w, None).float() + bias.float()), **BF16_TOL
+    )
+
+
 def _quant_available() -> bool:
     return available()
 
@@ -277,6 +357,20 @@ def test_dequant_matches_python_reference(kind: str) -> None:
     )
 
 
+
+@pytest.mark.parametrize("kind", QUANT_KINDS)
+def test_dequant_handles_a_vocabulary_sized_weight(kind: str) -> None:
+    """Past 32768 rows the kernel strides, which no small shape exercises."""
+    from engine.qweight import python_dequantize, quantize
+
+    torch.manual_seed(11)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    w = torch.randn(40000, 128, device=device, dtype=torch.bfloat16) * 0.02
+    qw = quantize(w, kind, group_size=64)
+    torch.testing.assert_close(
+        qw.dequantize().float(), python_dequantize(qw).to(torch.bfloat16).float()
+    )
+
 @pytest.mark.parametrize("kind", QUANT_KINDS)
 def test_quantization_round_trip_stays_close(kind: str) -> None:
     """Packing has to preserve the weight well enough to be useful."""
@@ -292,20 +386,45 @@ def test_quantization_round_trip_stays_close(kind: str) -> None:
 
 
 @pytest.mark.parametrize("kind", QUANT_KINDS)
-@pytest.mark.parametrize("rows", [1, 4, 17, 32])
+@pytest.mark.parametrize("rows", [1, 4, 6, 12, 17, 32, 70])
 def test_qgemv_matches_dequantized_linear(kind: str, rows: int) -> None:
-    """The fused GEMV must equal a linear against the unpacked weight."""
-    from engine.qweight import python_dequantize, qlinear, quantize
+    """The fused GEMV must equal a linear against the unpacked weight.
+
+    The row counts walk every register bucket the launcher selects, including 6
+    and 12 — a two-token draft and an eight-token one — and 70, which chunks.
+    """
+    from engine.qweight import fused_qlinear, python_dequantize, quantize
 
     torch.manual_seed(13)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    w = torch.randn(320, 128, device=device, dtype=torch.bfloat16) * 0.02
-    x = torch.randn(rows, 128, device=device, dtype=torch.bfloat16)
+    # 1024 wide, so a lane's 32 weights do not cover the row in one pass and the
+    # k loop runs more than once.
+    w = torch.randn(320, 1024, device=device, dtype=torch.bfloat16) * 0.02
+    x = torch.randn(rows, 1024, device=device, dtype=torch.bfloat16)
     qw = quantize(w, kind, group_size=64) if kind == "int4" else quantize(w, kind)
-    got = qlinear(x, qw)
+    got = fused_qlinear(x, qw)
+    assert got is not None
     want = torch.nn.functional.linear(x.float(), python_dequantize(qw))
     rel = (got.float() - want).norm() / want.norm()
     assert rel < 5e-3, f"{kind} qgemv rel error {rel:.2e}"
+
+
+@pytest.mark.parametrize("group", [32, 64, 128])
+@pytest.mark.parametrize("k", [128, 2048, 4096])
+def test_qgemv_int4_group_sizes_line_up_with_scales(group: int, k: int) -> None:
+    """Every group the loader can choose, at widths that make the k loop wrap."""
+    from engine.qweight import fused_qlinear, python_dequantize, quantize
+
+    torch.manual_seed(15)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    w = torch.randn(192, k, device=device, dtype=torch.bfloat16) * 0.02
+    x = torch.randn(3, k, device=device, dtype=torch.bfloat16)
+    qw = quantize(w, "int4", group_size=group)
+    got = fused_qlinear(x, qw)
+    assert got is not None
+    want = torch.nn.functional.linear(x.float(), python_dequantize(qw))
+    rel = (got.float() - want).norm() / want.norm()
+    assert rel < 5e-3, f"int4 group {group} k {k} rel error {rel:.2e}"
 
 
 @pytest.mark.parametrize("kind", QUANT_KINDS)
@@ -372,7 +491,7 @@ def test_moe_gemv_matches_per_expert_loop() -> None:
 
     torch.manual_seed(17)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    experts, n, k, rows = 8, 64, 96, 5
+    experts, n, k, rows = 8, 64, 100, 5  # 100 is not a whole number of vectors
     w = torch.randn(experts, n, k, device=device, dtype=torch.bfloat16) * 0.05
     x = torch.randn(3, k, device=device, dtype=torch.bfloat16)
     row_expert = torch.randint(0, experts, (rows,), device=device, dtype=torch.int32)
@@ -426,7 +545,7 @@ def test_fused_dispatch_matches_reference_dispatch() -> None:
         x, idx, wts, experts, lambda e, tok: expert_mlp(tok, up[e], down[e], "relu2")
     )
     rel = (fused.float() - loop.float()).norm() / loop.float().norm()
-    assert rel < 2e-2, f"fused vs loop rel error {rel:.2e}"
+    assert rel < 5e-3, f"fused vs loop rel error {rel:.2e}"
 
 
 def test_stack_moe_experts_replaces_per_expert_keys() -> None:
@@ -484,19 +603,58 @@ def _reference_scan(
     return torch.stack(ys, dim=1), acc
 
 
-def _scan_inputs(seq: int, dtype: torch.dtype, device: str, heads: int = 16):
-    head_dim, groups, n = 64, 2, 128
+def _scan_inputs(
+    seq: int,
+    dtype: torch.dtype,
+    device: str,
+    heads: int = 16,
+    head_dim: int = 64,
+    n: int = 128,
+    groups: int = 2,
+    batch: int = 1,
+):
     gen = torch.Generator(device="cpu").manual_seed(seq + 101)
     mk = lambda *shape: torch.randn(*shape, generator=gen).to(device=device, dtype=dtype)
     return dict(
-        x=mk(1, seq, heads, head_dim),
-        dt_raw=mk(1, seq, heads),
+        x=mk(batch, seq, heads, head_dim),
+        dt_raw=mk(batch, seq, heads),
         dt_bias=torch.randn(heads, generator=gen).to(device),
         a_log=torch.randn(heads, generator=gen).to(device),
-        b_mat=mk(1, seq, groups, n),
-        c_mat=mk(1, seq, groups, n),
+        b_mat=mk(batch, seq, groups, n),
+        c_mat=mk(batch, seq, groups, n),
         d_skip=torch.randn(heads, generator=gen).to(device),
     )
+
+
+def _scan_op(state, has_state, x, dt_raw, dt_bias, a_log, b_mat, c_mat, d_skip):
+    """The scan through the op itself: the wrapper refuses anything but CUDA."""
+    op = registered_op("mamba2_scan")
+    if op is None:
+        pytest.skip("extension unavailable")
+    return op(x, dt_raw, dt_bias, a_log, b_mat, c_mat, d_skip, state, has_state, 0.0, 100.0)
+
+
+@compiled_only
+@pytest.mark.parametrize("head_dim,n", [(64, 128), (128, 128), (64, 64), (32, 128), (128, 32)])
+@pytest.mark.parametrize("groups", [1, 2])
+def test_mamba2_scan_register_layouts_all_agree(head_dim: int, n: int, groups: int) -> None:
+    """Each (head_dim, state) pair is its own template; only one was ever run.
+
+    A single group is what most Nemotron-H layers use, and it changes which head
+    reads which B/C row.
+    """
+    args = _scan_inputs(
+        5, torch.float32, "cuda" if torch.cuda.is_available() else "cpu",
+        heads=8, head_dim=head_dim, n=n, groups=groups, batch=2,
+    )
+    state = torch.randn(2, 8, head_dim, n, device=args["x"].device)
+    want_y, want_state = _reference_scan(
+        state=state, has_state=True, dt_lo=0.0, dt_hi=100.0, **args
+    )
+    got_state = state.clone()
+    got = _scan_op(got_state, True, **args)
+    torch.testing.assert_close(got.float(), want_y.float(), atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(got_state.float(), want_state.float(), atol=2e-4, rtol=2e-4)
 
 
 @pytest.mark.parametrize("seq", [1, 7, 64])
@@ -616,21 +774,31 @@ def test_quantized_expert_stack_matches_dense_dispatch() -> None:
     exact = fused_dispatch(x, idx, wts, unpacked, "relu2")
     assert exact is not None
     rel = (got.float() - exact.float()).norm() / exact.float().norm()
-    assert rel < 2e-2, f"packed vs unpacked dispatch rel error {rel:.2e}"
+    assert rel < 5e-3, f"packed vs unpacked dispatch rel error {rel:.2e}"
     drift = (got.float() - want.float()).norm() / want.float().norm()
     assert drift < 0.3, f"int4 experts drifted too far from bf16: {drift:.2e}"
 
 
-def test_qmoe_gemv_matches_dequantized_weight() -> None:
-    """Routed packed GEMV must match linear() against the unpacked block."""
+@pytest.mark.parametrize("kind", QUANT_KINDS)
+def test_qmoe_gemv_matches_dequantized_weight(kind: str) -> None:
+    """Routed packed GEMV must match linear() against the unpacked block.
+
+    The block is built the way the loader builds it — each expert packed on its
+    own, then joined — because for NVFP4 that join folds every part's global
+    scale into a per-row scale, and the kernel reads scales differently as a
+    result.
+    """
     from engine.kernels import qmoe_gemv
-    from engine.qweight import quantize
+    from engine.qweight import concat_quant_weights, quantize
 
     torch.manual_seed(22)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    experts, n, k, rows = 3, 64, 128, 5
+    experts, n, k, rows = 4, 64, 256, 6
     block = torch.randn(experts, n, k, device=device, dtype=torch.bfloat16) * 0.05
-    qw = quantize(block.reshape(experts * n, k), "int4", group_size=64)
+    group = 64 if kind == "int4" else (16 if kind == "nvfp4" else k)
+    qw = concat_quant_weights(
+        [quantize(block[e].contiguous(), kind, group_size=group) for e in range(experts)]
+    )
     qw.experts, qw.expert_cols = experts, n
     x = torch.randn(4, k, device=device, dtype=torch.bfloat16)
     row_expert = torch.randint(0, experts, (rows,), device=device, dtype=torch.int32)
@@ -649,7 +817,7 @@ def test_qmoe_gemv_matches_dequantized_weight() -> None:
         ]
     )
     rel = (got.float() - want).norm() / want.norm()
-    assert rel < 5e-3, f"qmoe_gemv rel error {rel:.2e}"
+    assert rel < 5e-3, f"{kind} qmoe_gemv rel error {rel:.2e}"
 
 
 # --- gated RMS norm ---------------------------------------------------
@@ -746,7 +914,10 @@ def _reference_decode(
     return torch.matmul(torch.nan_to_num(w), vf)
 
 
-@pytest.mark.parametrize("heads,kv_heads,head_dim", [(8, 8, 64), (16, 4, 128), (6, 2, 96)])
+@pytest.mark.parametrize(
+    "heads,kv_heads,head_dim",
+    [(8, 8, 64), (16, 4, 128), (6, 2, 96), (32, 1, 128), (8, 8, 80), (4, 4, 256)],
+)
 @compiled_only
 def test_attn_decode_matches_reference(heads: int, kv_heads: int, head_dim: int) -> None:
     """GQA, odd head dims, and long caches must all land on the same answer."""
@@ -855,13 +1026,17 @@ def test_attn_decode_reads_a_cache_view() -> None:
 
 
 @compiled_only
-def test_gdn_decode_matches_recurrence() -> None:
-    """The fused step must reproduce one iteration of the Python recurrence."""
+@pytest.mark.parametrize("b,heads,dk,dv", [(2, 6, 128, 64), (1, 4, 4096, 128), (3, 32, 128, 128)])
+def test_gdn_decode_matches_recurrence(b: int, heads: int, dk: int, dv: int) -> None:
+    """The fused step must reproduce one iteration of the Python recurrence.
+
+    4096 is the widest key the kernel accepts and puts 32 KB into shared memory,
+    which no other shape here comes close to.
+    """
     from engine.kernels import gdn_decode
 
     torch.manual_seed(41)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    b, heads, dk, dv = 2, 6, 128, 64
     q = torch.randn(b, heads, dk, device=device)
     k = torch.randn(b, heads, dk, device=device)
     v = torch.randn(b, heads, dv, device=device)
@@ -905,3 +1080,49 @@ def test_gdn_decode_matches_layer_recurrent_path() -> None:
     got, got_state = fused
     torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(got_state, want_state, atol=2e-5, rtol=2e-5)
+
+
+@compiled_only
+@pytest.mark.parametrize("kv_len", [1, 63, 64, 65, 127, 128, 129, 1000])
+def test_attn_decode_across_split_boundaries(kv_len: int) -> None:
+    """How many chunks the kernel splits into is the GPU's choice, not the test's.
+
+    pick_splits reads the SM count, so these lengths straddle the 64-key chunk
+    boundary to make the merge step run at more than one partition count.
+    """
+    from engine.kernels import attn_decode
+
+    torch.manual_seed(33)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    heads, head_dim = 32, 128
+    q = torch.randn(1, heads, head_dim, device=device)
+    k = torch.randn(1, heads, kv_len, head_dim, device=device)
+    v = torch.randn(1, heads, kv_len, head_dim, device=device)
+    scale = head_dim**-0.5
+    got = attn_decode(q, k, v, scale=scale)
+    assert got is not None
+    want = _reference_decode(q.unsqueeze(2), k, v, scale=scale)[:, :, 0]
+    torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
+
+
+@compiled_only
+def test_moe_gemv_handles_a_real_expert_width() -> None:
+    """The tiny shape leaves most lanes idle; a real expert does not."""
+    from engine.kernels import moe_gemv
+
+    torch.manual_seed(18)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    experts, n, k, rows = 4, 256, 2048, 32
+    w = torch.randn(experts, n, k, device=device, dtype=torch.bfloat16) * 0.02
+    x = torch.randn(8, k, device=device, dtype=torch.bfloat16)
+    row_expert = torch.randint(0, experts, (rows,), device=device, dtype=torch.int32)
+    row_input = torch.randint(0, 8, (rows,), device=device, dtype=torch.int32)
+    got = moe_gemv(x, w, row_expert, row_input)
+    assert got is not None
+    wf, xf = w.float(), x.float()
+    want = torch.stack([
+        torch.nn.functional.linear(xf[int(row_input[r])], wf[int(row_expert[r])])
+        for r in range(rows)
+    ])
+    rel = (got.float() - want).norm() / want.norm()
+    assert rel < 6e-3, f"moe_gemv rel error {rel:.2e}"

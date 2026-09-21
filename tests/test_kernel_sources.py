@@ -85,7 +85,14 @@ def test_cuda_prototypes_match_their_definitions(op: str) -> None:
     """A prototype that drifts from its .cu definition is a link error."""
     func = _impls("CUDA")[op]
     if func.endswith("_shim"):
-        pytest.skip(f"{func} is defined in ops.cpp itself")
+        # A shim lives in ops.cpp and forwards to the real kernel; check the
+        # kernel it calls, otherwise this op is the one whose prototype drift
+        # nothing catches until the link step on the GPU box.
+        body = re.search(rf"{func}\s*\(.*?\)\s*\{{(.*?)\n\}}", OPS, re.S)
+        assert body, f"{func} has no body in ops.cpp"
+        called = re.search(r"return\s+(\w+_cuda)\s*\(", body.group(1))
+        assert called, f"{func} forwards to no *_cuda function"
+        func = called.group(1)
     declared = _signature(OPS, func, declaration=True)
     assert declared, f"{func} is registered but never declared in ops.cpp"
     defined = [
