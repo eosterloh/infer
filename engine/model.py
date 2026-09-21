@@ -13,6 +13,7 @@ from engine.layers import (
     build_rope_cos_sin,
     decoder_block,
 )
+from engine.layers.gdn import fuse_split_conv1d
 from engine.layers.linear import dense
 from engine.layers.norm import apply_norm
 from engine.schedule import MixerKind, build_schedule
@@ -23,8 +24,8 @@ class DecoderModel:
 
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor]):
         self.config = config
-        self.weights = weights
-        sample = next(iter(weights.values()))
+        self.weights = fuse_split_conv1d(weights)
+        sample = next(iter(self.weights.values()))
         self.device = sample.device
         self.dtype = sample.dtype
         self.layers = config.layers or build_schedule(config)

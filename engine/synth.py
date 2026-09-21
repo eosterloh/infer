@@ -22,7 +22,11 @@ def write_config(folder: Path, raw: dict[str, Any]) -> Path:
 def random_engine_weights(cfg: ModelConfig, seed: int = 0) -> dict[str, torch.Tensor]:
     torch.manual_seed(seed)
     state: dict[str, torch.Tensor] = {}
-    for name, shape in cfg.expected_shapes().items():
+    shapes = cfg.expected_shapes()
+    # Published OLMo-hybrid folders split the short conv per projection, so the
+    # generated folders do too.
+    shapes.update(cfg.gdn_conv_shapes(split=True))
+    for name, shape in shapes.items():
         if name.endswith((".weight",)) and "norm" in name:
             state[name] = torch.ones(shape)
         elif name.endswith("bias") and "norm" in name:
@@ -104,6 +108,9 @@ def _hf_candidates(cfg: ModelConfig) -> list[str]:
                 f"model.layers.{i}.linear_attn.b_proj.weight",
                 f"model.layers.{i}.linear_attn.g_proj.weight",
                 f"model.layers.{i}.linear_attn.conv1d.weight",
+                f"model.layers.{i}.linear_attn.q_conv1d.weight",
+                f"model.layers.{i}.linear_attn.k_conv1d.weight",
+                f"model.layers.{i}.linear_attn.v_conv1d.weight",
                 f"model.layers.{i}.linear_attn.A_log",
                 f"model.layers.{i}.linear_attn.dt_bias",
                 f"model.layers.{i}.linear_attn.norm.weight",

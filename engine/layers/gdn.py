@@ -28,6 +28,25 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
+def fuse_split_conv1d(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Join per-projection short convs into the q|k|v conv the mixer runs.
+
+    OLMo-hybrid checkpoints keep one depthwise conv per projection. The mixer
+    convolves the concatenated q|k|v, so the parts are joined in that order
+    once here rather than on every token.
+    """
+    parts = [n for n in weights if n.endswith(".gdn.q_conv1d.weight")]
+    if not parts:
+        return weights
+    fused = dict(weights)
+    for q_name in parts:
+        p = q_name[: -len("q_conv1d.weight")]
+        fused[f"{p}conv1d.weight"] = torch.cat(
+            [fused.pop(f"{p}{axis}_conv1d.weight") for axis in ("q", "k", "v")]
+        )
+    return fused
+
+
 def _split_fused_qkvz_ba(
     mixed_qkvz: torch.Tensor,
     mixed_ba: torch.Tensor,

@@ -463,6 +463,24 @@ def _add_shared(
     return routed
 
 
+def _dbrx_expert_split(
+    fused: torch.Tensor, n_routed: int, hidden: int
+) -> torch.Tensor:
+    """One DBRX projection → [E, inter, hidden] blocks.
+
+    DBRX keeps every expert of a projection in a single tensor. The chunk an
+    expert owns is stored either [inter, hidden] or [hidden, inter], and the
+    hidden size is the only thing that separates them, so the row count cannot
+    stand in for the intermediate size.
+    """
+    chunks = fused.reshape(n_routed, -1)
+    inter = chunks.shape[-1] // hidden
+    stored_rows = fused.shape[0] // n_routed if fused.dim() == 2 else inter
+    if stored_rows == hidden and inter != hidden:
+        return chunks.reshape(n_routed, hidden, inter).transpose(1, 2)
+    return chunks.reshape(n_routed, inter, hidden)
+
+
 def _dbrx_experts(
     flat: torch.Tensor,
     topk_i: torch.Tensor,
@@ -471,14 +489,10 @@ def _dbrx_experts(
     p: str,
     n_routed: int,
 ) -> torch.Tensor:
-    w1 = weights[f"{p}.moe.experts.w1.weight"]
-    v1 = weights[f"{p}.moe.experts.v1.weight"]
-    w2 = weights[f"{p}.moe.experts.w2.weight"]
     hidden = flat.shape[-1]
-    inter = w1.shape[0] // n_routed
-    w1 = w1.view(n_routed, inter, hidden)
-    v1 = v1.view(n_routed, inter, hidden)
-    w2 = w2.view(n_routed, inter, hidden)
+    w1 = _dbrx_expert_split(weights[f"{p}.moe.experts.w1.weight"], n_routed, hidden)
+    v1 = _dbrx_expert_split(weights[f"{p}.moe.experts.v1.weight"], n_routed, hidden)
+    w2 = _dbrx_expert_split(weights[f"{p}.moe.experts.w2.weight"], n_routed, hidden)
 
     def run(idx: int, tok: torch.Tensor) -> torch.Tensor:
         gate = F.silu(F.linear(tok, w1[idx]))

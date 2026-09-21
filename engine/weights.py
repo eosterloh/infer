@@ -124,6 +124,14 @@ def _iter_hf_names(hf_names: list[str] | set[str]) -> list[str]:
     return [n for n in sorted(hf_names) if not is_quant_aux(n)]
 
 
+def _expected_shapes(config: ModelConfig, engine_names) -> dict[str, tuple[int, ...]]:
+    """Blueprint shapes, with the short-conv layout taken from the checkpoint."""
+    expected = config.expected_shapes()
+    split = any(str(n).endswith(".gdn.q_conv1d.weight") for n in engine_names)
+    expected.update(config.gdn_conv_shapes(split=split))
+    return expected
+
+
 def validate_name_map(
     config: ModelConfig, hf_names: list[str] | set[str]
 ) -> dict[str, str]:
@@ -157,7 +165,7 @@ def validate_name_map(
         more = f" (+{len(unknown) - 8} more)" if len(unknown) > 8 else ""
         raise KeyError(f"unmapped HF tensors: {preview}{more}")
 
-    expected = set(config.expected_shapes())
+    expected = set(_expected_shapes(config, mapped))
     got = set(mapped)
     if config.tie_word_embeddings:
         expected.discard("lm_head.weight")
@@ -281,7 +289,7 @@ def rename_state(
 
 
 def validate_shapes(config: ModelConfig, state: dict[str, torch.Tensor]) -> None:
-    expected = config.expected_shapes()
+    expected = _expected_shapes(config, state)
     missing = sorted(set(expected) - set(state))
     extra = sorted(set(state) - set(expected))
     extra = [e for e in extra if not e.startswith("mtp.")]

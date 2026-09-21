@@ -959,13 +959,14 @@ class ModelConfig:
         k = self.linear_conv_kernel_dim
         nv = self.linear_num_value_heads
         common = {
-            f"{p}.gdn.conv1d.weight": (conv_dim, 1, k),
             f"{p}.gdn.A_log": (nv,),
             f"{p}.gdn.dt_bias": (nv,),
             f"{p}.gdn.norm.weight": (self.linear_value_head_dim,),
             f"{p}.gdn.out_proj.weight": (h, value_dim),
         }
         if self.recipe_id == "olmo_hybrid":
+            # The short conv is the one tensor whose layout config.json does not
+            # pin down, so it comes from gdn_conv_shapes instead.
             return {
                 f"{p}.gdn.q.weight": (key_dim, h),
                 f"{p}.gdn.k.weight": (key_dim, h),
@@ -975,6 +976,7 @@ class ModelConfig:
                 f"{p}.gdn.in_proj_a.weight": (nv, h),
                 **common,
             }
+        common[f"{p}.gdn.conv1d.weight"] = (conv_dim, 1, k)
         if self.recipe_id == "qwen3_next":
             return {
                 f"{p}.gdn.in_proj_qkvz.weight": (key_dim * 2 + value_dim * 2, h),
@@ -988,6 +990,37 @@ class ModelConfig:
             f"{p}.gdn.in_proj_a.weight": (nv, h),
             **common,
         }
+
+    def gdn_conv_shapes(self, *, split: bool) -> dict[str, tuple[int, ...]]:
+        """Short-conv shapes for the layers that run a Gated DeltaNet mixer.
+
+        OLMo-hybrid checkpoints carry one depthwise conv per projection while
+        the mixer convolves q|k|v as one tensor. Nothing in config.json says
+        which layout a folder uses, so the caller reads it off the names it has.
+        """
+        if self.recipe_id != "olmo_hybrid":
+            return {}
+        assert self.linear_num_key_heads is not None
+        assert self.linear_num_value_heads is not None
+        assert self.linear_key_head_dim is not None
+        assert self.linear_value_head_dim is not None
+        assert self.linear_conv_kernel_dim is not None
+        key_dim = self.linear_num_key_heads * self.linear_key_head_dim
+        value_dim = self.linear_num_value_heads * self.linear_value_head_dim
+        k = self.linear_conv_kernel_dim
+        schedule = self.layers or llama_dense_schedule(self.num_hidden_layers)
+        shapes: dict[str, tuple[int, ...]] = {}
+        for spec in schedule:
+            if spec.mixer != MixerKind.GATED_DELTANET:
+                continue
+            p = f"layers.{spec.index}"
+            if split:
+                shapes[f"{p}.gdn.q_conv1d.weight"] = (key_dim, 1, k)
+                shapes[f"{p}.gdn.k_conv1d.weight"] = (key_dim, 1, k)
+                shapes[f"{p}.gdn.v_conv1d.weight"] = (value_dim, 1, k)
+            else:
+                shapes[f"{p}.gdn.conv1d.weight"] = (key_dim * 2 + value_dim, 1, k)
+        return shapes
 
     def _mlp_shapes(
         self, p: str, h: int, i: int, mlp_bias: bool
