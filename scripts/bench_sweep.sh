@@ -51,6 +51,23 @@ PY
     -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}'
 }
 
+# One 55 GB load leaves the pool full of its page cache, and MemAvailable takes
+# a moment to come back: the sweep asked for Nemotron 63 GB seconds after Mistral
+# exited, saw 44 GB free, and the preflight refused it. At rest it reports 120 GB.
+settle_memory() {
+  local want_gb="$1" waited=0 avail
+  sync
+  while [ "$waited" -lt 120 ]; do
+    avail="$(awk '/MemAvailable/{print int($2 / 1048576)}' /proc/meminfo 2>/dev/null || echo 999)"
+    if [ "$avail" -ge "$want_gb" ]; then
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "  (only ${avail} GB free after ${waited}s; wanted ${want_gb} GB)" >&2
+}
+
 LIST=()
 SKIPPED=()
 while IFS= read -r -d '' cfg; do
@@ -98,6 +115,9 @@ failed=0
 for entry in "${LIST[@]}"; do
   IFS=$'\t' read -r name prefill decode bytes <<<"$entry"
   echo "=== $name ($(( bytes / 1000000000 )) GB, prefill $prefill, decode $decode) ${EXTRA[*]:-} ==="
+  # Weights plus the load transient, rounded up; packed loads need far less, but
+  # waiting for the honest number costs nothing when it is already free.
+  settle_memory "$(( bytes / 1000000000 * 5 / 4 + 4 ))"
   "$PY" "$ROOT/scripts/bench_engine.py" \
     --model "$MODELS/$name" --prefill "$prefill" --decode "$decode" \
     --reps 2 --tag "$TAG" ${EXTRA[@]+"${EXTRA[@]}"} \
