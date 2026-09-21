@@ -16,6 +16,30 @@ from engine.schedule import (
     llama_dense_schedule,
 )
 
+_HEAD_NAMES = ("lm_head.weight", "output.weight", "model.lm_head.weight")
+
+
+def _tied_by_checkpoint(model_dir: Path) -> bool | None:
+    """Whether this folder's weights tie the head to the embedding.
+
+    HF's PretrainedConfig defaults ``tie_word_embeddings`` to true, and a family
+    that unties it says so — Llama and Mistral both do. Gemma-2 does not mention
+    it at all, so reading it as false asked for an lm_head the checkpoint does not
+    ship and the model failed to load. Rather than carry the default per family,
+    which is the same list of exceptions in a second place, this reads the names
+    in the index: no head tensor means the head is the embedding.
+
+    None when there is nothing to read, which is a config-only folder (tests
+    write one before there are any weights) and leaves the caller's default.
+    """
+    from engine.weights import load_weight_index
+
+    try:
+        names = load_weight_index(model_dir)
+    except Exception:
+        return None
+    return not any(name in names for name in _HEAD_NAMES)
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -265,6 +289,10 @@ class ModelConfig:
         if path.is_file():
             with path.open("r", encoding="utf-8") as f:
                 raw = json.load(f)
+            if "tie_word_embeddings" not in raw:
+                tied = _tied_by_checkpoint(model_dir)
+                if tied is not None:
+                    raw["tie_word_embeddings"] = tied
         else:
             from engine.gguf import find_gguf, gguf_meta_to_raw, read_gguf_header
 
