@@ -31,6 +31,9 @@ assert ext is not None, "extension failed to build"
 print("ops:", sorted(n for n in dir(torch.ops.infer) if not n.startswith("_")))
 EOF
 
+step "1b. every op runs on the GPU and matches (no wrapper, no fallback)"
+"$PY" scripts/kernel_smoke.py | tee bench/kernel_smoke.txt || fail=1
+
 step "2. kernel parity"
 "$PY" -m pytest tests/test_kernels.py -q || fail=1
 
