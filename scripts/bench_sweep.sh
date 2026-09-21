@@ -26,22 +26,27 @@ if [ ! -d "$MODELS" ]; then
   exit 2
 fi
 
+# -L so the sizes resolve through the HF cache's symlinks into blobs/: without
+# it every symlinked checkpoint measures a few hundred bytes and a 30B model
+# classifies as "small", which is how a big model ends up with a 512-token
+# prompt and an OOM instead of a row.
 weights_bytes() {
-  local total
-  total=$(find "$1" -maxdepth 2 \( -name '*.safetensors' -o -name '*.gguf' -o -name '*.bin' \) \
-    -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')
-  if [ -z "$total" ] || [ "$total" = "0" ]; then
-    total=$(( $(du -sk "$1" 2>/dev/null | cut -f1) * 1024 ))
-  fi
-  echo "$total"
+  find -L "$1" -maxdepth 2 \( -name '*.safetensors' -o -name '*.gguf' -o -name '*.bin' \) \
+    -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}'
 }
 
 LIST=()
-for dir in "$MODELS"/*/; do
+SKIPPED=()
+while IFS= read -r -d '' cfg; do
+  dir="$(dirname "$cfg")"
   name="$(basename "$dir")"
-  [ -f "$dir/config.json" ] || continue
   bytes="$(weights_bytes "$dir")"
-  [ "$bytes" -gt 0 ] || continue
+  # A config.json with no weights beside it is a tokenizer-only or partial
+  # download. Benchmarking it just spends a process to print a load error.
+  if [ "${bytes:-0}" -le 0 ]; then
+    SKIPPED+=("$name (no weight files)")
+    continue
+  fi
   if [ "$bytes" -ge "$BIG_BYTES" ]; then
     class=big; prefill=256; decode=16
   else
@@ -57,8 +62,14 @@ for dir in "$MODELS"/*/; do
   case "$name" in
     gpt2*|*pythia*|*Pythia*) prefill=128 ;;
   esac
-  LIST+=("$name $prefill $decode $bytes")
-done
+  # Tab-separated: model directories with spaces in the name are common enough
+  # in an HF cache that word-splitting the list would drop them.
+  LIST+=("$name	$prefill	$decode	$bytes")
+done < <(find -L "$MODELS" -mindepth 2 -maxdepth 2 -name config.json -print0 2>/dev/null)
+
+if [ "${#SKIPPED[@]}" -ne 0 ]; then
+  printf 'skipping: %s\n' "${SKIPPED[@]}" >&2
+fi
 
 if [ "${#LIST[@]}" -eq 0 ]; then
   echo "nothing to benchmark in $MODELS for set '$SET'; it holds:" >&2
@@ -67,9 +78,9 @@ if [ "${#LIST[@]}" -eq 0 ]; then
 fi
 
 mkdir -p "$ROOT/bench"
+failed=0
 for entry in "${LIST[@]}"; do
-  set -- $entry
-  name="$1"; prefill="$2"; decode="$3"; bytes="$4"
+  IFS=$'\t' read -r name prefill decode bytes <<<"$entry"
   echo "=== $name ($(( bytes / 1000000000 )) GB, prefill $prefill, decode $decode) ${EXTRA[*]:-} ==="
   "$PY" "$ROOT/scripts/bench_engine.py" \
     --model "$MODELS/$name" --prefill "$prefill" --decode "$decode" \
@@ -78,7 +89,15 @@ for entry in "${LIST[@]}"; do
   status=$?
   if [ $status -ne 0 ]; then
     echo "  FAILED (exit $status): $(tail -3 "$ROOT/bench/$name.$TAG.err" | tr '\n' ' ')"
+    failed=$((failed + 1))
   else
     echo "  ok"
   fi
 done
+
+# The sweep's own exit code reports how many models produced no row, so a tag
+# that collapses entirely cannot look like a clean run in the log above it.
+if [ "$failed" -ne 0 ]; then
+  echo "$TAG: $failed of ${#LIST[@]} models produced no row" >&2
+  exit 1
+fi

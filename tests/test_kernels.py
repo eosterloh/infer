@@ -1128,3 +1128,44 @@ def test_moe_gemv_handles_a_real_expert_width() -> None:
     ])
     rel = (got.float() - want).norm() / want.norm()
     assert rel < 6e-3, f"moe_gemv rel error {rel:.2e}"
+
+
+@compiled_only
+def test_moe_combine_keeps_the_routers_precision() -> None:
+    """Routing weights are fp32 by design and must not be rounded on the way in.
+
+    A BF16 output cannot be compared against an fp32 reference tightly enough to
+    see this, so instead this asks which reference the kernel agrees with: the one
+    that keeps the router's fp32 weights, or the one that rounds them first. The
+    two are about 1.5e-2 apart here, so the answer is unambiguous.
+    """
+    op = registered_op("moe_combine")
+    if op is None:
+        pytest.skip("extension unavailable")
+    torch.manual_seed(44)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokens, topk, n = 5, 4, 128
+    parts = torch.randn(tokens * topk, n, device=device, dtype=torch.bfloat16)
+    # Values a BF16 mantissa cannot hold, which is what a real softmax produces.
+    weights = torch.softmax(
+        torch.randn(tokens, topk, device=device, dtype=torch.float32) * 2, dim=-1
+    )
+    got = op(parts, weights, topk).float()
+
+    def combine(w: torch.Tensor) -> torch.Tensor:
+        return (
+            (parts.view(tokens, topk, n).float() * w.float()[..., None])
+            .sum(1)
+            .to(torch.bfloat16)
+            .float()
+        )
+
+    kept, rounded = combine(weights), combine(weights.to(torch.bfloat16))
+    apart = (kept - rounded).abs().max().item()
+    assert apart > 0, "pick weights that BF16 actually cannot represent"
+    near = (got - kept).abs().max().item()
+    far = (got - rounded).abs().max().item()
+    assert near < far / 4, (
+        f"combine rounded the router's weights: {near:.2e} from the fp32 answer, "
+        f"{far:.2e} from the BF16 one"
+    )

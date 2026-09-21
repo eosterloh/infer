@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+
+import pytest
 from pathlib import Path
 
 import torch
@@ -126,3 +128,84 @@ def test_both_dispatch_paths_agree(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("INFER_MOE_FUSED_ROWS_PER_EXPERT", "0")
     looped = moe(x, w, 0, cfg)
     torch.testing.assert_close(fused, looped, atol=2e-5, rtol=2e-5)
+
+
+_STACK_BASE = {
+    "vocab_size": 64,
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "rms_norm_eps": 1e-5,
+    "rope_theta": 10000.0,
+    "max_position_embeddings": 64,
+    "tie_word_embeddings": False,
+    "torch_dtype": "float32",
+    "hidden_act": "silu",
+}
+_STACK_RECIPES = {
+    "gpt_oss": {
+        "architectures": ["GptOssForCausalLM"],
+        "model_type": "gpt_oss",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+    },
+    "qwen3_moe": {
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "model_type": "qwen3_moe",
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "decoder_sparse_step": 1,
+    },
+    "mixtral": {
+        "architectures": ["MixtralForCausalLM"],
+        "model_type": "mixtral",
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+    },
+}
+
+
+@pytest.mark.parametrize("recipe", sorted(_STACK_RECIPES))
+def test_stacking_experts_does_not_change_the_logits(
+    tmp_path: Path, recipe: str, monkeypatch
+) -> None:
+    """Stacking is a layout change, so it has to be invisible in the output.
+
+    GPT-OSS ships per-expert biases as [E, N] next to [E, N, K] weights, and the
+    stack is the only place the layer looks for them once one exists — so a bias
+    the adopt step skips is a bias dropped from the math, which showed up here as
+    an 11.7 logit difference before the fix.
+    """
+    from engine.agent_api import load_engine
+    from engine.synth import random_engine_weights, write_config, write_hf_folder
+
+    folder = write_config(tmp_path / recipe, {**_STACK_BASE, **_STACK_RECIPES[recipe]})
+    cfg = ModelConfig.from_pretrained(folder)
+    write_hf_folder(folder, cfg, random_engine_weights(cfg))
+    ids = torch.arange(4).reshape(1, 4) % cfg.vocab_size
+
+    out = {}
+    for flag in ("0", "1"):
+        monkeypatch.setenv("INFER_MOE_STACK", flag)
+        engine = load_engine(folder, device="cpu", dtype="float32")
+        out[flag] = engine.model.forward(ids).detach().clone()
+    torch.testing.assert_close(out["1"], out["0"], atol=1e-4, rtol=1e-4)
+
+    monkeypatch.setenv("INFER_MOE_STACK", "1")
+    stacked = load_engine(folder, device="cpu", dtype="float32")
+    stack = stacked.model.weights.get("_expert_stacks")
+    assert stack, "stacking was requested and did not happen"
+    fields = set(next(iter(stack.values())))
+    loose = {
+        name
+        for name in stacked.model.weights
+        if ".experts." in name and name.endswith(".bias")
+    }
+    assert not loose or {f for f in fields if f.endswith("_bias")}, (
+        f"{recipe} has per-expert biases {loose} that no stack field covers"
+    )

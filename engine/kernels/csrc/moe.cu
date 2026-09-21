@@ -67,10 +67,14 @@ __global__ void moe_gemv_kernel(
 
 // Weighted reduction of the per-expert results back onto the token:
 // out[t, n] = sum_k weight[t, k] * expert_out[t * topk + k, n]
+// The router computes its weights in fp32 on purpose, so they stay fp32 here:
+// rounding them to the activation dtype first would throw away seven mantissa
+// bits of exactly the quantity the router worked in fp32 to get right, and both
+// references (ops.cpp and the Python fallback) keep the full precision.
 template <typename scalar_t>
 __global__ void moe_combine_kernel(
     const scalar_t* __restrict__ expert_out,  // [T * topk, N]
-    const scalar_t* __restrict__ weights,     // [T, topk]
+    const float* __restrict__ weights,        // [T, topk], fp32
     scalar_t* __restrict__ out,               // [T, N]
     int tokens,
     int topk,
@@ -83,7 +87,7 @@ __global__ void moe_combine_kernel(
     const int64_t n = idx - t * n_cols;
     float acc = 0.0f;
     for (int k = 0; k < topk; ++k) {
-      const float w = static_cast<float>(weights[t * topk + k]);
+      const float w = weights[t * topk + k];
       acc += w * static_cast<float>(expert_out[(t * topk + k) * n_cols + n]);
     }
     out[idx] = static_cast<scalar_t>(acc);
@@ -150,25 +154,35 @@ at::Tensor moe_combine_cuda(
     const at::Tensor& expert_out, const at::Tensor& weights, int64_t topk) {
   TORCH_CHECK(expert_out.is_cuda() && weights.is_cuda(), "moe_combine expects CUDA");
   TORCH_CHECK(expert_out.dim() == 2, "expert_out must be [T*topk, N]");
+  TORCH_CHECK(topk > 0, "moe_combine needs a positive topk");
+  TORCH_CHECK(
+      expert_out.size(0) % topk == 0,
+      "moe_combine: ", expert_out.size(0), " rows is not a whole number of topk groups");
   const at::cuda::OptionalCUDAGuard guard(at::device_of(expert_out));
   const int64_t n_cols = expert_out.size(1);
   const int64_t tokens = expert_out.size(0) / topk;
+  TORCH_CHECK(
+      weights.numel() == tokens * topk,
+      "moe_combine: ", weights.numel(), " weights for ", tokens * topk, " routed rows");
+  TORCH_CHECK(
+      expert_out.scalar_type() == at::kBFloat16 || expert_out.scalar_type() == at::kHalf,
+      "moe_combine supports bf16 and fp16");
   auto out = at::empty({tokens, n_cols}, expert_out.options());
   const int threads = 256;
   const int64_t total = tokens * n_cols;
   const int blocks =
       static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 8192));
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto w = weights.to(expert_out.scalar_type()).contiguous();
+  auto w = weights.to(at::kFloat).contiguous();
   if (expert_out.scalar_type() == at::kBFloat16) {
     using scalar_t = at::BFloat16;
     moe_combine_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-        expert_out.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(),
+        expert_out.data_ptr<scalar_t>(), w.data_ptr<float>(), out.data_ptr<scalar_t>(),
         static_cast<int>(tokens), static_cast<int>(topk), static_cast<int>(n_cols));
   } else {
     using scalar_t = at::Half;
     moe_combine_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-        expert_out.data_ptr<scalar_t>(), w.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(),
+        expert_out.data_ptr<scalar_t>(), w.data_ptr<float>(), out.data_ptr<scalar_t>(),
         static_cast<int>(tokens), static_cast<int>(topk), static_cast<int>(n_cols));
   }
   AT_CUDA_CHECK(cudaGetLastError());

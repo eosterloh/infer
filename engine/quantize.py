@@ -194,11 +194,16 @@ def adopt_packed_experts(
         if not m:
             continue
         value = weights[name]
-        if not isinstance(value, torch.Tensor) or value.dim() != 3:
-            continue
         prefix, field, kindpart = m.group(1), m.group(2), m.group(3)
-        block = value.transpose(1, 2).contiguous() if transposed else value
-        key = field if kindpart == "weight" else f"{field}_bias"
+        is_bias = kindpart == "bias"
+        # A per-expert bias is [E, N] where the weight is [E, N, K]. Both have to
+        # be adopted: once a stack exists the layer reads biases only out of it,
+        # so a bias left behind here is a bias silently dropped from the math.
+        want_dim = 2 if is_bias else 3
+        if not isinstance(value, torch.Tensor) or value.dim() != want_dim:
+            continue
+        block = value.transpose(1, 2).contiguous() if transposed and not is_bias else value
+        key = f"{field}_bias" if is_bias else field
         stacks.setdefault(prefix, {})[key] = block
         adopted += 1
         # The block owns the data now; the layer reads experts out of the stack
