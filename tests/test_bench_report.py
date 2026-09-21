@@ -185,3 +185,24 @@ def test_a_token_that_should_have_made_the_list_is_drift() -> None:
     intruder = _row([5, 6], [5, 6, 7, 8, 99], [20.0, 19.5, 18.0, 17.0, 19.2])
     label, bad = report._verdict(base, intruder)
     assert bad, label
+
+
+def test_a_quantized_row_reports_its_drift_without_failing() -> None:
+    """NVFP4 changes the answer by construction; that is not a regression.
+
+    Holding a 4-bit run to the bf16 logits fails the one configuration the
+    quantized path exists to ship, so the verdict measures the drift and the
+    gate stays on the runs that claim to be arithmetically equivalent.
+    """
+    base = _row([5, 6, 7, 8], [5, 6, 7, 8, 9], [9.0, 8.0, 7.0, 6.0, 5.0])
+    new = _row([5, 6, 1, 2], [5, 6, 7, 8, 9], [9.5, 8.1, 7.2, 6.4, 5.1], quant="nvfp4")
+    label, bad = report._verdict(base, new)
+    assert not bad
+    assert "nvfp4" in label and "2/4 tokens kept" in label
+
+
+def test_the_same_drift_at_the_same_precision_still_fails() -> None:
+    base = _row([5, 6, 7, 8], [5, 6, 7, 8, 9], [9.0, 8.0, 7.0, 6.0, 5.0])
+    new = _row([5, 6, 1, 2], [5, 6, 7, 8, 9], [9.5, 8.1, 7.2, 6.4, 5.1])
+    _, bad = report._verdict(base, new)
+    assert bad

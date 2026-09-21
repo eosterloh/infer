@@ -137,6 +137,17 @@ def _logit_delta(base: dict, new: dict, tol: float) -> float | None:
     return max(abs(a_by[token] - b_by[token]) for token in shared)
 
 
+def _lossy(base: dict, new: dict) -> bool:
+    """Whether the two rows hold different weights, not just different code.
+
+    A 4-bit run is a different model, by design: NVFP4 rounds every weight to one
+    of sixteen values, and the answer moves. Reporting that as a regression makes
+    the gate meaningless — it would fail on the one configuration it is there to
+    ship — so a precision change is measured and shown, not judged.
+    """
+    return (base.get("quant") or "none") != (new.get("quant") or "none")
+
+
 def _verdict(base: dict, new: dict) -> tuple[str, bool]:
     """A label for the table, and whether it should fail the run.
 
@@ -152,6 +163,12 @@ def _verdict(base: dict, new: dict) -> tuple[str, bool]:
     delta = _logit_delta(base, new, tol)
     if delta is None:
         return "no logits", False
+    lossy = _lossy(base, new)
+    if lossy:
+        kept = sum(1 for x, y in zip(a, b) if x == y)
+        drift = "top-5 reordered" if delta == float("inf") else f"Δlogit {delta:.3f}"
+        quant = new.get("quant") or "none"
+        return f"{quant}: {kept}/{len(a)} tokens kept, {drift}", False
     if delta == float("inf"):
         return "DIFFERS (a top-5 token moved clear of the cut)", True
     if a[0] != b[0]:

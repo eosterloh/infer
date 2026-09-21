@@ -95,6 +95,11 @@ while IFS= read -r -d '' cfg; do
   case "$name" in
     gpt2*|*pythia*|*Pythia*) prefill=128 ;;
   esac
+  # ONLY=<glob> narrows the sweep, which is how one family that failed earlier
+  # gets its missing row back without re-measuring the whole zoo around it.
+  if [ -n "${ONLY:-}" ]; then
+    case "$name" in ${ONLY}) ;; *) continue ;; esac
+  fi
   # Tab-separated: model directories with spaces in the name are common enough
   # in an HF cache that word-splitting the list would drop them.
   LIST+=("$name	$prefill	$decode	$bytes")
