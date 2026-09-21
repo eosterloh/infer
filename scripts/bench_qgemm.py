@@ -162,9 +162,16 @@ def main() -> int:
     if crossovers:
         for name, rows in crossovers:
             print(f"crossover  {name}: fused holds through {rows} rows")
-        worst = min(rows for _, rows in crossovers)
-        cap = max(1, worst)
-        print(f"\nset INFER_QGEMV_MAX_ROWS={cap}")
+        held = sorted(rows for _, rows in crossovers)
+        worst = held[0]
+        # The median, not the minimum: these shapes are not equally hot. The
+        # narrow expert projections are the ones that give up early, and a sparse
+        # prefill already leaves the grouped GEMV before it reaches those row
+        # counts (INFER_MOE_FUSED_ROWS_PER_EXPERT), so cutting every wide
+        # projection down to the narrowest shape's crossover costs more than it
+        # saves. The minimum is printed so the trade is visible.
+        cap = max(1, held[len(held) // 2])
+        print(f"\nset INFER_QGEMV_MAX_ROWS={cap}   (narrowest shape gave up at {worst})")
         if worst >= max(rows_list):
             print("fused won everywhere measured; raise --rows to find the edge")
     print(

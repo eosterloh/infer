@@ -432,10 +432,17 @@ def bits_per_weight(kind: str) -> float:
 KERNEL_ROW_LIMIT = 32
 
 
+# Measured on the GB10 with scripts/bench_qgemm.py: for every projection wide
+# enough to matter, the fused path wins through 16 rows and loses at 32, where
+# unpacking once and handing cuBLAS a GEMM starts to amortize. Decode is one row,
+# where it is roughly ten times cuBLAS on a packed 4096x4096.
+FUSED_ROW_DEFAULT = 16
+
+
 def _max_fused_rows() -> int:
     """Rows the fused path keeps; INFER_QGEMV_MAX_ROWS to sweep the crossover."""
     try:
-        rows = int(os.environ.get("INFER_QGEMV_MAX_ROWS", "32"))
+        rows = int(os.environ.get("INFER_QGEMV_MAX_ROWS", str(FUSED_ROW_DEFAULT)))
     except ValueError:
         return KERNEL_ROW_LIMIT
     return max(0, min(rows, 4096))
