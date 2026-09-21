@@ -112,3 +112,41 @@ def test_family_coverage_names_every_kernel_group() -> None:
     assert "| dense attention + MLP | llama1b |" in text
     assert "nano30b" in text
     assert "| MLA (compressed KV cache) | **none** |" in text
+
+
+def test_strict_fails_when_a_tag_has_no_row(tmp_path, capsys, monkeypatch) -> None:
+    """A configuration that crashed on a model must not read as a clean sweep.
+
+    No row means nothing appears in the table, so without this the loudest
+    possible failure — a model that does not run at all — is the quietest.
+    """
+    import json
+
+    ids, top5, logits = [5, 6], [5, 6, 7, 8, 9], [20.0, 19.5, 18.0, 17.0, 16.0]
+    rows = []
+    for tag, models in (
+        ("origin", ("alpha", "beta")),
+        ("kernels", ("alpha", "beta")),
+        ("graph", ("alpha",)),
+    ):
+        for model in models:
+            rows.append(_row(ids, top5, logits, tag=tag, model=model))
+    results = tmp_path / "results.jsonl"
+    results.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "bench_report",
+            "--results", str(results),
+            "--baseline", "origin",
+            "--tag", "kernels",
+            "--tag", "graph",
+            "--strict",
+        ],
+    )
+    code = report.main()
+    printed = capsys.readouterr().out
+    assert code == 1
+    assert "graph/beta" in printed, "the missing model has to be named"
+    assert "kernels/beta" not in printed

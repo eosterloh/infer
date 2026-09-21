@@ -169,16 +169,26 @@ def main() -> int:
         {r["tag"] for r in rows if r.get("tag") != args.baseline}
     )
     base = latest_by_model(rows, args.baseline)
+    measured = {tag: latest_by_model(rows, tag) for tag in tags}
+    # A model that crashed under one configuration leaves no row at all, and a
+    # table only shows what it has: the sweep would read as clean while a family
+    # went unmeasured. So the models any configuration managed are what every
+    # configuration is held to.
+    expected = {model for got in measured.values() for model in got}
 
     lines: list[str] = []
     drifted: list[str] = []
+    absent: list[str] = []
     host = next((r.get("host") for r in rows if r.get("host")), "unknown")
     lines.append(f"# infer benchmarks — {host}")
     lines.append("")
     lines.extend(coverage(rows))
     for tag in tags:
-        new = latest_by_model(rows, tag)
+        new = measured[tag]
+        for model in sorted(expected - set(new)):
+            absent.append(f"{tag}/{model}: no row (the run failed or was skipped)")
         if not new:
+            absent.append(f"{tag}: produced no rows at all")
             continue
         lines.append(f"## {tag} vs {args.baseline}")
         lines.append("")
@@ -190,10 +200,13 @@ def main() -> int:
         for model, row in sorted(new.items()):
             b = base.get(model)
             if b is None:
+                # The pre-work revision cannot load every checkpoint here — some
+                # of these recipes are part of the work — so "no before" is a
+                # real answer for those, not a hole in the measurement.
                 lines.append(
                     f"| {model} | {(row.get('params') or 0) / 1e9:.2f}B | — | "
                     f"{row['decode_tok_s']} | — | — | {row['prefill_tok_s']} | — | "
-                    "no baseline |"
+                    f"no {args.baseline} row |"
                 )
                 continue
             d_gain = row["decode_tok_s"] / b["decode_tok_s"]
@@ -217,13 +230,22 @@ def main() -> int:
         lines.extend(f"- {item}" for item in drifted)
         lines.append("")
 
+    if absent:
+        lines.append("## missing rows")
+        lines.append("")
+        lines.extend(f"- {item}" for item in absent)
+        lines.append("")
+
     text = "\n".join(lines)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text + "\n")
     print(text)
-    if drifted and args.strict:
-        print("\nFAIL: a faster run changed the answer", file=sys.stderr)
+    if args.strict and (drifted or absent):
+        if drifted:
+            print("\nFAIL: a faster run changed the answer", file=sys.stderr)
+        if absent:
+            print("FAIL: a configuration produced no row for a model", file=sys.stderr)
         return 1
     return 0
 

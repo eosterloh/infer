@@ -32,8 +32,23 @@ from engine.agent_api import load_engine  # noqa: E402
 
 try:  # The pre-kernel revision has no extension; this script benchmarks it too.
     from engine import kernels
-except ImportError:
+except Exception:  # not just ImportError: an older engine imports differently
     kernels = None
+
+
+def kernels_loaded() -> bool:
+    """Whether the extension is in play, for a tree that may not have one.
+
+    The baseline sweep runs this same script inside a worktree of the pre-kernel
+    revision, where `engine.kernels` exists but `available()` does not. Calling
+    it there raised AttributeError before the first row was written, which left
+    the "before" column empty and the whole speedup claim unsupported.
+    """
+    probe = getattr(kernels, "available", None)
+    try:
+        return bool(probe and probe())
+    except Exception:
+        return False
 
 FINGERPRINT_PROMPT = "The capital of France is Paris, and the capital of Italy is"
 
@@ -178,7 +193,7 @@ def main() -> int:
         "params": getattr(engine, "n_params", None),
         "quant": args.quant,
         "graph": bool(args.graph),
-        "kernels": bool(kernels is not None and kernels.available()),
+        "kernels": kernels_loaded(),
         "dtype": str(model.dtype),
         "device": str(model.device),
         "load_seconds": round(load_s, 2),
