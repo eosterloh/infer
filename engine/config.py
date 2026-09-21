@@ -587,6 +587,12 @@ class ModelConfig:
             residual_kind = "olmo_hybrid"
         elif recipe_id in {"olmo2", "olmo3", "flex_olmo", "exaone4"}:
             residual_kind = "post_norm"
+        elif recipe_id == "gpt_neox" and bool(
+            raw.get("use_parallel_residual", True)
+        ):
+            # GPT-NeoX keeps a second layernorm for the parallel FFN branch;
+            # Phi / StableLM / Cohere reuse the one normed hidden state.
+            residual_kind = "parallel_dual"
         elif recipe_id in {"cohere", "cohere2_moe", "phi", "gptj"} or bool(raw.get("use_parallel_residual")):
             residual_kind = "parallel"
         elif recipe_id == "falcon" and bool(raw.get("new_decoder_architecture", False)):

@@ -402,7 +402,7 @@ def _map_gpt2(hf_name: str) -> str | None:
         return "final_norm.bias"
     if hf_name == "lm_head.weight":
         return "lm_head.weight"
-    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    m = re.match(r"^(?:transformer\.)?h\.(\d+)\.(.+)$", hf_name)
     if not m:
         return None
     i, rest = m.group(1), m.group(2)
@@ -435,7 +435,7 @@ def _map_gptj(hf_name: str) -> str | None:
         return "lm_head.weight"
     if hf_name in {"lm_head.bias", "transformer.lm_head.bias"}:
         return "lm_head.bias"
-    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    m = re.match(r"^(?:transformer\.)?h\.(\d+)\.(.+)$", hf_name)
     if not m:
         return None
     i, rest = m.group(1), m.group(2)
@@ -466,7 +466,7 @@ def _map_gpt_neo(hf_name: str) -> str | None:
         return "final_norm.bias"
     if hf_name == "lm_head.weight":
         return "lm_head.weight"
-    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    m = re.match(r"^(?:transformer\.)?h\.(\d+)\.(.+)$", hf_name)
     if not m:
         return None
     i, rest = m.group(1), m.group(2)
@@ -557,7 +557,7 @@ def _map_bloom(hf_name: str) -> str | None:
         return "final_norm.bias"
     if hf_name == "lm_head.weight":
         return "lm_head.weight"
-    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    m = re.match(r"^(?:transformer\.)?h\.(\d+)\.(.+)$", hf_name)
     if not m:
         return None
     i, rest = m.group(1), m.group(2)
@@ -588,7 +588,7 @@ def _map_falcon(hf_name: str) -> str | None:
         return "final_norm.bias"
     if hf_name == "lm_head.weight":
         return "lm_head.weight"
-    m = re.match(r"^transformer\.h\.(\d+)\.(.+)$", hf_name)
+    m = re.match(r"^(?:transformer\.)?h\.(\d+)\.(.+)$", hf_name)
     if not m:
         return None
     i, rest = m.group(1), m.group(2)
@@ -621,7 +621,7 @@ def _map_mpt(hf_name: str) -> str | None:
         return "final_norm.weight"
     if hf_name == "lm_head.weight":
         return "lm_head.weight"
-    m = re.match(r"^transformer\.blocks\.(\d+)\.(.+)$", hf_name)
+    m = re.match(r"^(?:transformer\.)?blocks\.(\d+)\.(.+)$", hf_name)
     if not m:
         return None
     i, rest = m.group(1), m.group(2)
@@ -644,7 +644,7 @@ def _map_dbrx(hf_name: str) -> str | None:
         return "final_norm.weight"
     if hf_name == "lm_head.weight":
         return "lm_head.weight"
-    m = re.match(r"^transformer\.blocks\.(\d+)\.(.+)$", hf_name)
+    m = re.match(r"^(?:transformer\.)?blocks\.(\d+)\.(.+)$", hf_name)
     if not m:
         return None
     i, rest = m.group(1), m.group(2)
@@ -826,6 +826,11 @@ def is_ignored_hf_name(hf_name: str, config: ModelConfig | None = None) -> bool:
     if ".attn.embed_positions" in hf_name:
         return True
     if hf_name.endswith(".attn.attention.bias") or hf_name.endswith(".attn.bias"):
+        return True
+    # Non-parameter buffers: causal masks and rotary tables are rebuilt here.
+    if hf_name.endswith((".attention.bias", ".masked_bias")):
+        return True
+    if hf_name.endswith("inv_freq") or ".rotary_emb." in hf_name:
         return True
     recipe = getattr(config, "recipe_id", "") if config is not None else ""
     if recipe == "qwen3_5" and (

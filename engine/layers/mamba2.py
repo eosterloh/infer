@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 
 from engine.config import ModelConfig
+from engine.kernels import mamba2_scan
+from engine.layers.linear import dense
 
 if TYPE_CHECKING:
     from engine.cache import RuntimeState
@@ -90,7 +92,7 @@ def mamba2(
     dt_bias = weights[f"{p}.mamba.dt_bias"]
     norm_w = weights[f"{p}.mamba.norm.weight"]
 
-    projected = F.linear(x, in_proj)
+    projected = dense(x, in_proj)
     # d_mlp is 0 for Nemotron-H: split = gate | B_C | dt
     gate, bc, dt = projected.split([inter, conv_dim, n_heads], dim=-1)
 
@@ -125,17 +127,46 @@ def mamba2(
         [inter, n_groups * state_size, n_groups * state_size], dim=-1
     )
 
-    A = -torch.exp(A_log.float())  # [n_heads]
-    dt = F.softplus(dt.float() + dt_bias.float())
-    # Clamp using config limits if present
+    # Clamp limits from config, shared by the kernel and the Python scan.
     raw = config.raw or {}
     dt_limit = raw.get("time_step_limit") or raw.get("mamba_dt_limit")
+    dt_lo, dt_hi = 0.0, float("inf")
     if dt_limit is not None and len(dt_limit) == 2:
-        lo, hi = float(dt_limit[0]), float(dt_limit[1])
-        if hi != float("inf"):
-            dt = torch.clamp(dt, lo, hi)
-        elif lo > 0:
-            dt = torch.clamp(dt, min=lo)
+        dt_lo, dt_hi = float(dt_limit[0]), float(dt_limit[1])
+
+    # One fused scan for both prefill and decode: the recurrent state stays in
+    # registers, so it moves once per layer instead of once per token.
+    if cache is not None and cache.ssm_states[layer] is not None:
+        fused = mamba2_scan(
+            x_ssm.reshape(b, s, n_heads, head_dim).contiguous(),
+            dt.contiguous(),
+            dt_bias,
+            A_log,
+            B.reshape(b, s, n_groups, state_size).contiguous(),
+            C.reshape(b, s, n_groups, state_size).contiguous(),
+            D,
+            cache.ssm_states[layer],
+            has_state=cache.mamba_ready(layer),
+            dt_lo=dt_lo,
+            dt_hi=dt_hi,
+        )
+        if fused is not None:
+            cache.mark_mamba_ready(layer)
+            scan_out = _rms_norm_gated(
+                fused.reshape(b, s, inter),
+                norm_w,
+                gate,
+                eps=config.rms_norm_eps,
+                group_size=inter // n_groups,
+            )
+            return dense(scan_out, out_proj)
+
+    A = -torch.exp(A_log.float())  # [n_heads]
+    dt = F.softplus(dt.float() + dt_bias.float())
+    if dt_hi != float("inf"):
+        dt = torch.clamp(dt, dt_lo, dt_hi)
+    elif dt_lo > 0:
+        dt = torch.clamp(dt, min=dt_lo)
 
     # Reshape for multi-head SSM
     # x: [B,S,H,D], B/C: [B,S,n_groups,N] → expand to heads
@@ -199,4 +230,4 @@ def mamba2(
         eps=config.rms_norm_eps,
         group_size=group_size,
     )
-    return F.linear(scan_out, out_proj)
+    return dense(scan_out, out_proj)

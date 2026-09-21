@@ -20,7 +20,15 @@ import torch
 _EXT = None
 _LOAD_ATTEMPTED = False
 _SOURCES = ("ops.cpp",)
-_CUDA_SOURCES = ("norm.cu", "activation.cu", "rope.cu", "gemv.cu")
+_CUDA_SOURCES = (
+    "norm.cu",
+    "activation.cu",
+    "rope.cu",
+    "gemv.cu",
+    "quant_gemv.cu",
+    "moe.cu",
+    "mamba.cu",
+)
 
 
 def _extension_dir() -> Path:
@@ -236,6 +244,143 @@ def gemv(
         return None
     try:
         return ops.gemv(x, weight, bias)
+    except Exception:
+        return None
+
+
+def moe_gemv(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    row_expert: torch.Tensor,
+    row_input: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Per-row expert GEMV against a stacked ``[E, N, K]`` weight.
+
+    ``row_expert[r]`` picks the expert for output row ``r`` and ``row_input[r]``
+    the activation row, so routing never leaves the device. None means the
+    caller must take the Python path.
+    """
+    ops = _ops()
+    if ops is None or w.dim() != 3 or x.dim() != 2:
+        return None
+    if x.device.type not in ("cuda", "cpu"):
+        return None
+    if x.dtype != w.dtype or x.dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if not x.is_contiguous() or not w.is_contiguous():
+        return None
+    try:
+        return ops.moe_gemv(x, w, row_expert.to(torch.int32), row_input, bias)
+    except Exception:
+        return None
+
+
+def qmoe_gemv(
+    x: torch.Tensor,
+    qw,
+    row_expert: torch.Tensor,
+    row_input: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Per-row expert GEMV against a packed ``[E * N, K]`` expert stack.
+
+    ``qw`` is a ``QuantWeight`` whose rows are the experts' output rows laid end
+    to end. None means the caller must take the dense path.
+    """
+    ops = _ops()
+    if ops is None or x.dim() != 2 or x.device.type not in ("cuda", "cpu"):
+        return None
+    if getattr(qw, "expert_cols", 0) <= 0 or x.shape[-1] != qw.in_features:
+        return None
+    if x.dtype not in (torch.bfloat16, torch.float16) or qw.in_features % 64:
+        return None
+    try:
+        from engine.qweight import _KIND_CODE
+
+        return ops.qmoe_gemv(
+            x.contiguous(),
+            qw.qweight,
+            qw.scales,
+            qw.zeros,
+            qw.channel_scale,
+            row_expert.to(torch.int32),
+            row_input if row_input is None else row_input.to(torch.int32),
+            _KIND_CODE[qw.kind],
+            qw.group_size,
+            qw.expert_cols,
+            qw.in_features,
+            float(qw.global_scale),
+        )
+    except Exception:
+        return None
+
+
+def moe_combine(
+    expert_out: torch.Tensor, weights: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """``sum_k weights[t, k] * expert_out[t * topk + k]``."""
+    ops = _ops()
+    if ops is not None and expert_out.device.type in ("cuda", "cpu"):
+        try:
+            return ops.moe_combine(expert_out, weights, int(topk))
+        except Exception:
+            pass
+    tokens = expert_out.shape[0] // topk
+    grouped = expert_out.view(tokens, topk, -1).float()
+    return (grouped * weights.reshape(tokens, topk, 1).float()).sum(1).to(expert_out.dtype)
+
+
+def mamba2_scan(
+    x: torch.Tensor,
+    dt_raw: torch.Tensor,
+    dt_bias: torch.Tensor,
+    a_log: torch.Tensor,
+    b_mat: torch.Tensor,
+    c_mat: torch.Tensor,
+    d_skip: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    has_state: bool,
+    dt_lo: float = 0.0,
+    dt_hi: float = float("inf"),
+) -> torch.Tensor | None:
+    """Selective scan over the whole sequence, state updated in place.
+
+    ``x`` is ``[B, S, H, D]``, ``b_mat``/``c_mat`` are ``[B, S, G, N]``, and
+    ``dt_raw`` is pre-softplus. The kernel keeps the recurrent state in
+    registers, so it handles prefill and decode with one launch per layer.
+    None means the caller must run the Python scan.
+    """
+    ops = _ops()
+    if ops is None or not x.is_cuda:
+        return None
+    head_dim, state_size = x.shape[-1], b_mat.shape[-1]
+    if head_dim % 8 or state_size % 32:
+        return None
+    if not 1 <= head_dim // 8 <= 16 or not 1 <= state_size // 32 <= 4:
+        return None
+    if not (x.is_contiguous() and b_mat.is_contiguous() and c_mat.is_contiguous()):
+        return None
+    if not dt_raw.is_contiguous():
+        return None
+    if state.dtype != torch.float32 or not state.is_contiguous():
+        return None
+    if x.dtype != b_mat.dtype or x.dtype != c_mat.dtype or x.dtype != dt_raw.dtype:
+        return None
+    try:
+        return ops.mamba2_scan(
+            x,
+            dt_raw,
+            dt_bias.float(),
+            a_log.float(),
+            b_mat,
+            c_mat,
+            d_skip.float(),
+            state,
+            bool(has_state),
+            float(dt_lo),
+            float(dt_hi),
+        )
     except Exception:
         return None
 

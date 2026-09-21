@@ -6,8 +6,19 @@ import torch
 import torch.nn.functional as F
 
 from engine.config import ModelConfig
-from engine.kernels import act_mul
+from engine.kernels import act_and_mul, act_mul, moe_combine, moe_gemv, qmoe_gemv
 from engine.layers.linear import dense
+
+# Set by the loader when it stacks the per-expert tensors: "layers.N.moe" →
+# {"up": [E, N, K], "down": ..., optional "gate"/"*_bias"}.
+EXPERT_STACK_KEY = "_expert_stacks"
+
+
+def expert_stack(weights: dict, p: str) -> dict[str, torch.Tensor] | None:
+    stacks = weights.get(EXPERT_STACK_KEY)
+    if not stacks:
+        return None
+    return stacks.get(f"{p}.moe")
 
 
 def _relu2(x: torch.Tensor) -> torch.Tensor:
@@ -133,6 +144,12 @@ def _dispatch_experts(
     n_routed: int,
     run_expert,
 ) -> torch.Tensor:
+    """Reference dispatch: one pass per expert over the tokens it received.
+
+    ``torch.where`` has to know how many tokens matched, so every expert costs a
+    device synchronization. Stacked expert weights take `fused_dispatch`
+    instead; this stays the correctness reference and the CPU path.
+    """
     routed = torch.zeros_like(flat, dtype=topk_weights.dtype)
     expert_mask = F.one_hot(topk_indices, num_classes=n_routed).permute(2, 0, 1)
     for expert_idx in range(n_routed):
@@ -144,6 +161,106 @@ def _dispatch_experts(
         expert_out = expert_out * topk_weights[token_indices, weight_indices].unsqueeze(-1)
         routed.index_add_(0, token_indices, expert_out.to(routed.dtype))
     return routed
+
+
+def _routing_rows(
+    tokens: int, topk_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten [T, topk] routing into per-output-row expert / token indices."""
+    topk = topk_indices.shape[-1]
+    row_expert = topk_indices.reshape(-1).to(torch.int32)
+    row_input = torch.arange(
+        tokens, device=topk_indices.device, dtype=torch.int32
+    ).repeat_interleave(topk)
+    return row_expert, row_input
+
+
+def _expert_from_stack(stack: dict, idx: int) -> dict:
+    """One expert's weights as views into the stacked block."""
+    out = {}
+    for field in ("gate", "up", "down"):
+        block = stack.get(field)
+        if block is None:
+            continue
+        out[field] = (
+            block.expert_view(idx) if hasattr(block, "expert_view") else block[idx]
+        )
+    return out
+
+
+def _stack_gemv(
+    x: torch.Tensor,
+    w,
+    row_expert: torch.Tensor,
+    row_input: torch.Tensor | None,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Routed GEMV against one expert block, packed or dense."""
+    if getattr(w, "expert_cols", 0):
+        out = qmoe_gemv(x, w, row_expert, row_input)
+        if out is None:
+            return None
+        if bias is not None:
+            out = out + bias.index_select(0, row_expert.to(torch.long))
+        return out
+    return moe_gemv(x, w, row_expert, row_input, bias)
+
+
+def fused_dispatch(
+    flat: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    stack: dict[str, torch.Tensor],
+    act: str,
+) -> torch.Tensor | None:
+    """One launch per projection over the routed rows, or None if unsupported.
+
+    ``stack`` holds the experts as contiguous ``[E, N, K]`` tensors. Every token
+    in the batch is handled in the same launches, so cost tracks the tokens
+    actually routed instead of the expert count.
+    """
+    down = stack.get("down")
+    gate_up = stack.get("gate_up")
+    up = stack.get("up")
+    if down is None or (up is None and gate_up is None):
+        return None
+    gate = stack.get("gate")
+    tokens = flat.shape[0]
+    topk = int(topk_indices.shape[-1])
+    row_expert, row_input = _routing_rows(tokens, topk_indices)
+    flat_c = flat.contiguous()
+
+    if gate_up is not None:
+        # One block holds gate rows then up rows, so a single GEMV feeds the
+        # fused activation directly.
+        fused_h = _stack_gemv(flat_c, gate_up, row_expert, row_input, stack.get("gate_up_bias"))
+        if fused_h is None:
+            return None
+        h = act_and_mul(fused_h, "silu" if act in {"silu", "swiglu"} else act)
+        out = _stack_gemv(h.contiguous(), down, row_expert, None, stack.get("down_bias"))
+        if out is None:
+            return None
+        return moe_combine(out, topk_weights, topk)
+
+    h = _stack_gemv(flat_c, up, row_expert, row_input, stack.get("up_bias"))
+    if h is None:
+        return None
+    if gate is not None:
+        g = _stack_gemv(flat_c, gate, row_expert, row_input, stack.get("gate_bias"))
+        if g is None:
+            return None
+        h = act_mul(g, h, "silu" if act in {"silu", "swiglu"} else act)
+    elif act in {"relu2", "relu_squared", "squared_relu"}:
+        h = _relu2(h)
+    elif act == "silu":
+        h = F.silu(h)
+    else:
+        return None
+
+    out = _stack_gemv(h.contiguous(), down, row_expert, None, stack.get("down_bias"))
+    if out is None:
+        return None
+    return moe_combine(out, topk_weights, topk)
 
 
 def moe(
@@ -234,31 +351,60 @@ def moe(
     else:
         topk_i, topk_w = softmax_topk(flat, gate_w, top_k, gate_b, norm_topk_prob=norm_topk)
 
-    packed = f"{p}.moe.experts.gate_up.weight" in weights
+    stack = expert_stack(weights, p)
+    packed = f"{p}.moe.experts.gate_up.weight" in weights or (
+        stack is not None and "gate_up" in stack
+    )
+    if stack is not None:
+        fused = fused_dispatch(
+            flat, topk_i, topk_w, stack, config.mlp_hidden_act or "silu"
+        )
+        if fused is not None:
+            routed = fused
+            return _add_shared(
+                routed, x, residuals, orig_shape, weights, p, config
+            )
     if kind == "dbrx" or f"{p}.moe.experts.w1.weight" in weights:
         routed = _dbrx_experts(flat, topk_i, topk_w, weights, p, n_routed)
     elif kind in {"gpt_oss", "llama4"} or packed:
-        routed = _packed_experts(flat, topk_i, topk_w, weights, p, n_routed, kind)
+        routed = _packed_experts(
+            flat, topk_i, topk_w, weights, p, n_routed, kind, stack=stack
+        )
     else:
-        act_gate = True
 
         def run(idx: int, tok: torch.Tensor) -> torch.Tensor:
-            if f"{p}.moe.experts.{idx}.gate.weight" in weights:
-                return expert_swiglu(
-                    tok,
-                    weights[f"{p}.moe.experts.{idx}.gate.weight"],
-                    weights[f"{p}.moe.experts.{idx}.up.weight"],
-                    weights[f"{p}.moe.experts.{idx}.down.weight"],
-                )
+            # Stacking removes the per-expert entries, so when the fused path
+            # declines the loop reads slices of the block instead.
+            expert = (
+                _expert_from_stack(stack, idx)
+                if stack is not None
+                else {
+                    field: weights[f"{p}.moe.experts.{idx}.{field}.weight"]
+                    for field in ("gate", "up", "down")
+                    if f"{p}.moe.experts.{idx}.{field}.weight" in weights
+                }
+            )
+            if "gate" in expert:
+                return expert_swiglu(tok, expert["gate"], expert["up"], expert["down"])
             return expert_mlp(
-                tok,
-                weights[f"{p}.moe.experts.{idx}.up.weight"],
-                weights[f"{p}.moe.experts.{idx}.down.weight"],
-                config.mlp_hidden_act or "silu",
+                tok, expert["up"], expert["down"], config.mlp_hidden_act or "silu"
             )
 
         routed = _dispatch_experts(flat, topk_i, topk_w, n_routed, run)
 
+    return _add_shared(routed, x, residuals, orig_shape, weights, p, config)
+
+
+def _add_shared(
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    residuals: torch.Tensor,
+    orig_shape: torch.Size,
+    weights: dict[str, torch.Tensor],
+    p: str,
+    config: ModelConfig,
+) -> torch.Tensor:
+    """Add the always-on shared expert (and its gate) to the routed output."""
     routed = routed.view(*orig_shape).to(dtype=x.dtype)
     if f"{p}.moe.shared.up.weight" in weights or f"{p}.moe.shared.gate_up.weight" in weights:
         if f"{p}.moe.shared.gate_up.weight" in weights:
@@ -326,24 +472,33 @@ def _packed_experts(
     p: str,
     n_routed: int,
     kind: str,
+    stack: dict | None = None,
 ) -> torch.Tensor:
-    gate_up = weights[f"{p}.moe.experts.gate_up.weight"]
-    down = weights[f"{p}.moe.experts.down.weight"]
-    gu_bias = weights.get(f"{p}.moe.experts.gate_up.bias")
-    dn_bias = weights.get(f"{p}.moe.experts.down.bias")
+    # llama4/gpt_oss store [E, H, 2I] / [E, I, H] (token @ weight).
+    # Qwen2/3-MoE store Linear layouts [E, 2I, H] / [E, H, I]. Adoption into a
+    # stack normalizes both to the Linear layout.
+    transposed = kind in {"gpt_oss", "llama4"} and stack is None
+    if stack is not None:
+        gate_up, down = stack["gate_up"], stack["down"]
+        gu_bias, dn_bias = stack.get("gate_up_bias"), stack.get("down_bias")
+    else:
+        gate_up = weights[f"{p}.moe.experts.gate_up.weight"]
+        down = weights[f"{p}.moe.experts.down.weight"]
+        gu_bias = weights.get(f"{p}.moe.experts.gate_up.bias")
+        dn_bias = weights.get(f"{p}.moe.experts.down.bias")
+
+    def slice_expert(block, idx: int):
+        return block.expert_view(idx) if hasattr(block, "expert_view") else block[idx]
 
     def run(idx: int, tok: torch.Tensor) -> torch.Tensor:
-        # llama4/gpt_oss store [E, H, 2I] / [E, I, H] (token @ weight).
-        # Qwen2/3-MoE store Linear layouts [E, 2I, H] / [E, H, I].
-        transposed = kind in {"gpt_oss", "llama4"}
-        w_gu = gate_up[idx]
-        fused = tok @ w_gu if transposed else F.linear(tok, w_gu)
+        w_gu = slice_expert(gate_up, idx)
+        fused = tok @ w_gu if transposed else dense(tok, w_gu)
         if gu_bias is not None:
             fused = fused + gu_bias[idx]
         gate, up = fused.chunk(2, dim=-1)
         h = F.silu(gate) * up
-        w_dn = down[idx]
-        out = h @ w_dn if transposed else F.linear(h, w_dn)
+        w_dn = slice_expert(down, idx)
+        out = h @ w_dn if transposed else dense(h, w_dn)
         if dn_bias is not None:
             out = out + dn_bias[idx]
         return out
@@ -388,17 +543,26 @@ def _moe_nemotron(
 
     expert_in = flat
     if latent:
-        expert_in = F.linear(flat, weights[f"{p}.moe.latent_down.weight"])
+        expert_in = dense(flat, weights[f"{p}.moe.latent_down.weight"])
+
+    stack = expert_stack(weights, p)
 
     def run(idx: int, tok: torch.Tensor) -> torch.Tensor:
-        return expert_mlp(
-            tok,
-            weights[f"{p}.moe.experts.{idx}.up.weight"],
-            weights[f"{p}.moe.experts.{idx}.down.weight"],
-            act,
+        expert = (
+            _expert_from_stack(stack, idx)
+            if stack is not None
+            else {
+                "up": weights[f"{p}.moe.experts.{idx}.up.weight"],
+                "down": weights[f"{p}.moe.experts.{idx}.down.weight"],
+            }
         )
+        return expert_mlp(tok, expert["up"], expert["down"], act)
 
-    routed = _dispatch_experts(expert_in, topk_indices, topk_weights, n_routed, run)
+    routed = None
+    if stack is not None:
+        routed = fused_dispatch(expert_in, topk_indices, topk_weights, stack, act)
+    if routed is None:
+        routed = _dispatch_experts(expert_in, topk_indices, topk_weights, n_routed, run)
     if latent:
         routed = F.linear(routed, weights[f"{p}.moe.latent_up.weight"])
 

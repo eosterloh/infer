@@ -267,8 +267,15 @@ def attention(
     alibi_bias_max: float = 8.0,
     qk_norm_after_rope: bool = False,
     sub_norm: torch.Tensor | None = None,
+    kv_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Causal GQA attention. x: [B, S_new, H]."""
+    """Causal GQA attention. x: [B, S_new, H].
+
+    ``attention_mask`` is the usual [B, S] key-padding mask, whose trailing
+    entries also mark which *queries* are real. ``kv_mask`` marks key validity
+    only: CUDA-graph decode reads a fixed KV window that runs past the live
+    length, and the query it is decoding is always real.
+    """
     b, s_new, _ = x.shape
     q = dense(x, w_q, b_q)
     k = dense(x, w_k, b_k)
@@ -343,6 +350,9 @@ def attention(
         raise ValueError(
             f"expected attention_mask [B,S], got {tuple(attention_mask.shape)}"
         )
+    key_mask = attention_mask
+    if kv_mask is not None:
+        key_mask = kv_mask if key_mask is None else (key_mask.bool() & kv_mask.bool())
 
     fused_ok = (
         _attention_mode() != "eager"
@@ -358,7 +368,7 @@ def attention(
             v,
             scale=scale,
             sliding_window=sliding_window,
-            padding_mask=attention_mask,
+            padding_mask=key_mask,
         )
         out = out.transpose(1, 2).contiguous().view(b, s_new, nq * hd)
         if gate is not None:
@@ -423,13 +433,9 @@ def attention(
         )
 
     scores = scores + causal
-    if attention_mask is not None:
-        if attention_mask.dim() != 2 or attention_mask.shape[0] != b:
-            raise ValueError(
-                f"expected attention_mask [B,S], got {tuple(attention_mask.shape)}"
-            )
-        key_mask = attention_mask[:, -s_total:].to(device=x.device, dtype=torch.bool)
-        scores = scores.masked_fill(~key_mask[:, None, None, :], float("-inf"))
+    if key_mask is not None:
+        keep = key_mask[:, -s_total:].to(device=x.device, dtype=torch.bool)
+        scores = scores.masked_fill(~keep[:, None, None, :], float("-inf"))
     if sinks is not None:
         sink = sinks.reshape(1, -1, 1, 1).to(dtype=scores.dtype)
         scores = torch.cat([scores, sink.expand(b, nq, s_new, 1)], dim=-1)
@@ -443,7 +449,7 @@ def attention(
         out = out * torch.sigmoid(gate)
     if sub_norm is not None:
         out = rms_norm(out, sub_norm, rms_eps)
-    out = F.linear(out, w_o, b_o)
+    out = dense(out, w_o, b_o)
     if attention_mask is not None:
         out = out * attention_mask[:, -s_new:, None].to(dtype=out.dtype)
     return out
@@ -531,6 +537,7 @@ def attention_from_weights(
     *,
     use_rope: bool = True,
     attention_mask: torch.Tensor | None = None,
+    kv_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     p = f"layers.{spec_index}"
     nq, nkv, hd = config.num_attention_heads, config.num_key_value_heads, config.head_dim
@@ -545,7 +552,7 @@ def attention_from_weights(
             k, v = cache.update(spec_index, k, v)
         scale = 1.0 / math.sqrt(hd)
         if _attention_mode() != "eager" and q.is_floating_point():
-            out = sdpa_attend(q, k, v, scale=scale)
+            out = sdpa_attend(q, k, v, scale=scale, padding_mask=kv_mask)
         else:
             k = repeat_kv(k, nq // max(nkv, 1)) if nkv else k
             v = repeat_kv(v, nq // max(nkv, 1)) if nkv else v
@@ -587,7 +594,7 @@ def attention_from_weights(
             and q.is_floating_point()
         ):
             # Matches the eager branch below: no sliding-window / padding mask here.
-            out = sdpa_attend(q, k, v, scale=scale)
+            out = sdpa_attend(q, k, v, scale=scale, padding_mask=kv_mask)
             out = out.transpose(1, 2).contiguous().view(x.shape[0], s_new, nq * hd)
             return dense(
                 out, weights[f"{p}.attn.o.weight"], weights.get(f"{p}.attn.o.bias")
@@ -677,4 +684,5 @@ def attention_from_weights(
         ),
         qk_norm_after_rope=config.recipe_id == "hunyuan_v1_moe",
         sub_norm=weights.get(f"{p}.attn.sub_norm.weight"),
+        kv_mask=kv_mask,
     )

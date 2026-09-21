@@ -17,6 +17,10 @@ from engine.kernels import gemv
 def dense(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
+    if type(weight) is not torch.Tensor and hasattr(weight, "kind"):
+        from engine.qweight import qlinear
+
+        return qlinear(x, weight, bias)
     if x.numel() == x.shape[-1]:
         out = gemv(x, weight, bias)
         if out is not None:

@@ -102,6 +102,7 @@ class DecoderModel:
         inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        kv_mask: torch.Tensor | None = None,
         return_hidden: bool = False,
         logits_to_keep: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -218,6 +219,7 @@ class DecoderModel:
                 cache=cache,
                 use_rope=self.use_rope,
                 attention_mask=effective_mask,
+                kv_mask=kv_mask,
             )
 
         if cache is not None and hasattr(cache, "advance"):

@@ -50,6 +50,10 @@ class KVCache:
         self.max_seq_len = int(max_seq_len) if max_seq_len else None
         self._seq_len = 0
         self.padding_mask: torch.Tensor | None = None
+        # Graph mode: writes go to a slot held on the GPU and reads expose a
+        # fixed window, so a decode step has static shapes and can be captured.
+        self._graph_window: int | None = None
+        self._graph_slot: torch.Tensor | None = None
 
     # --- buffer views -------------------------------------------------
     @property
@@ -119,7 +123,7 @@ class KVCache:
                 assert old is not None
                 shape = list(old.shape)
                 shape[2] = target
-                new = torch.empty(shape, device=old.device, dtype=old.dtype)
+                new = torch.zeros(shape, device=old.device, dtype=old.dtype)
                 length = self._layer_len[i]
                 if length:
                     new[:, :, :length] = old[:, :, :length]
@@ -139,18 +143,56 @@ class KVCache:
                 f"KV cache needs {needed} positions > max_seq_len {self.max_seq_len}"
             )
         # MLA keys and values have different head dims, so size each separately.
+        # Zeroed, not empty: graph-mode attention reads a fixed window that can
+        # run past the live length, and masked-out NaN garbage would poison the
+        # softmax even though its weight is zero.
         for store, ref in ((self._k_buf, k_new), (self._v_buf, v_new)):
-            store[layer] = torch.empty(
+            store[layer] = torch.zeros(
                 (ref.shape[0], ref.shape[1], target, ref.shape[3]),
                 device=ref.device,
                 dtype=ref.dtype,
             )
         self._capacity = max(self._capacity, target)
 
+    # --- CUDA graph mode ----------------------------------------------
+    def enable_graph_mode(self, window: int, slot: torch.Tensor) -> None:
+        """Freeze shapes for capture: write at ``slot``, read ``[:window]``.
+
+        ``slot`` is a device tensor so the write index can change between
+        replays without re-capturing, and ``window`` is a fixed power-of-block
+        length so every tensor in the step keeps its shape.
+        """
+        window = int(window)
+        if window > self._capacity:
+            raise ValueError(f"graph window {window} > capacity {self._capacity}")
+        if slot.device != self.device or slot.dtype != torch.int64:
+            raise ValueError("graph slot must be an int64 tensor on the cache device")
+        self._graph_window = window
+        self._graph_slot = slot
+
+    def disable_graph_mode(self) -> None:
+        self._graph_window = None
+        self._graph_slot = None
+
+    @property
+    def graph_mode(self) -> bool:
+        return self._graph_window is not None
+
+    def set_length(self, seq_len: int) -> None:
+        """Set the live length directly (graph replays bypass ``update``)."""
+        seq_len = int(seq_len)
+        if seq_len > self._capacity:
+            raise ValueError(f"length {seq_len} > capacity {self._capacity}")
+        self._layer_len = [seq_len] * self.n_layers
+        self._seq_len = seq_len
+
     def prepare_padding_mask(
         self, mask: torch.Tensor | None, new_tokens: int
     ) -> torch.Tensor | None:
         """Install or extend one key-padding mask before layer KV updates."""
+        if self._graph_window is not None:
+            # The runner owns the mask buffer; growing it here would allocate.
+            return self.padding_mask
         if mask is None:
             if self.padding_mask is not None:
                 ones = torch.ones(
@@ -203,6 +245,20 @@ class KVCache:
         if k_new.shape[2] != v_new.shape[2]:
             raise ValueError(f"k/v seq mismatch: {k_new.shape} vs {v_new.shape}")
 
+        if self._graph_window is not None:
+            k_buf = self._k_buf[layer]
+            v_buf = self._v_buf[layer]
+            if k_buf is None or v_buf is None:
+                raise RuntimeError("graph mode requires a warmed cache")
+            slot = self._graph_slot
+            assert slot is not None
+            # index_copy_ keeps the write position in a device tensor, so the
+            # captured graph can target a different row on every replay.
+            k_buf.index_copy_(2, slot, k_new.to(k_buf.dtype))
+            v_buf.index_copy_(2, slot, v_new.to(v_buf.dtype))
+            window = self._graph_window
+            return k_buf[:, :, :window], v_buf[:, :, :window]
+
         base = self._layer_len[layer]
         end = base + int(k_new.shape[2])
         if self._k_buf[layer] is None:
@@ -243,6 +299,11 @@ class KVCache:
             return
         self.truncate(int(spec_len))
         self._spec_len = None
+
+
+def _clone_states(states) -> list[torch.Tensor | None]:
+    """Detach a list of mixer state buffers from whoever else holds them."""
+    return [s.clone() if s is not None else None for s in states]
 
 
 class RuntimeState:
@@ -362,6 +423,21 @@ class RuntimeState:
     ) -> torch.Tensor | None:
         return self.kv.prepare_padding_mask(mask, new_tokens)
 
+    def enable_graph_mode(self, window: int, slot: torch.Tensor) -> None:
+        self.kv.enable_graph_mode(window, slot)
+
+    def disable_graph_mode(self) -> None:
+        self.kv.disable_graph_mode()
+
+    @property
+    def graph_mode(self) -> bool:
+        return self.kv.graph_mode
+
+    def set_length(self, seq_len: int) -> None:
+        if self.kv.capacity():
+            self.kv.set_length(seq_len)
+        self._token_len = int(seq_len)
+
     def advance(self, n_tokens: int) -> None:
         """Record that `n_tokens` were consumed (prefill sets absolute via replace)."""
         self._token_len += int(n_tokens)
@@ -385,12 +461,15 @@ class RuntimeState:
             raise NotImplementedError(
                 "transactional speculative commit is implemented for Gated DeltaNet"
             )
+        # Cloned, not aliased: the mixers write their state buffers in place, so
+        # a reference would be overwritten by the very tokens this transaction
+        # may have to roll back.
         self._spec_base = {
             "token_len": self._token_len,
             "kv_len": self.kv.seq_len(),
             "ready": list(self._mamba_ready),
-            "conv": list(self.conv_states),
-            "ssm": list(self.ssm_states),
+            "conv": _clone_states(self.conv_states),
+            "ssm": _clone_states(self.ssm_states),
         }
         self._spec_gdn = {}
 
@@ -450,8 +529,8 @@ class RuntimeState:
         self.kv.truncate(int(base["kv_len"]))
         self._token_len = int(base["token_len"])
         self._mamba_ready = list(base["ready"])  # type: ignore[arg-type]
-        self.conv_states = list(base["conv"])  # type: ignore[arg-type]
-        self.ssm_states = list(base["ssm"])  # type: ignore[arg-type]
+        self.conv_states = _clone_states(base["conv"])  # type: ignore[arg-type]
+        self.ssm_states = _clone_states(base["ssm"])  # type: ignore[arg-type]
         self._spec_base = None
         self._spec_gdn = {}
 
@@ -461,12 +540,12 @@ class RuntimeState:
         self._token_len = 0
         self._spec_base = None
         self._spec_gdn = {}
-        for i, s in enumerate(self.conv_states):
+        for s in self.conv_states:
             if s is not None:
-                self.conv_states[i] = torch.zeros_like(s)
-        for i, s in enumerate(self.ssm_states):
+                s.zero_()
+        for s in self.ssm_states:
             if s is not None:
-                self.ssm_states[i] = torch.zeros_like(s)
+                s.zero_()
 
     def snapshot(self) -> dict[str, object]:
         """Copy fixed-size hybrid state; KV rollback only needs its sequence length."""
@@ -479,12 +558,18 @@ class RuntimeState:
         }
 
     def restore(self, snapshot: dict[str, object]) -> None:
-        """Restore a snapshot after speculative tokens are rejected."""
+        """Restore a snapshot after speculative tokens are rejected.
+
+        Copies out of the snapshot: mixer state is now updated in place, so
+        adopting the snapshot's tensors directly would let the next token
+        overwrite the snapshot and make a second restore read post-rollback
+        state.
+        """
         self.kv.truncate(int(snapshot["kv_len"]))
         self._token_len = int(snapshot["token_len"])
         self._mamba_ready = list(snapshot["ready"])  # type: ignore[arg-type]
-        self.conv_states = list(snapshot["conv"])  # type: ignore[arg-type]
-        self.ssm_states = list(snapshot["ssm"])  # type: ignore[arg-type]
+        self.conv_states = _clone_states(snapshot["conv"])  # type: ignore[arg-type]
+        self.ssm_states = _clone_states(snapshot["ssm"])  # type: ignore[arg-type]
 
     # --- attention passthrough ---
     def update(
@@ -498,23 +583,37 @@ class RuntimeState:
     # --- mamba ---
     def update_conv_prefill(self, layer: int, conv_state: torch.Tensor) -> None:
         """Replace conv state after a prefill (shape [B, conv_dim, kernel])."""
-        self.conv_states[layer] = conv_state.to(
-            device=self.device, dtype=self.dtype
-        )
+        self._write_state(self.conv_states, layer, conv_state, self.dtype)
         self._mamba_ready[layer] = True
 
     def update_conv_step(self, layer: int, x_t: torch.Tensor) -> torch.Tensor:
         """Roll conv cache and insert new token features. x_t: [B, 1, conv_dim]."""
         state = self.conv_states[layer]
         assert state is not None
-        state = state.roll(shifts=-1, dims=-1)
+        # In place: the buffer address has to survive a CUDA graph capture, so
+        # the rolled copy is written back instead of rebinding the slot.
+        state.copy_(state.roll(shifts=-1, dims=-1))
         state[:, :, -1] = x_t[:, 0, :].to(dtype=state.dtype)
-        self.conv_states[layer] = state
         self._mamba_ready[layer] = True
         return state
 
     def update_ssm(self, layer: int, ssm_state: torch.Tensor) -> None:
-        self.ssm_states[layer] = ssm_state.to(
-            device=self.device, dtype=self.ssm_dtype
-        )
+        self._write_state(self.ssm_states, layer, ssm_state, self.ssm_dtype)
         self._mamba_ready[layer] = True
+
+    def mark_mamba_ready(self, layer: int) -> None:
+        """Record that a kernel updated this layer's state buffer in place."""
+        self._mamba_ready[layer] = True
+
+    def _write_state(
+        self,
+        store: list[torch.Tensor | None],
+        layer: int,
+        value: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> None:
+        current = store[layer]
+        if current is not None and current.shape == value.shape:
+            current.copy_(value)
+        else:
+            store[layer] = value.to(device=self.device, dtype=dtype)

@@ -38,6 +38,7 @@ def decoder_block(
     *,
     use_rope: bool = True,
     attention_mask: torch.Tensor | None = None,
+    kv_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One scheduled layer: optional mixer residual + optional FFN residual."""
     p = f"layers.{spec.index}"
@@ -59,6 +60,7 @@ def decoder_block(
                 cache=cache,
                 use_rope=layer_rope,
                 attention_mask=attention_mask,
+                kv_mask=kv_mask,
             )
         if spec.mixer == MixerKind.MAMBA2:
             return mamba2(h, weights, layer, config, cache=cache)

@@ -164,6 +164,9 @@ def validate_name_map(
     extra = sorted(got - expected)
     # MTP extras mapped under mtp.* are allowed even if not in expected
     extra = [e for e in extra if not e.startswith("mtp.")]
+    if config.tie_word_embeddings:
+        # Several tied checkpoints (Qwen3) still ship the duplicate head.
+        extra = [e for e in extra if e != "lm_head.weight"]
     if missing:
         raise KeyError(f"missing weights after map: {missing[:12]}")
     if extra:
@@ -350,7 +353,23 @@ def count_params(state: dict[str, torch.Tensor]) -> int:
     seen: set[int] = set()
     total = 0
     for tensor in state.values():
-        ptr = tensor.data_ptr()
+        if isinstance(tensor, torch.Tensor):
+            ptr = tensor.data_ptr()
+        elif hasattr(tensor, "qweight"):
+            # Packed weight: count the logical parameters it stands in for.
+            ptr = tensor.qweight.data_ptr()
+        elif isinstance(tensor, dict):
+            # Stacked MoE experts, keyed by layer then projection. Either dense
+            # blocks or packed ones, depending on whether quantization ran.
+            for block in tensor.values():
+                for value in block.values():
+                    inner = getattr(value, "qweight", value)
+                    if inner.data_ptr() not in seen:
+                        seen.add(inner.data_ptr())
+                        total += value.numel()
+            continue
+        else:
+            continue
         if ptr in seen:
             continue
         seen.add(ptr)
@@ -368,13 +387,69 @@ def _cast_one(
     return tensor.to(device=device, dtype=dtype)
 
 
+def _pack_in_place(
+    state: dict[str, object],
+    name: str,
+    *,
+    kind: str,
+    group_size: int,
+    min_numel: int | None = None,
+) -> None:
+    """Replace one just-loaded tensor with its packed form, freeing the dense copy."""
+    from engine.quantize import MIN_QUANT_NUMEL, eligible_for_quant, group_for_quant
+    from engine.qweight import quantize
+
+    tensor = state.get(name)
+    floor = MIN_QUANT_NUMEL if min_numel is None else int(min_numel)
+    if not isinstance(tensor, torch.Tensor) or not eligible_for_quant(name, tensor, floor):
+        return
+    group = group_for_quant(kind, int(tensor.shape[1]), group_size)
+    if group is None:
+        return
+    packed = (
+        quantize(tensor, kind) if kind == "fp8" else quantize(tensor, kind, group_size=group)
+    )
+    state[name] = packed
+    del tensor
+
+
+def checkpoint_numel(model_dir: str | Path) -> int:
+    """Total elements in the checkpoint, read from shard headers only.
+
+    Safetensors keeps its metadata at the head of the file, so this costs a few
+    kilobytes of IO instead of a load, which is what makes it usable as a
+    preflight check before committing to a 60 GB model.
+    """
+    from safetensors import safe_open
+
+    total = 0
+    for shard in _shard_paths(Path(model_dir)):
+        with safe_open(str(shard), framework="pt") as f:
+            for key in f.keys():
+                shape = f.get_slice(key).get_shape()
+                count = 1
+                for dim in shape:
+                    count *= int(dim)
+                total += count
+    return total
+
+
 def load_weights(
     model_dir: str | Path,
     config: ModelConfig,
     device: str | torch.device = "cuda",
     dtype: str | torch.dtype | None = None,
+    quant: str | None = None,
+    quant_group: int = 128,
+    quant_min_numel: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Deserialize shard-by-shard onto device so we do not hold a CPU+GPU copy."""
+    """Deserialize shard-by-shard onto device so we do not hold a CPU+GPU copy.
+
+    With ``quant`` set, each tensor is packed as it arrives and the dense copy is
+    dropped immediately, so peak memory tracks the packed model plus one shard
+    rather than the full BF16 checkpoint. That is the difference between a 30B
+    model fitting on the Spark and the whole box swapping.
+    """
     model_dir = Path(model_dir)
     device = torch.device(device)
     if dtype is None:
@@ -419,6 +494,14 @@ def load_weights(
                 raise RuntimeError(f"name map collision on {engine_name}")
             tensor = _maybe_transpose(engine_name, tensor, config)
             state[engine_name] = _cast_one(engine_name, tensor, dtype, device)
+            if quant:
+                _pack_in_place(
+                    state,
+                    engine_name,
+                    kind=quant,
+                    group_size=quant_group,
+                    min_numel=quant_min_numel,
+                )
         del piece
 
     validate_shapes(config, state)
