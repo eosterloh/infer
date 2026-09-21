@@ -52,6 +52,8 @@ __global__ void attn_decode_split_kernel(
     Strides vs,
     int head_dim,
     int kv_len,
+    int kv_begin,
+    int mask_stride,
     int group,
     int splits,
     int chunk,
@@ -72,12 +74,14 @@ __global__ void attn_decode_split_kernel(
 
   const T* qp = q + batch * qs.b + head * qs.h;
   float q_reg[kMaxPerLane];
-  int held = 0;
-  for (int i = lane; i < head_dim; i += kWarpSize) {
-    q_reg[held++] = load_as_float(qp + i);
+  for (int i = lane, c = 0; i < head_dim; i += kWarpSize, ++c) {
+    q_reg[c] = load_as_float(qp + i);
   }
 
-  int begin = split * chunk;
+  // The splits cover [kv_begin, kv_len), which is the window on a windowed
+  // layer: chunking the whole cache would leave every block outside it with
+  // nothing to do and this one carrying the window alone.
+  int begin = kv_begin + split * chunk;
   int end = min(begin + chunk, kv_len);
   if (window > 0) {
     // A windowed layer keeps the last `window` keys; the query is the newest.
@@ -93,7 +97,7 @@ __global__ void attn_decode_split_kernel(
   }
 
   for (int t = begin + warp; t < end; t += kWarpsPerBlock) {
-    if (kv_mask != nullptr && !kv_mask[batch * kv_len + t]) {
+    if (kv_mask != nullptr && !kv_mask[static_cast<int64_t>(batch) * mask_stride + t]) {
       continue;
     }
     const T* kp = k + batch * ks.b + kv_head * ks.h + static_cast<int64_t>(t) * ks.s;
@@ -263,18 +267,29 @@ at::Tensor attn_decode_cuda(
     return out;
   }
 
-  const int splits = pick_splits(kv_len, batch * heads);
-  const int chunk = static_cast<int>((kv_len + splits - 1) / splits);
+  // A windowed layer only ever reads the last `window` keys, so the splits are
+  // sized against that and not against the whole cache.
+  const int64_t eff_len = (window > 0 && window < kv_len) ? window : kv_len;
+  const int splits = pick_splits(eff_len, batch * heads);
+  const int chunk = static_cast<int>((eff_len + splits - 1) / splits);
+  const int kv_begin = static_cast<int>(kv_len - eff_len);
   auto fopts = q.options().dtype(at::kFloat);
   auto part_out = at::empty({batch, heads, splits, head_dim}, fopts);
   auto part_m = at::empty({batch, heads, splits}, fopts);
   auto part_l = at::empty({batch, heads, splits}, fopts);
 
   const bool* mask_ptr = nullptr;
+  int mask_stride = 0;
   if (kv_mask.has_value() && kv_mask->defined()) {
     TORCH_CHECK(kv_mask->scalar_type() == at::kBool, "kv_mask must be bool");
     TORCH_CHECK(kv_mask->size(-1) == kv_len, "kv_mask length mismatch");
     TORCH_CHECK(kv_mask->is_contiguous(), "kv_mask must be contiguous");
+    // The CPU reference views the mask as [-1, 1, 1, L], so one row broadcasts
+    // over the batch; the graph path builds exactly that single-row mask.
+    const int64_t mask_rows = kv_mask->numel() / kv_len;
+    TORCH_CHECK(mask_rows == batch || mask_rows == 1,
+                "kv_mask needs one row per batch or exactly one, got ", mask_rows);
+    mask_stride = (mask_rows == 1) ? 0 : static_cast<int>(kv_len);
     mask_ptr = kv_mask->data_ptr<bool>();
   }
   const float* sink_ptr = nullptr;
@@ -301,7 +316,8 @@ at::Tensor attn_decode_cuda(
         attn_decode_split_kernel<T><<<grid, kThreadsPerBlock, smem, stream>>>(
             q.data_ptr<T>(), k.data_ptr<T>(), v.data_ptr<T>(), mask_ptr,
             part_out.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            qs, ks, vs, head_dim, kv_len, group, splits, chunk, window, scale, softcap);
+            qs, ks, vs, head_dim, kv_len, kv_begin, mask_stride, group, splits, chunk,
+            window, scale, softcap);
         attn_decode_combine_kernel<T><<<dim3(heads, batch), kThreadsPerBlock, 0, stream>>>(
             part_out.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
             sink_ptr, out.data_ptr<T>(), os, head_dim, splits);
@@ -311,7 +327,8 @@ at::Tensor attn_decode_cuda(
         attn_decode_split_kernel<T><<<grid, kThreadsPerBlock, smem, stream>>>(
             q.data_ptr<T>(), k.data_ptr<T>(), v.data_ptr<T>(), mask_ptr,
             part_out.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            qs, ks, vs, head_dim, kv_len, group, splits, chunk, window, scale, softcap);
+            qs, ks, vs, head_dim, kv_len, kv_begin, mask_stride, group, splits, chunk,
+            window, scale, softcap);
         attn_decode_combine_kernel<T><<<dim3(heads, batch), kThreadsPerBlock, 0, stream>>>(
             part_out.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
             sink_ptr, out.data_ptr<T>(), os, head_dim, splits);
@@ -321,11 +338,13 @@ at::Tensor attn_decode_cuda(
         attn_decode_split_kernel<T><<<grid, kThreadsPerBlock, smem, stream>>>(
             q.data_ptr<T>(), k.data_ptr<T>(), v.data_ptr<T>(), mask_ptr,
             part_out.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
-            qs, ks, vs, head_dim, kv_len, group, splits, chunk, window, scale, softcap);
+            qs, ks, vs, head_dim, kv_len, kv_begin, mask_stride, group, splits, chunk,
+            window, scale, softcap);
         attn_decode_combine_kernel<T><<<dim3(heads, batch), kThreadsPerBlock, 0, stream>>>(
             part_out.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
             sink_ptr, out.data_ptr<T>(), os, head_dim, splits);
       }));
+  AT_CUDA_CHECK(cudaGetLastError());
   return out;
 }
 

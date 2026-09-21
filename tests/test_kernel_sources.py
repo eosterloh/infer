@@ -11,11 +11,17 @@ the Spark, where every failed build is a round trip.
 from __future__ import annotations
 
 import re
+from itertools import product
 from pathlib import Path
 
 import pytest
 
-from engine.kernels import _CUDA_SOURCES
+from engine.kernels import (
+    _CUDA_SOURCES,
+    _MAX_ROUTED_ROWS,
+    _SCAN_D_PER_WARP,
+    _SCAN_N_PER_LANE,
+)
 
 CSRC = Path(__file__).resolve().parents[1] / "engine" / "kernels" / "csrc"
 OPS = (CSRC / "ops.cpp").read_text()
@@ -112,6 +118,27 @@ def test_every_source_file_is_compiled() -> None:
     assert on_disk == set(_CUDA_SOURCES), (
         f"sources on disk {sorted(on_disk)} != compiled {sorted(_CUDA_SOURCES)}"
     )
+
+
+def test_scan_eligibility_matches_the_instantiated_kernels() -> None:
+    """A ratio the wrapper allows but mamba.cu never instantiates throws inside
+    the op, and the wrapper turns that into a silent fall back to the Python
+    scan the kernel exists to replace."""
+    instantiated = {
+        (int(d), int(n))
+        for d, n in re.findall(
+            r"INFER_SCAN_CASE\((\d+),\s*(\d+)\)", (CSRC / "mamba.cu").read_text()
+        )
+    }
+    assert instantiated == set(product(_SCAN_D_PER_WARP, _SCAN_N_PER_LANE))
+
+
+def test_routed_row_cap_is_mirrored_in_the_kernels() -> None:
+    """Past gridDim.y's limit the launch fails, so the wrapper has to bail on
+    the same bound the kernels check."""
+    for name in ("moe.cu", "quant_gemv.cu"):
+        text = (CSRC / name).read_text()
+        assert f"m_rows <= {_MAX_ROUTED_ROWS}" in text, f"{name} does not cap routed rows"
 
 
 def test_every_op_is_reachable_from_python() -> None:

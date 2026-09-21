@@ -212,6 +212,7 @@ at::Tensor mamba2_scan_cuda(
   TORCH_CHECK(state.is_contiguous(), "state must be contiguous");
 
   const at::cuda::OptionalCUDAGuard guard(at::device_of(x));
+  const int batch = static_cast<int>(x.size(0));
   const int seq = static_cast<int>(x.size(1));
   const int n_heads = static_cast<int>(x.size(2));
   const int head_dim = static_cast<int>(x.size(3));
@@ -220,6 +221,18 @@ at::Tensor mamba2_scan_cuda(
   TORCH_CHECK(head_dim % kScanWarps == 0, "head_dim must be a multiple of 8");
   TORCH_CHECK(state_size % kWarpSize == 0, "state_size must be a multiple of 32");
   TORCH_CHECK(n_heads % n_groups == 0, "heads must divide evenly into groups");
+  // The state offset is built from x and b_mat, so a state of any other shape
+  // is written past its end.
+  TORCH_CHECK(
+      state.size(0) == batch && state.size(1) == n_heads && state.size(2) == head_dim &&
+          state.size(3) == state_size,
+      "mamba2_scan: state must be [B, H, D, N]");
+  TORCH_CHECK(
+      dt_raw.numel() == static_cast<int64_t>(batch) * seq * n_heads,
+      "mamba2_scan: dt_raw must be [B, S, H]");
+  TORCH_CHECK(
+      dt_bias.numel() == n_heads && a_log.numel() == n_heads && d_skip.numel() == n_heads,
+      "mamba2_scan: dt_bias, a_log and d_skip are indexed per head");
 
   auto y = at::empty_like(x);
   if (x.scalar_type() == at::kBFloat16) {

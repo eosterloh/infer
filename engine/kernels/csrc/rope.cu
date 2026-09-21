@@ -82,6 +82,9 @@ void rope_inplace_cuda(
   TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1, "rope_inplace needs a contiguous head dim");
   TORCH_CHECK(q.scalar_type() == k.scalar_type(), "rope_inplace dtype mismatch");
   TORCH_CHECK(cos.scalar_type() == q.scalar_type(), "rope_inplace cos dtype mismatch");
+  // cos's strides index both tables, so sin has to have cos's exact shape.
+  TORCH_CHECK(sin.sizes() == cos.sizes() && sin.scalar_type() == cos.scalar_type(),
+              "rope_inplace sin must match cos");
   TORCH_CHECK(q.size(0) == k.size(0) && q.size(2) == k.size(2), "rope_inplace batch/seq mismatch");
   TORCH_CHECK(q.size(3) == k.size(3), "rope_inplace head_dim mismatch");
 

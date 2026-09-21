@@ -32,6 +32,16 @@ _CUDA_SOURCES = (
     "gdn.cu",
 )
 
+# The scan kernel is instantiated for these ratios only; see the
+# INFER_SCAN_CASE list in csrc/mamba.cu. Anything else hard-errors inside the
+# op, which this wrapper would then swallow into the slow Python scan.
+_SCAN_D_PER_WARP = (1, 2, 4, 8, 16)
+_SCAN_N_PER_LANE = (1, 2, 4)
+
+# A routed row becomes gridDim.y in the MoE kernels, which the hardware caps
+# at 65535; the .cu files check the same bound.
+_MAX_ROUTED_ROWS = 65535
+
 
 def _extension_dir() -> Path:
     return Path(__file__).resolve().parent
@@ -317,6 +327,8 @@ def moe_gemv(
         return None
     if not x.is_contiguous() or not w.is_contiguous():
         return None
+    if row_expert.numel() > _MAX_ROUTED_ROWS:
+        return None
     try:
         return ops.moe_gemv(x, w, row_expert.to(torch.int32), row_input, bias)
     except Exception:
@@ -340,6 +352,8 @@ def qmoe_gemv(
     if getattr(qw, "expert_cols", 0) <= 0 or x.shape[-1] != qw.in_features:
         return None
     if x.dtype not in (torch.bfloat16, torch.float16) or qw.in_features % 64:
+        return None
+    if row_expert.numel() > _MAX_ROUTED_ROWS:
         return None
     try:
         from engine.qweight import _KIND_CODE
@@ -404,7 +418,7 @@ def mamba2_scan(
     head_dim, state_size = x.shape[-1], b_mat.shape[-1]
     if head_dim % 8 or state_size % 32:
         return None
-    if not 1 <= head_dim // 8 <= 16 or not 1 <= state_size // 32 <= 4:
+    if head_dim // 8 not in _SCAN_D_PER_WARP or state_size // 32 not in _SCAN_N_PER_LANE:
         return None
     if not (x.is_contiguous() and b_mat.is_contiguous() and c_mat.is_contiguous()):
         return None

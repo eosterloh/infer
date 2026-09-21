@@ -114,6 +114,8 @@ at::Tensor moe_gemv_cuda(
   const int64_t n_cols = w.size(1);
   const int64_t k_dim = w.size(2);
   TORCH_CHECK(x.size(1) == k_dim, "activation width does not match expert K");
+  // One routed row per gridDim.y, which the hardware caps at 65535.
+  TORCH_CHECK(m_rows <= 65535, "moe_gemv handles at most 65535 routed rows, got ", m_rows);
 
   auto out = at::empty({m_rows, n_cols}, x.options());
   const int threads = 256;

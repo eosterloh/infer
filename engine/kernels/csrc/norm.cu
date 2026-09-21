@@ -304,6 +304,7 @@ at::Tensor rms_norm_cuda(
               x_ptr, w_ptr, o_ptr, hidden, eps_f, offset_f);
         }
       }));
+  AT_CUDA_CHECK(cudaGetLastError());
   return out;
 }
 
@@ -387,6 +388,7 @@ void fused_add_rms_norm_cuda(
               x_ptr, r_ptr, w_ptr, hidden, eps_f, offset_f);
         }
       }));
+  AT_CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace infer

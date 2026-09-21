@@ -70,6 +70,37 @@ __global__ void gemv_kernel(
   }
 }
 
+// A row base that is not 16-byte aligned cannot be read as Vec<T, 8>: the
+// 128-bit load faults, and a misaligned-address fault is sticky for the rest
+// of the context. Widths that are not a whole number of vectors land here.
+template <typename T, int WARPS>
+__global__ void gemv_scalar_kernel(
+    const T* __restrict__ w,
+    const T* __restrict__ x,
+    const T* __restrict__ bias,
+    T* __restrict__ y,
+    int n,
+    int k) {
+  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int warp = threadIdx.x >> 5;
+  const int row = blockIdx.x * WARPS + warp;
+  if (row >= n) {
+    return;
+  }
+  float acc = 0.0f;
+  for (int t = lane; t < k; t += kWarpSize) {
+    acc += static_cast<float>(w[static_cast<int64_t>(row) * k + t]) *
+           static_cast<float>(x[t]);
+  }
+  acc = warp_reduce_sum(acc);
+  if (lane == 0) {
+    if (bias != nullptr) {
+      acc += static_cast<float>(bias[row]);
+    }
+    y[row] = static_cast<T>(acc);
+  }
+}
+
 template <typename T>
 static void launch_gemv(
     const T* w,
@@ -78,10 +109,15 @@ static void launch_gemv(
     T* y,
     int n,
     int k,
+    bool use_vec,
     cudaStream_t stream) {
   constexpr int kWarps = 4;
   const int threads = kWarps * kWarpSize;
   const int blocks = (n + kWarps - 1) / kWarps;
+  if (!use_vec) {
+    gemv_scalar_kernel<T, kWarps><<<blocks, threads, 0, stream>>>(w, x, bias, y, n, k);
+    return;
+  }
   const int vectors = k / kGemvVec;
   if (vectors >= 4 * kWarpSize) {
     gemv_kernel<T, kWarps, 4><<<blocks, threads, 0, stream>>>(w, x, bias, y, n, k);
@@ -110,6 +146,9 @@ at::Tensor gemv_cuda(
   sizes.back() = n;
   auto out = at::empty(sizes, x.options());
   auto stream = at::cuda::getCurrentCUDAStream();
+  // Every row base is w + row * k, so k itself has to be a whole number of
+  // vectors for the vector path to stay aligned past row 0.
+  const bool use_vec = vectorizable(weight, k, kGemvVec) && vectorizable(xc, k, kGemvVec);
   const at::Tensor* b = bias.has_value() ? &bias.value() : nullptr;
   if (b != nullptr) {
     TORCH_CHECK(b->numel() == n, "gemv bias size mismatch");
@@ -128,6 +167,7 @@ at::Tensor gemv_cuda(
             out.data_ptr<T>(),
             static_cast<int>(n),
             static_cast<int>(k),
+            use_vec,
             stream);
       })
       AT_DISPATCH_CASE(at::kHalf, [&] {
@@ -139,6 +179,7 @@ at::Tensor gemv_cuda(
             out.data_ptr<T>(),
             static_cast<int>(n),
             static_cast<int>(k),
+            use_vec,
             stream);
       }));
   return out;

@@ -517,9 +517,9 @@ void launch_dequant(
 
   // Vector path: eight columns per thread, which needs a width that divides by
   // eight and groups that do not split a vector.
-  const bool vectorizable =
+  const bool use_vec =
       a.k_dim % 8 == 0 && (KIND == kQuantFp8 || a.group_size % 8 == 0);
-  if (vectorizable) {
+  if (use_vec) {
     int shift = -1;
     for (int bit = 0; bit < 31; ++bit) {
       if ((int64_t{1} << bit) == a.group_size) {
@@ -596,6 +596,9 @@ at::Tensor qgemv_cuda(
   args.scales_u8 = nullptr;
   if (kind == kQuantNvfp4) {
     TORCH_CHECK(scales.has_value(), "nvfp4 needs block scales");
+    // The reinterpret_cast below bypasses the dtype check data_ptr<uint8_t>()
+    // would have made, so the bytes have to be checked here.
+    TORCH_CHECK(scales->scalar_type() == at::kByte, "nvfp4 block scales must be uint8");
     args.scales_u8 = reinterpret_cast<const uint8_t*>(scales->data_ptr());
   }
   args.channel_scale = (channel_scale.has_value() && channel_scale->defined())
@@ -639,6 +642,8 @@ at::Tensor qmoe_gemv_cuda(
   const at::cuda::OptionalCUDAGuard guard(at::device_of(x));
   auto x_c = x.contiguous();
   const int64_t m_rows = row_expert.numel();
+  // One routed row per gridDim.y, which the hardware caps at 65535.
+  TORCH_CHECK(m_rows <= 65535, "qmoe_gemv handles at most 65535 routed rows, got ", m_rows);
   auto out = at::empty({m_rows, expert_cols}, x_c.options());
   if (m_rows == 0) {
     return out;
@@ -646,9 +651,12 @@ at::Tensor qmoe_gemv_cuda(
 
   QuantArgs args;
   args.qweight = reinterpret_cast<const uint8_t*>(qweight.data_ptr());
-  args.scales_u8 = (kind == kQuantNvfp4)
-                       ? reinterpret_cast<const uint8_t*>(scales->data_ptr())
-                       : nullptr;
+  args.scales_u8 = nullptr;
+  if (kind == kQuantNvfp4) {
+    TORCH_CHECK(scales.has_value(), "nvfp4 needs block scales");
+    TORCH_CHECK(scales->scalar_type() == at::kByte, "nvfp4 block scales must be uint8");
+    args.scales_u8 = reinterpret_cast<const uint8_t*>(scales->data_ptr());
+  }
   args.channel_scale = (channel_scale.has_value() && channel_scale->defined())
                            ? channel_scale->data_ptr<float>()
                            : nullptr;
@@ -687,9 +695,12 @@ at::Tensor dequant_cuda(
 
   QuantArgs args;
   args.qweight = reinterpret_cast<const uint8_t*>(qweight.data_ptr());
-  args.scales_u8 = (kind == kQuantNvfp4)
-                       ? reinterpret_cast<const uint8_t*>(scales->data_ptr())
-                       : nullptr;
+  args.scales_u8 = nullptr;
+  if (kind == kQuantNvfp4) {
+    TORCH_CHECK(scales.has_value(), "nvfp4 needs block scales");
+    TORCH_CHECK(scales->scalar_type() == at::kByte, "nvfp4 block scales must be uint8");
+    args.scales_u8 = reinterpret_cast<const uint8_t*>(scales->data_ptr());
+  }
   args.channel_scale = (channel_scale.has_value() && channel_scale->defined())
                            ? channel_scale->data_ptr<float>()
                            : nullptr;

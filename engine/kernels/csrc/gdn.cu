@@ -93,12 +93,15 @@ at::Tensor gdn_decode_cuda(
   TORCH_CHECK(q.is_cuda() && state.is_cuda(), "gdn_decode expects CUDA tensors");
   TORCH_CHECK(q.scalar_type() == at::kFloat && state.scalar_type() == at::kFloat,
               "gdn_decode is fp32");
-  TORCH_CHECK(q.dim() == 3 && state.dim() == 4, "gdn_decode shape");
+  TORCH_CHECK(q.dim() == 3 && v.dim() == 3 && state.dim() == 4, "gdn_decode shape");
   const int64_t batch = q.size(0);
   const int64_t heads = q.size(1);
   const int64_t k_dim = q.size(2);
   const int64_t v_dim = v.size(2);
   TORCH_CHECK(k.sizes() == q.sizes(), "gdn_decode q/k mismatch");
+  TORCH_CHECK(v.size(0) == batch && v.size(1) == heads, "gdn_decode q/v mismatch");
+  TORCH_CHECK(g_log.numel() == batch * heads && beta.numel() == batch * heads,
+              "gdn_decode gates must be [B, H]");
   TORCH_CHECK(state.size(0) == batch && state.size(1) == heads, "gdn_decode state batch");
   TORCH_CHECK(state.size(2) == k_dim && state.size(3) == v_dim, "gdn_decode state dims");
   TORCH_CHECK(v_dim <= 1024, "gdn_decode v_dim > 1024");
