@@ -247,3 +247,30 @@ def test_memory_floor_stops_a_load_before_the_pool_runs_out(
     monkeypatch.setenv("INFER_MEM_FLOOR_GB", "6")
     monkeypatch.setattr(memory, "available_bytes", lambda: None)
     memory.check_floor("unknown platform")
+
+
+def test_fused_path_chunks_past_the_kernels_row_budget() -> None:
+    """The row cap is a measured choice, not the kernel's register count."""
+    from engine.qweight import KERNEL_ROW_LIMIT, fused_qlinear, python_dequantize, quantize
+
+    torch.manual_seed(4)
+    w = torch.randn(320, 512, dtype=torch.bfloat16) * 0.02
+    for kind, group in (("int4", 128), ("nvfp4", 16), ("fp8", 512)):
+        qw = quantize(w, kind=kind, group_size=group)
+        dense = python_dequantize(qw).to(torch.bfloat16)
+        for shape in ((1, 512), (KERNEL_ROW_LIMIT, 512), (KERNEL_ROW_LIMIT * 4 + 1, 512), (2, 7, 512)):
+            x = torch.randn(*shape, dtype=torch.bfloat16)
+            got = fused_qlinear(x, qw)
+            assert got is not None, (kind, shape)
+            want = torch.nn.functional.linear(x, dense)
+            assert got.shape == want.shape
+            scale = want.float().abs().max().item()
+            assert (got.float() - want.float()).abs().max().item() / scale < 2e-2
+
+
+def test_fused_path_declines_shapes_it_cannot_pack() -> None:
+    from engine.qweight import fused_qlinear, quantize
+
+    qw = quantize(torch.randn(64, 512, dtype=torch.bfloat16) * 0.02, kind="int4", group_size=128)
+    assert fused_qlinear(torch.randn(4, 256, dtype=torch.bfloat16), qw) is None  # wrong width
+    assert fused_qlinear(torch.randn(4, 512, dtype=torch.float32), qw) is None  # wrong dtype

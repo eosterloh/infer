@@ -423,13 +423,53 @@ def bits_per_weight(kind: str) -> float:
     return _BITS[kind]
 
 
+# Rows the kernel itself can hold: each lane keeps one accumulator per row, so
+# past this the register file, not the algorithm, is the limit.
+KERNEL_ROW_LIMIT = 32
+
+
 def _max_fused_rows() -> int:
-    """Rows the fused GEMV keeps; INFER_QGEMV_MAX_ROWS to sweep the crossover."""
+    """Rows the fused path keeps; INFER_QGEMV_MAX_ROWS to sweep the crossover."""
     try:
         rows = int(os.environ.get("INFER_QGEMV_MAX_ROWS", "32"))
     except ValueError:
-        return 32
-    return max(0, min(rows, 32))
+        return KERNEL_ROW_LIMIT
+    return max(0, min(rows, 4096))
+
+
+def fused_qlinear(x: torch.Tensor, qw: "QuantWeight") -> torch.Tensor | None:
+    """``x @ w.T`` straight from the packed bytes, or None for shapes it cannot do.
+
+    Above the kernel's register budget this walks the rows in chunks, which reads
+    the packed weight once per chunk. That is the same total arithmetic a wider
+    kernel would do and a fraction of the traffic the unpack path pays, so where
+    the two meet stays a question for measurement rather than a register count.
+    """
+    ops = _ops()
+    if (
+        ops is None
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or x.shape[-1] != qw.in_features
+        or qw.in_features % 64 != 0
+    ):
+        return None
+    flat = x.reshape(-1, x.shape[-1])
+    rows = flat.shape[0]
+    args = (
+        qw.qweight, qw.scales, qw.zeros, qw.channel_scale, _KIND_CODE[qw.kind],
+        qw.group_size, qw.out_features, qw.in_features, float(qw.global_scale),
+    )
+    try:
+        if rows <= KERNEL_ROW_LIMIT:
+            out = ops.qgemv(flat, *args)
+        else:
+            out = torch.empty(rows, qw.out_features, device=x.device, dtype=x.dtype)
+            for start in range(0, rows, KERNEL_ROW_LIMIT):
+                stop = min(start + KERNEL_ROW_LIMIT, rows)
+                out[start:stop] = ops.qgemv(flat[start:stop], *args)
+    except Exception:
+        return None
+    return out.reshape(*x.shape[:-1], qw.out_features)
 
 
 def qlinear(
@@ -450,34 +490,10 @@ def qlinear(
     512 tokens over 128 experts at top-8 is 32 rows each, so the MoE prefill
     stops dequantizing entirely.
     """
-    ops = _ops()
     rows = x.numel() // x.shape[-1]
-    if (
-        ops is not None
-        and qw.qweight.is_cuda
-        and x.is_cuda
-        and rows <= _max_fused_rows()
-        and x.dtype in (torch.bfloat16, torch.float16)
-        and x.shape[-1] == qw.in_features
-        and qw.in_features % 64 == 0
-    ):
-        try:
-            out = ops.qgemv(
-                x,
-                qw.qweight,
-                qw.scales,
-                qw.zeros,
-                qw.channel_scale,
-                _KIND_CODE[qw.kind],
-                qw.group_size,
-                qw.out_features,
-                qw.in_features,
-                float(qw.global_scale),
-            )
-            if bias is not None:
-                out = out + bias
-            return out
-        except Exception:
-            pass
+    if qw.qweight.is_cuda and x.is_cuda and rows <= _max_fused_rows():
+        out = fused_qlinear(x, qw)
+        if out is not None:
+            return out if bias is None else out + bias
     weight = qw.dequantize(out_dtype=x.dtype)
     return torch.nn.functional.linear(x, weight, bias)

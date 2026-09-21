@@ -36,7 +36,7 @@ if str(ROOT) not in sys.path:
 
 from engine.kernels import load_extension  # noqa: E402
 from engine.quantize import group_for_quant  # noqa: E402
-from engine.qweight import quantize  # noqa: E402
+from engine.qweight import fused_qlinear, quantize  # noqa: E402
 
 SHAPES = [
     ("llama8b q", 4096, 4096),
@@ -70,28 +70,12 @@ def timed(fn, iters: int, warmup: int = 5) -> float:
 
 
 def _fused(x: torch.Tensor, qw) -> torch.Tensor | None:
-    """qlinear's fused branch, whatever the current row cap says."""
-    from engine.kernels import _ops
-    from engine.qweight import _KIND_CODE
+    """The packed path exactly as production runs it, row cap ignored.
 
-    ops = _ops()
-    if ops is None:
-        return None
-    try:
-        return ops.qgemv(
-            x,
-            qw.qweight,
-            qw.scales,
-            qw.zeros,
-            qw.channel_scale,
-            _KIND_CODE[qw.kind],
-            qw.group_size,
-            qw.out_features,
-            qw.in_features,
-            float(qw.global_scale),
-        )
-    except Exception:
-        return None
+    Past the kernel's 32-row register budget this chunks, so the sweep can ask
+    what 64 or 512 rows would cost instead of stopping where the kernel does.
+    """
+    return fused_qlinear(x, qw)
 
 
 def _dequant_then_blas(x: torch.Tensor, qw) -> torch.Tensor:
@@ -179,8 +163,8 @@ def main() -> int:
         for name, rows in crossovers:
             print(f"crossover  {name}: fused holds through {rows} rows")
         worst = min(rows for _, rows in crossovers)
-        cap = max(1, min(worst, 32))
-        print(f"\nset INFER_QGEMV_MAX_ROWS={cap} (the kernel caps at 32)")
+        cap = max(1, worst)
+        print(f"\nset INFER_QGEMV_MAX_ROWS={cap}")
         if worst >= max(rows_list):
             print("fused won everywhere measured; raise --rows to find the edge")
     print(

@@ -130,7 +130,7 @@ Knobs, all off-by-default unless noted:
 | `INFER_CUDA_GRAPH=1` | capture and replay the decode step |
 | `INFER_QUANT=int4\|nvfp4\|fp8` | pack weights while loading (`INFER_QUANT_GROUP`, `INFER_QUANT_MIN_NUMEL`) |
 | `INFER_MOE_STACK=0` | keep per-expert tensors instead of one `[E, N, K]` block (default on) |
-| `INFER_QGEMV_MAX_ROWS` | rows the fused packed GEMV keeps before unpacking wins (default 32, max 32) |
+| `INFER_QGEMV_MAX_ROWS` | rows the fused packed GEMV keeps before unpacking wins (default 32; above 32 it chunks) |
 | `INFER_MOE_FUSED_ROWS_PER_EXPERT` | rows per expert above which prefill leaves the grouped GEMV (default 2) |
 | `INFER_MEM_FLOOR_GB` | abort a load with this much of the pool left (default 6, `0` disables) |
 | `INFER_SKIP_PREFLIGHT=1` | load anyway when the size estimate says it will not fit |
