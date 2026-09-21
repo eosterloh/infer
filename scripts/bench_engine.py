@@ -28,8 +28,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from engine import kernels  # noqa: E402
 from engine.agent_api import load_engine  # noqa: E402
+
+try:  # The pre-kernel revision has no extension; this script benchmarks it too.
+    from engine import kernels
+except ImportError:
+    kernels = None
 
 FINGERPRINT_PROMPT = "The capital of France is Paris, and the capital of Italy is"
 
@@ -142,9 +146,8 @@ def main() -> int:
         os.environ["INFER_CUDA_GRAPH"] = "1"
 
     t_load = time.perf_counter()
-    engine = load_engine(
-        args.model, device=args.device, dtype=args.dtype, quant=args.quant
-    )
+    extra = {"quant": args.quant} if args.quant else {}
+    engine = load_engine(args.model, device=args.device, dtype=args.dtype, **extra)
     load_s = time.perf_counter() - t_load
     model = engine.model
 
@@ -172,10 +175,10 @@ def main() -> int:
         "model": args.model.name,
         "model_dir": str(args.model),
         "recipe": model.config.recipe_id,
-        "params": engine.n_params,
+        "params": getattr(engine, "n_params", None),
         "quant": args.quant,
         "graph": bool(args.graph),
-        "kernels": bool(kernels.available()),
+        "kernels": bool(kernels is not None and kernels.available()),
         "dtype": str(model.dtype),
         "device": str(model.device),
         "load_seconds": round(load_s, 2),

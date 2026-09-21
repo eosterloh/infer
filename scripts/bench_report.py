@@ -42,14 +42,56 @@ def _ids(row: dict) -> list[int] | None:
     return fp.get("greedy_ids") if fp else None
 
 
-def _verdict(base: dict, new: dict) -> str:
+def _tolerance(logits: list[float]) -> float:
+    """What counts as the same logit in BF16.
+
+    Reassociating a reduction moves a logit a little, and the kernels do exactly
+    that — an fp32 accumulator over a different order of the same terms. The
+    allowance scales with magnitude because the error does.
+    """
+    return 0.05 + 0.01 * max((abs(v) for v in logits), default=0.0)
+
+
+def _logit_delta(base: dict, new: dict) -> float | None:
+    """Largest gap between the two runs' top-5 logits, or None if incomparable."""
+    fa, fb = base.get("fingerprint"), new.get("fingerprint")
+    if not fa or not fb:
+        return None
+    ids_a, ids_b = fa.get("top5_ids"), fb.get("top5_ids")
+    la, lb = fa.get("top5_logits"), fb.get("top5_logits")
+    if not ids_a or not ids_b or not la or not lb:
+        return None
+    if set(ids_a) != set(ids_b):
+        return float("inf")
+    by_id = dict(zip(ids_b, lb))
+    return max(abs(value - by_id[token]) for token, value in zip(ids_a, la))
+
+
+def _verdict(base: dict, new: dict) -> tuple[str, bool]:
+    """A label for the table, and whether it should fail the run.
+
+    The gate is the first token and the logits behind it, not the whole greedy
+    chain. A 16-token chain amplifies one near-tie into total divergence, so
+    holding a kernel to an exact chain match would fail on arithmetic that is
+    within BF16 noise. A wrong kernel does not sit inside that noise.
+    """
     a, b = _ids(base), _ids(new)
     if a is None or b is None:
-        return "no fingerprint"
+        return "no fingerprint", False
+    delta = _logit_delta(base, new)
+    tol = _tolerance(base.get("fingerprint", {}).get("top5_logits") or [])
+    if delta is None:
+        return "no logits", False
+    if delta == float("inf"):
+        return "DIFFERS (top-5 set changed)", True
+    if a[0] != b[0]:
+        return f"DIFFERS (first token, Δlogit {delta:.3f})", True
+    if delta > tol:
+        return f"DIFFERS (Δlogit {delta:.3f} > {tol:.3f})", True
     if a == b:
-        return "same"
+        return f"same (Δlogit {delta:.3f})", False
     common = sum(1 for x, y in zip(a, b) if x == y)
-    return f"DIFFERS (first {common}/{len(a)} match)"
+    return f"same head, chain splits at {common}/{len(a)} (Δlogit {delta:.3f})", False
 
 
 def main() -> int:
@@ -98,10 +140,10 @@ def main() -> int:
                 continue
             d_gain = row["decode_tok_s"] / b["decode_tok_s"]
             p_gain = row["prefill_tok_s"] / b["prefill_tok_s"]
-            verdict = _verdict(b, row)
+            verdict, bad = _verdict(b, row)
             # Quantization changes the weights, so its output is expected to
             # move; a kernel or a captured graph has no such excuse.
-            if verdict.startswith("DIFFERS") and not row.get("quant"):
+            if bad and not row.get("quant"):
                 drifted.append(f"{tag}/{model}: {verdict}")
             lines.append(
                 f"| {model} | {row.get('params', 0) / 1e9:.2f}B "
