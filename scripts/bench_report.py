@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +58,11 @@ def main() -> int:
     p.add_argument("--baseline", default="baseline")
     p.add_argument("--tag", action="append", default=None, help="repeatable")
     p.add_argument("--out", type=Path, default=None)
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit non-zero if any tag changed a model's greedy output",
+    )
     args = p.parse_args()
 
     rows = load(args.results)
@@ -66,6 +72,7 @@ def main() -> int:
     base = latest_by_model(rows, args.baseline)
 
     lines: list[str] = []
+    drifted: list[str] = []
     host = next((r.get("host") for r in rows if r.get("host")), "unknown")
     lines.append(f"# infer benchmarks — {host}")
     lines.append("")
@@ -91,12 +98,23 @@ def main() -> int:
                 continue
             d_gain = row["decode_tok_s"] / b["decode_tok_s"]
             p_gain = row["prefill_tok_s"] / b["prefill_tok_s"]
+            verdict = _verdict(b, row)
+            # Quantization changes the weights, so its output is expected to
+            # move; a kernel or a captured graph has no such excuse.
+            if verdict.startswith("DIFFERS") and not row.get("quant"):
+                drifted.append(f"{tag}/{model}: {verdict}")
             lines.append(
                 f"| {model} | {row.get('params', 0) / 1e9:.2f}B "
                 f"| {b['decode_tok_s']} | {row['decode_tok_s']} | {d_gain:.2f}x "
                 f"| {b['prefill_tok_s']} | {row['prefill_tok_s']} | {p_gain:.2f}x "
-                f"| {_verdict(b, row)} |"
+                f"| {verdict} |"
             )
+        lines.append("")
+
+    if drifted:
+        lines.append("## output drift")
+        lines.append("")
+        lines.extend(f"- {item}" for item in drifted)
         lines.append("")
 
     text = "\n".join(lines)
@@ -104,6 +122,9 @@ def main() -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text + "\n")
     print(text)
+    if drifted and args.strict:
+        print("\nFAIL: a faster run changed the answer", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -28,6 +28,11 @@ from engine.layers.rope import apply_rope
 cuda_only = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a CUDA device"
 )
+# Some cases assert the compiled op ran at all, which INFER_KERNELS=0 (how the
+# baseline benchmark runs) deliberately makes impossible.
+compiled_only = pytest.mark.skipif(
+    not available(), reason="needs the compiled extension"
+)
 
 BF16_TOL = dict(atol=6e-3, rtol=6e-3)
 
@@ -401,6 +406,7 @@ def test_moe_combine_matches_weighted_sum() -> None:
     torch.testing.assert_close(got.float(), want, atol=6e-3, rtol=6e-3)
 
 
+@compiled_only
 def test_fused_dispatch_matches_reference_dispatch() -> None:
     """The stacked path and the per-expert loop must agree on the same weights."""
     from engine.layers.moe import _dispatch_experts, expert_mlp, fused_dispatch
@@ -568,6 +574,7 @@ def test_mamba2_scan_chained_decode_equals_prefill() -> None:
 # --- quantized MoE experts --------------------------------------------
 
 
+@compiled_only
 def test_quantized_expert_stack_matches_dense_dispatch() -> None:
     """Packing the [E, N, K] blocks must not change what the MoE computes much."""
     from engine.layers.moe import EXPERT_STACK_KEY, fused_dispatch
@@ -740,6 +747,7 @@ def _reference_decode(
 
 
 @pytest.mark.parametrize("heads,kv_heads,head_dim", [(8, 8, 64), (16, 4, 128), (6, 2, 96)])
+@compiled_only
 def test_attn_decode_matches_reference(heads: int, kv_heads: int, head_dim: int) -> None:
     """GQA, odd head dims, and long caches must all land on the same answer."""
     from engine.kernels import attn_decode
@@ -757,6 +765,7 @@ def test_attn_decode_matches_reference(heads: int, kv_heads: int, head_dim: int)
     torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
 
 
+@compiled_only
 def test_attn_decode_honors_window_mask_sinks_and_softcap() -> None:
     from engine.kernels import attn_decode
 
@@ -790,6 +799,7 @@ def test_attn_decode_honors_window_mask_sinks_and_softcap() -> None:
         torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
 
 
+@compiled_only
 def test_attn_decode_empty_mask_gives_zeros() -> None:
     """Every key masked is the padded-row case; the eager path zeroes it."""
     from engine.kernels import attn_decode
@@ -844,6 +854,7 @@ def test_attn_decode_reads_a_cache_view() -> None:
 # --- gated delta step -------------------------------------------------
 
 
+@compiled_only
 def test_gdn_decode_matches_recurrence() -> None:
     """The fused step must reproduce one iteration of the Python recurrence."""
     from engine.kernels import gdn_decode
@@ -871,6 +882,7 @@ def test_gdn_decode_matches_recurrence() -> None:
     torch.testing.assert_close(state, rec, atol=2e-5, rtol=2e-5)
 
 
+@compiled_only
 def test_gdn_decode_matches_layer_recurrent_path() -> None:
     """Whole-mixer check: fused step vs the engine's own Python recurrence."""
     from engine.layers.gdn import _gated_delta_recurrent, _gated_delta_step

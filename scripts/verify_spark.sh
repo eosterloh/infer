@@ -43,6 +43,16 @@ step "3. full suite"
 step "3b. full suite with graphs armed"
 INFER_CUDA_GRAPH=1 "$PY" -m pytest tests -q || fail=1
 
+step "3c. full suite with the extension off (the fallbacks the baseline uses)"
+INFER_KERNELS=0 "$PY" -m pytest tests -q || fail=1
+
+step "3d. decode roofline, one model per shape class"
+for m in Llama-3.2-1B-Instruct Qwen2.5-1.5B-Instruct Mistral-7B-Instruct-v0.3; do
+  [ -d "$HOME/models/$m" ] || continue
+  "$PY" scripts/profile_decode.py --model "$HOME/models/$m" --steps 16 \
+    | tee "bench/roofline.$m.txt" | sed -n '1,12p'
+done
+
 step "4a. baseline sweep (kernels off)"
 INFER_KERNELS=0 scripts/bench_sweep.sh baseline "$SET"
 
@@ -55,9 +65,9 @@ INFER_KERNELS=1 scripts/bench_sweep.sh graph "$SET" --graph
 step "4d. nvfp4 sweep"
 INFER_KERNELS=1 scripts/bench_sweep.sh nvfp4 "$SET" --quant nvfp4
 
-step "5. report"
-"$PY" scripts/bench_report.py --baseline baseline \
-  --tag kernels --tag graph --tag nvfp4 --out bench/REPORT.md
+step "5. report — strict, so a faster wrong answer fails here"
+"$PY" scripts/bench_report.py --baseline baseline --strict \
+  --tag kernels --tag graph --tag nvfp4 --out bench/REPORT.md || fail=1
 
 echo
 if [ "$fail" -ne 0 ]; then
