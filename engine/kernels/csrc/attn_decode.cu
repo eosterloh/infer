@@ -15,6 +15,8 @@
 // windows, logit soft-capping, attention sinks, and a key-validity mask (the
 // CUDA-graph path reads a fixed window that runs past the live length).
 
+#include <algorithm>
+
 #include "common.cuh"
 
 namespace infer {

@@ -102,6 +102,7 @@ at::Tensor gdn_decode_cuda(
   TORCH_CHECK(state.size(0) == batch && state.size(1) == heads, "gdn_decode state batch");
   TORCH_CHECK(state.size(2) == k_dim && state.size(3) == v_dim, "gdn_decode state dims");
   TORCH_CHECK(v_dim <= 1024, "gdn_decode v_dim > 1024");
+  TORCH_CHECK(k_dim <= 4096, "gdn_decode k_dim > 4096");  // q and k sit in shared
   TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
               "gdn_decode needs contiguous q/k/v");
   TORCH_CHECK(state.is_contiguous(), "gdn_decode needs a contiguous state");

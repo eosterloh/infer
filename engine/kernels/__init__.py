@@ -453,7 +453,7 @@ def gdn_decode(
         return None
     if q.dtype != torch.float32 or state.dtype != torch.float32:
         return None
-    if v.shape[-1] > 1024:
+    if v.shape[-1] > 1024 or q.shape[-1] > 4096:
         return None
     tensors = (q, k, v, g_log, beta, state)
     if not all(t.is_contiguous() and t.dtype == torch.float32 for t in tensors):
