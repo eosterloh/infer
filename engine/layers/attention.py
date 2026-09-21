@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from engine import kernels
 from engine.layers.linear import dense
 from engine.layers.norm import gemma_rms_norm, rms_norm
 from engine.layers.rope import apply_rope
@@ -140,6 +141,44 @@ def causal_keep_mask(
     if sliding_window:
         keep = keep & (k_pos > q_pos - sliding_window)
     return keep
+
+
+def decode_attend(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    sliding_window: int | None = None,
+    key_mask: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
+    softcap: float | None = None,
+) -> torch.Tensor | None:
+    """One-query attention through the fused kernel, or None to use SDPA.
+
+    Worth its own path because a decode step is all cache read: the kernel takes
+    K/V exactly as the cache stores them, so nothing of length ``s_total`` — no
+    mask, no GQA copy, no score row — is materialized per layer per token.
+    """
+    if q.shape[2] != 1 or _attention_mode() == "eager":
+        return None
+    s_total = k.shape[2]
+    window = int(sliding_window or 0)
+    if window and key_mask is not None and s_total > window:
+        # The mask means the live length is below s_total, so "the last `window`
+        # keys" cannot be read off the buffer length. Let SDPA handle it.
+        return None
+    out = kernels.attn_decode(
+        q[:, :, 0],
+        k,
+        v,
+        scale=scale,
+        kv_mask=None if key_mask is None else key_mask[:, -s_total:],
+        sinks=sinks,
+        window=window if window < s_total else 0,
+        softcap=float(softcap or 0.0),
+    )
+    return None if out is None else out.unsqueeze(2)
 
 
 def sdpa_attend(
@@ -354,22 +393,30 @@ def attention(
     if kv_mask is not None:
         key_mask = kv_mask if key_mask is None else (key_mask.bool() & kv_mask.bool())
 
-    fused_ok = (
-        _attention_mode() != "eager"
-        and sinks is None
-        and not alibi
-        and not attn_logit_softcapping
-        and q.is_floating_point()
-    )
+    fused_ok = _attention_mode() != "eager" and not alibi and q.is_floating_point()
+    out = None
     if fused_ok:
-        out = sdpa_attend(
+        # The decode kernel covers sinks and soft-capping; SDPA does not.
+        out = decode_attend(
             q,
             k,
             v,
             scale=scale,
             sliding_window=sliding_window,
-            padding_mask=key_mask,
+            key_mask=key_mask,
+            sinks=sinks,
+            softcap=attn_logit_softcapping,
         )
+        if out is None and sinks is None and not attn_logit_softcapping:
+            out = sdpa_attend(
+                q,
+                k,
+                v,
+                scale=scale,
+                sliding_window=sliding_window,
+                padding_mask=key_mask,
+            )
+    if out is not None:
         out = out.transpose(1, 2).contiguous().view(b, s_new, nq * hd)
         if gate is not None:
             out = out * torch.sigmoid(gate)
@@ -552,7 +599,9 @@ def attention_from_weights(
             k, v = cache.update(spec_index, k, v)
         scale = 1.0 / math.sqrt(hd)
         if _attention_mode() != "eager" and q.is_floating_point():
-            out = sdpa_attend(q, k, v, scale=scale, padding_mask=kv_mask)
+            out = decode_attend(q, k, v, scale=scale, key_mask=kv_mask)
+            if out is None:
+                out = sdpa_attend(q, k, v, scale=scale, padding_mask=kv_mask)
         else:
             k = repeat_kv(k, nq // max(nkv, 1)) if nkv else k
             v = repeat_kv(v, nq // max(nkv, 1)) if nkv else v
@@ -594,7 +643,9 @@ def attention_from_weights(
             and q.is_floating_point()
         ):
             # Matches the eager branch below: no sliding-window / padding mask here.
-            out = sdpa_attend(q, k, v, scale=scale, padding_mask=kv_mask)
+            out = decode_attend(q, k, v, scale=scale, key_mask=kv_mask)
+            if out is None:
+                out = sdpa_attend(q, k, v, scale=scale, padding_mask=kv_mask)
             out = out.transpose(1, 2).contiguous().view(x.shape[0], s_new, nq * hd)
             return dense(
                 out, weights[f"{p}.attn.o.weight"], weights.get(f"{p}.attn.o.bias")

@@ -14,6 +14,9 @@ import torch
 import torch.nn.functional as F
 
 from engine.config import ModelConfig
+from engine import kernels
+from engine.kernels import gated_rms_norm
+from engine.layers.linear import dense
 from engine.layers.mamba2 import _depthwise_conv1d
 from engine.layers.norm import rms_norm
 
@@ -91,6 +94,35 @@ def _gated_delta_recurrent(
         outs.append((rec * q_t.unsqueeze(-1)).sum(dim=-2))
     out = torch.stack(outs, dim=2).transpose(1, 2).contiguous().to(dtype=query.dtype)
     return out, rec
+
+
+def _gated_delta_step(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_log: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """One token through the fused kernel. None means take the Python path.
+
+    Decode is all state traffic — every layer touches its whole [Dk, Dv] memory
+    per head — so the win is doing it in one pass instead of a dozen.
+    """
+    if state is None or query.shape[1] != 1:
+        return None
+    k_dim = key.shape[-1]
+    q = (_l2norm(query)[:, 0].float() * k_dim**-0.5).contiguous()
+    k = _l2norm(key)[:, 0].float().contiguous()
+    v = value[:, 0].float().contiguous()
+    st = state if state.dtype == torch.float32 else state.float()
+    st = st if st.is_contiguous() else st.contiguous()
+    out = kernels.gdn_decode(
+        q, k, v, g_log[:, 0].float().contiguous(), beta[:, 0].float().contiguous(), st
+    )
+    if out is None:
+        return None
+    return out.unsqueeze(1).to(dtype=query.dtype), st
 
 
 def _gated_delta_chunk(
@@ -284,7 +316,14 @@ def gated_delta_net(
         and trajectory is None
         and os.environ.get("INFER_GDN_CHUNK", "1") != "0"
     )
-    if use_chunk:
+    fused = (
+        None
+        if trajectory is not None
+        else _gated_delta_step(query, key, value, g_log, beta, initial)
+    )
+    if fused is not None:
+        core, rec = fused
+    elif use_chunk:
         core, rec = _gated_delta_chunk(query, key, value, g_log, beta, initial)
     else:
         core, rec = _gated_delta_recurrent(
@@ -297,6 +336,9 @@ def gated_delta_net(
 
     core = core.reshape(b, s, n_v, dv)
     norm_eps = 1e-5 if config.recipe_id == "olmo_hybrid" else config.rms_norm_eps
-    core_n = rms_norm(core, norm_w, norm_eps)
-    core_n = core_n * F.silu(z.float()).to(dtype=dtype)
-    return F.linear(core_n.reshape(b, s, value_dim), out_proj)
+    if norm_w.numel() == dv and core.dtype == norm_w.dtype:
+        core_n = gated_rms_norm(core, z, norm_w, norm_eps, dv, gate_first=False)
+    else:
+        core_n = rms_norm(core, norm_w, norm_eps)
+        core_n = core_n * F.silu(z.float()).to(dtype=dtype)
+    return dense(core_n.reshape(b, s, value_dim), out_proj)

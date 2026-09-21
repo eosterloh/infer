@@ -2,11 +2,13 @@
 # Benchmark every model folder we have, one process each so a load failure or
 # an OOM cannot take the rest of the sweep with it.
 #
-#   scripts/bench_sweep.sh <tag> [small|all|big]
+#   scripts/bench_sweep.sh <tag> [small|all|big] [extra bench_engine flags...]
 set -u
 
 TAG="${1:-run}"
 SET="${2:-small}"
+shift 2 2>/dev/null || true
+EXTRA=("$@")
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${PYTHON:-$ROOT/.venv/bin/python}"
 MODELS="${MODELS_DIR:-$HOME/models}"
@@ -45,10 +47,12 @@ for entry in "${LIST[@]}"; do
     echo "skip $name (not downloaded)"
     continue
   fi
-  echo "=== $name (prefill $prefill, decode $decode) ==="
+  echo "=== $name (prefill $prefill, decode $decode) ${EXTRA[*]:-} ==="
+  mkdir -p "$ROOT/bench"
   "$PY" "$ROOT/scripts/bench_engine.py" \
     --model "$dir" --prefill "$prefill" --decode "$decode" \
-    --reps 2 --tag "$TAG" >/dev/null 2>"$ROOT/bench/$name.$TAG.err"
+    --reps 2 --tag "$TAG" ${EXTRA[@]+"${EXTRA[@]}"} \
+    >/dev/null 2>"$ROOT/bench/$name.$TAG.err"
   status=$?
   if [ $status -ne 0 ]; then
     echo "  FAILED (exit $status): $(tail -3 "$ROOT/bench/$name.$TAG.err" | tr '\n' ' ')"

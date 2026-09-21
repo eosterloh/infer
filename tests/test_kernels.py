@@ -643,3 +643,253 @@ def test_qmoe_gemv_matches_dequantized_weight() -> None:
     )
     rel = (got.float() - want).norm() / want.norm()
     assert rel < 5e-3, f"qmoe_gemv rel error {rel:.2e}"
+
+
+# --- gated RMS norm ---------------------------------------------------
+
+
+def test_gated_rms_norm_matches_mamba_expression() -> None:
+    """gate_first must match mamba_ssm's norm_before_gate=False form."""
+    from engine.kernels import gated_rms_norm
+
+    torch.manual_seed(23)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    group, rows = 128, 6
+    x = torch.randn(1, rows, group * 2, device=device, dtype=torch.float32)
+    gate = torch.randn_like(x)
+    w = torch.randn(group, device=device, dtype=torch.float32)
+
+    y = x * torch.nn.functional.silu(gate)
+    y = y.reshape(1, rows, 2, group)
+    want = (y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + 1e-5)).reshape(x.shape) * w.repeat(2)
+    got = gated_rms_norm(x, gate, w, 1e-5, group, gate_first=True)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+def test_gated_rms_norm_matches_gdn_expression() -> None:
+    """gate_after must match Gated DeltaNet's norm-then-gate form."""
+    from engine.kernels import gated_rms_norm
+
+    torch.manual_seed(24)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    heads, dv = 4, 64
+    x = torch.randn(1, 3, heads, dv, device=device, dtype=torch.float32)
+    z = torch.randn_like(x)
+    w = torch.randn(dv, device=device, dtype=torch.float32)
+
+    normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+    want = normed * w * torch.nn.functional.silu(z)
+    got = gated_rms_norm(x, z, w, 1e-6, dv, gate_first=False)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+@cuda_only
+def test_gated_rms_norm_bf16_no_worse_than_python() -> None:
+    from engine.kernels import gated_rms_norm, python_gated_rms_norm
+
+    torch.manual_seed(25)
+    group = 256
+    x = torch.randn(1, 8, group, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    w = torch.randn(group, device="cuda", dtype=torch.bfloat16)
+    got = gated_rms_norm(x, gate, w, 1e-5, group, gate_first=True)
+    python = python_gated_rms_norm(x, gate, w, 1e-5, group, gate_first=True)
+    exact = python_gated_rms_norm(
+        x.float(), gate.float(), w.float(), 1e-5, group, gate_first=True
+    )
+    assert_no_worse_than_python(got, python, exact)
+
+
+# --- flash decode attention -------------------------------------------
+
+
+def _reference_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    window: int = 0,
+    kv_mask: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
+    softcap: float = 0.0,
+) -> torch.Tensor:
+    """The expression the kernel replaces: fp32 scores, mask, softmax, matmul."""
+    from engine.layers.attention import repeat_kv
+
+    group = q.shape[1] // k.shape[1]
+    kf = repeat_kv(k.float(), group)
+    vf = repeat_kv(v.float(), group)
+    total = k.shape[2]
+    scores = torch.matmul(q.float(), kf.transpose(-2, -1)) * scale
+    if softcap:
+        scores = torch.tanh(scores / softcap) * softcap
+    keep = torch.ones(1, 1, 1, total, dtype=torch.bool, device=q.device)
+    if window and window < total:
+        pos = torch.arange(total, device=q.device)
+        keep = keep & (pos >= total - window).view(1, 1, 1, total)
+    if kv_mask is not None:
+        keep = keep & kv_mask.bool().view(-1, 1, 1, total)
+    scores = scores.masked_fill(~keep, float("-inf"))
+    if sinks is not None:
+        sink = sinks.float().view(1, -1, 1, 1).expand(q.shape[0], q.shape[1], 1, 1)
+        w = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :total]
+    else:
+        w = torch.softmax(scores, dim=-1)
+    return torch.matmul(torch.nan_to_num(w), vf)
+
+
+@pytest.mark.parametrize("heads,kv_heads,head_dim", [(8, 8, 64), (16, 4, 128), (6, 2, 96)])
+def test_attn_decode_matches_reference(heads: int, kv_heads: int, head_dim: int) -> None:
+    """GQA, odd head dims, and long caches must all land on the same answer."""
+    from engine.kernels import attn_decode
+
+    torch.manual_seed(31)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    total = 300
+    q = torch.randn(1, heads, head_dim, device=device)
+    k = torch.randn(1, kv_heads, total, head_dim, device=device)
+    v = torch.randn(1, kv_heads, total, head_dim, device=device)
+    scale = head_dim**-0.5
+    got = attn_decode(q, k, v, scale=scale)
+    assert got is not None
+    want = _reference_decode(q.unsqueeze(2), k, v, scale=scale)[:, :, 0]
+    torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
+
+
+def test_attn_decode_honors_window_mask_sinks_and_softcap() -> None:
+    from engine.kernels import attn_decode
+
+    torch.manual_seed(32)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    heads, kv_heads, head_dim, total = 8, 2, 64, 200
+    q = torch.randn(2, heads, head_dim, device=device)
+    k = torch.randn(2, kv_heads, total, head_dim, device=device)
+    v = torch.randn(2, kv_heads, total, head_dim, device=device)
+    scale = head_dim**-0.5
+    mask = torch.zeros(2, total, dtype=torch.bool, device=device)
+    mask[0, :140] = True
+    mask[1, :90] = True
+    sinks = torch.randn(heads, device=device)
+
+    for window, sink, cap in ((64, None, 0.0), (0, sinks, 0.0), (0, None, 30.0), (128, sinks, 50.0)):
+        got = attn_decode(
+            q, k, v, scale=scale, kv_mask=mask, sinks=sink, window=window, softcap=cap
+        )
+        assert got is not None
+        want = _reference_decode(
+            q.unsqueeze(2),
+            k,
+            v,
+            scale=scale,
+            window=window,
+            kv_mask=mask,
+            sinks=sink,
+            softcap=cap,
+        )[:, :, 0]
+        torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
+
+
+def test_attn_decode_empty_mask_gives_zeros() -> None:
+    """Every key masked is the padded-row case; the eager path zeroes it."""
+    from engine.kernels import attn_decode
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    q = torch.randn(1, 4, 64, device=device)
+    k = torch.randn(1, 4, 32, 64, device=device)
+    v = torch.randn(1, 4, 32, 64, device=device)
+    mask = torch.zeros(1, 32, dtype=torch.bool, device=device)
+    got = attn_decode(q, k, v, scale=0.125, kv_mask=mask)
+    assert got is not None
+    assert torch.count_nonzero(got) == 0
+
+
+@cuda_only
+def test_attn_decode_bf16_no_worse_than_python() -> None:
+    from engine.kernels import attn_decode
+
+    torch.manual_seed(33)
+    heads, kv_heads, head_dim, total = 32, 8, 128, 1024
+    q = torch.randn(1, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, kv_heads, total, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, kv_heads, total, head_dim, device="cuda", dtype=torch.bfloat16)
+    scale = head_dim**-0.5
+    got = attn_decode(q, k, v, scale=scale)
+    assert got is not None
+    python = _reference_decode(q.unsqueeze(2), k, v, scale=scale)[:, :, 0].to(torch.bfloat16)
+    exact = _reference_decode(
+        q.float().unsqueeze(2), k.float(), v.float(), scale=scale
+    )[:, :, 0]
+    assert_no_worse_than_python(got, python, exact)
+
+
+@cuda_only
+def test_attn_decode_reads_a_cache_view() -> None:
+    """The engine passes ``buf[:, :, :len]``; a strided view must still work."""
+    from engine.kernels import attn_decode
+
+    torch.manual_seed(34)
+    heads, kv_heads, head_dim, cap, live = 8, 2, 64, 512, 130
+    q = torch.randn(1, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k_buf = torch.randn(1, kv_heads, cap, head_dim, device="cuda", dtype=torch.bfloat16)
+    v_buf = torch.randn(1, kv_heads, cap, head_dim, device="cuda", dtype=torch.bfloat16)
+    k, v = k_buf[:, :, :live], v_buf[:, :, :live]
+    assert not k.is_contiguous()
+    got = attn_decode(q, k, v, scale=head_dim**-0.5)
+    assert got is not None
+    want = _reference_decode(q.unsqueeze(2), k, v, scale=head_dim**-0.5)[:, :, 0]
+    torch.testing.assert_close(got.float(), want.float(), atol=6e-3, rtol=6e-3)
+
+
+# --- gated delta step -------------------------------------------------
+
+
+def test_gdn_decode_matches_recurrence() -> None:
+    """The fused step must reproduce one iteration of the Python recurrence."""
+    from engine.kernels import gdn_decode
+
+    torch.manual_seed(41)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    b, heads, dk, dv = 2, 6, 128, 64
+    q = torch.randn(b, heads, dk, device=device)
+    k = torch.randn(b, heads, dk, device=device)
+    v = torch.randn(b, heads, dv, device=device)
+    g_log = -torch.rand(b, heads, device=device)
+    beta = torch.rand(b, heads, device=device)
+    state = torch.randn(b, heads, dk, dv, device=device)
+
+    rec = state.clone() * g_log.exp()[:, :, None, None]
+    kv_mem = (rec * k[..., None]).sum(-2)
+    delta = (v - kv_mem) * beta[..., None]
+    rec = rec + k[..., None] * delta[..., None, :]
+    want = (rec * q[..., None]).sum(-2)
+
+    got = gdn_decode(q, k, v, g_log, beta, state)
+    assert got is not None
+    torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
+    # The state carries the next token, so it has to be updated in place.
+    torch.testing.assert_close(state, rec, atol=2e-5, rtol=2e-5)
+
+
+def test_gdn_decode_matches_layer_recurrent_path() -> None:
+    """Whole-mixer check: fused step vs the engine's own Python recurrence."""
+    from engine.layers.gdn import _gated_delta_recurrent, _gated_delta_step
+
+    torch.manual_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    b, heads, dk, dv = 1, 4, 64, 64
+    query = torch.randn(b, 1, heads, dk, device=device)
+    key = torch.randn(b, 1, heads, dk, device=device)
+    value = torch.randn(b, 1, heads, dv, device=device)
+    g_log = -torch.rand(b, 1, heads, device=device)
+    beta = torch.rand(b, 1, heads, device=device)
+    state = torch.randn(b, heads, dk, dv, device=device)
+
+    want, want_state = _gated_delta_recurrent(
+        query, key, value, g_log, beta, state.clone()
+    )
+    fused = _gated_delta_step(query, key, value, g_log, beta, state.clone())
+    assert fused is not None
+    got, got_state = fused
+    torch.testing.assert_close(got, want, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(got_state, want_state, atol=2e-5, rtol=2e-5)

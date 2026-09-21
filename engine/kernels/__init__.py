@@ -28,6 +28,8 @@ _CUDA_SOURCES = (
     "quant_gemv.cu",
     "moe.cu",
     "mamba.cu",
+    "attn_decode.cu",
+    "gdn.cu",
 )
 
 
@@ -193,6 +195,51 @@ def fused_add_rms_norm(
             pass
     residual = residual + x
     return python_rms_norm(residual, weight, eps, weight_offset), residual
+
+
+def python_gated_rms_norm(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group: int,
+    *,
+    gate_first: bool,
+) -> torch.Tensor:
+    shape = x.shape
+    xf = x.float().reshape(-1, group)
+    gf = torch.nn.functional.silu(gate.float().reshape(-1, group))
+    value = xf * gf if gate_first else xf
+    inv = torch.rsqrt(value.pow(2).mean(dim=-1, keepdim=True) + eps)
+    out = value * inv * weight.float().reshape(1, group)
+    if not gate_first:
+        out = out * gf
+    return out.reshape(shape).to(x.dtype)
+
+
+def gated_rms_norm(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group: int,
+    *,
+    gate_first: bool,
+) -> torch.Tensor:
+    """RMS norm fused with its SiLU gate, as the recurrent mixers need it.
+
+    ``gate_first`` normalizes ``x * silu(gate)`` (Mamba-2); otherwise the gate
+    multiplies the normalized value (Gated DeltaNet).
+    """
+    ops = _ops()
+    if ops is not None and x.dtype == weight.dtype and x.shape == gate.shape:
+        try:
+            return ops.gated_rms_norm(
+                x, gate, weight, float(eps), int(group), bool(gate_first)
+            )
+        except Exception:
+            pass
+    return python_gated_rms_norm(x, gate, weight, eps, group, gate_first=gate_first)
 
 
 def act_mul(gate: torch.Tensor, up: torch.Tensor, act: str = "silu") -> torch.Tensor:
@@ -380,6 +427,89 @@ def mamba2_scan(
             bool(has_state),
             float(dt_lo),
             float(dt_hi),
+        )
+    except Exception:
+        return None
+
+
+def gdn_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_log: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+) -> torch.Tensor | None:
+    """One gated-delta step per head, state updated in place.
+
+    ``q``/``k`` are ``[B, H, Dk]`` (already normalized and scaled), ``v`` is
+    ``[B, H, Dv]``, gates are ``[B, H]``, and ``state`` is ``[B, H, Dk, Dv]``
+    fp32. None means the caller must run the Python recurrence.
+    """
+    ops = _ops()
+    if ops is None or q.device.type not in ("cuda", "cpu"):
+        return None
+    if q.dim() != 3 or v.dim() != 3 or state.dim() != 4:
+        return None
+    if q.dtype != torch.float32 or state.dtype != torch.float32:
+        return None
+    if v.shape[-1] > 1024:
+        return None
+    tensors = (q, k, v, g_log, beta, state)
+    if not all(t.is_contiguous() and t.dtype == torch.float32 for t in tensors):
+        return None
+    try:
+        return ops.gdn_decode(q, k, v, g_log, beta, state)
+    except Exception:
+        return None
+
+
+def attn_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    kv_mask: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
+    window: int = 0,
+    softcap: float = 0.0,
+) -> torch.Tensor | None:
+    """Attention for one query position, straight out of the cache.
+
+    ``q`` is ``[B, nq, D]`` and ``k``/``v`` are the cache views ``[B, nkv, L, D]``
+    — GQA stays unexpanded and no mask of length L is ever built. Returns
+    ``[B, nq, D]``, or None when the caller must use SDPA.
+    """
+    ops = _ops()
+    if ops is None or q.dim() != 3 or k.dim() != 4 or v.dim() != 4:
+        return None
+    if q.device.type not in ("cuda", "cpu"):
+        return None
+    if q.dtype != k.dtype or q.dtype != v.dtype or not q.is_floating_point():
+        return None
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        return None
+    head_dim = q.shape[-1]
+    if head_dim > 256 or v.shape[-1] != head_dim:
+        return None
+    heads, kv_heads = q.shape[1], k.shape[1]
+    if kv_heads == 0 or heads % kv_heads:
+        return None
+    if kv_mask is not None:
+        kv_mask = kv_mask.bool().contiguous()
+        if kv_mask.shape[-1] != k.shape[2]:
+            return None
+    try:
+        return ops.attn_decode(
+            q,
+            k,
+            v,
+            kv_mask,
+            sinks,
+            float(scale),
+            int(window or 0),
+            float(softcap or 0.0),
         )
     except Exception:
         return None

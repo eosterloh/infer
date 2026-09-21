@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from engine.config import ModelConfig
-from engine.kernels import mamba2_scan
+from engine.kernels import gated_rms_norm, mamba2_scan
 from engine.layers.linear import dense
 
 if TYPE_CHECKING:
@@ -26,12 +26,15 @@ def _rms_norm_gated(
     group_size: int,
 ) -> torch.Tensor:
     """Match mamba_ssm rmsnorm_fn with norm_before_gate=False (group RMS)."""
-    # y = rmsnorm(x * silu(gate)) * weight, RMS over each group
-    y = x.float() * F.silu(gate.float())
-    orig = y.shape
-    d = orig[-1]
+    d = x.shape[-1]
     if d % group_size != 0:
         raise ValueError(f"hidden {d} not divisible by group_size {group_size}")
+    if weight.numel() == group_size:
+        return gated_rms_norm(x, gate, weight, eps, group_size, gate_first=True)
+    # A weight spanning the whole hidden state cannot be folded into the group
+    # kernel, so that case keeps the elementwise form.
+    y = x.float() * F.silu(gate.float())
+    orig = y.shape
     y = y.reshape(*orig[:-1], d // group_size, group_size)
     var = y.pow(2).mean(dim=-1, keepdim=True)
     y = y * torch.rsqrt(var + eps)

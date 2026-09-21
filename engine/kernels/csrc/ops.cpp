@@ -5,6 +5,7 @@
 // reference; the CUDA side is what runs on the Spark.
 #include <torch/extension.h>
 
+#include <limits>
 #include <string>
 
 namespace infer {
@@ -18,6 +19,13 @@ void fused_add_rms_norm_cuda(
     const at::Tensor& weight,
     double eps,
     double weight_offset);
+at::Tensor gated_rms_norm_cuda(
+    const at::Tensor& x,
+    const at::Tensor& gate,
+    const at::Tensor& weight,
+    double eps,
+    int64_t group,
+    bool gate_first);
 at::Tensor act_mul_cuda(
     const at::Tensor& gate, const at::Tensor& up, const std::string& act);
 at::Tensor act_and_mul_cuda(const at::Tensor& gate_up, const std::string& act);
@@ -76,6 +84,22 @@ at::Tensor moe_gemv_cuda(
 at::Tensor moe_combine_cuda(
     const at::Tensor& expert_out, const at::Tensor& weights, int64_t topk);
 
+at::Tensor gdn_decode_cuda(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& g_log,
+    const at::Tensor& beta,
+    at::Tensor state);
+at::Tensor attn_decode_cuda(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const c10::optional<at::Tensor>& kv_mask,
+    const c10::optional<at::Tensor>& sinks,
+    double scale,
+    int64_t window,
+    double softcap);
 at::Tensor mamba2_scan_cuda(
     const at::Tensor& x,
     const at::Tensor& dt_raw,
@@ -143,6 +167,27 @@ void fused_add_rms_norm_cpu(
   TORCH_CHECK(x.sizes() == residual.sizes(), "fused_add_rms_norm shape mismatch");
   residual.add_(x);
   x.copy_(rms_norm_cpu(residual, weight, eps, weight_offset));
+}
+
+at::Tensor gated_rms_norm_cpu(
+    const at::Tensor& x,
+    const at::Tensor& gate,
+    const at::Tensor& weight,
+    double eps,
+    int64_t group,
+    bool gate_first) {
+  TORCH_CHECK(x.sizes() == gate.sizes(), "gated_rms_norm: gate shape mismatch");
+  TORCH_CHECK(group > 0 && x.numel() % group == 0, "gated_rms_norm: bad group");
+  auto shape = x.sizes().vec();
+  auto xf = x.to(at::kFloat).reshape({-1, group});
+  auto gf = at::silu(gate.to(at::kFloat).reshape({-1, group}));
+  auto value = gate_first ? xf * gf : xf;
+  auto inv = at::rsqrt(value.pow(2).mean(-1, /*keepdim=*/true) + eps);
+  auto out = value * inv * weight.to(at::kFloat).view({1, group});
+  if (!gate_first) {
+    out = out * gf;
+  }
+  return out.reshape(shape).to(x.scalar_type());
 }
 
 at::Tensor act_mul_cpu(
@@ -370,6 +415,67 @@ at::Tensor mamba2_scan_cpu(
   return y.to(x.scalar_type());
 }
 
+// Reference gated delta step, straight off the recurrence in the paper.
+// ``state`` is updated in place, as in the kernel.
+at::Tensor gdn_decode_cpu(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& g_log,
+    const at::Tensor& beta,
+    at::Tensor state) {
+  auto decay = at::exp(g_log).unsqueeze(-1).unsqueeze(-1);       // [B, H, 1, 1]
+  auto rec = state * decay;                                      // [B, H, Dk, Dv]
+  auto kv_mem = (rec * k.unsqueeze(-1)).sum(-2);                 // [B, H, Dv]
+  auto delta = (v - kv_mem) * beta.unsqueeze(-1);
+  rec = rec + k.unsqueeze(-1) * delta.unsqueeze(-2);
+  state.copy_(rec);
+  return (rec * q.unsqueeze(-1)).sum(-2);
+}
+
+// Reference single-query attention. Same masking rules as the CUDA kernel:
+// every cached key is visible to the newest query, minus the window, minus the
+// validity mask, with the sink as a denominator-only logit.
+at::Tensor attn_decode_cpu(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const c10::optional<at::Tensor>& kv_mask,
+    const c10::optional<at::Tensor>& sinks,
+    double scale,
+    int64_t window,
+    double softcap) {
+  const int64_t heads = q.size(1);
+  const int64_t kv_heads = k.size(1);
+  const int64_t kv_len = k.size(2);
+  const int64_t group = heads / kv_heads;
+
+  auto kf = k.to(at::kFloat).repeat_interleave(group, 1);          // [B, H, L, D]
+  auto vf = v.to(at::kFloat).repeat_interleave(group, 1);
+  auto qf = q.to(at::kFloat).unsqueeze(2);                         // [B, H, 1, D]
+  auto scores = at::matmul(qf, kf.transpose(-2, -1)) * scale;      // [B, H, 1, L]
+  if (softcap > 0.0) {
+    scores = at::tanh(scores / softcap) * softcap;
+  }
+  auto keep = at::ones({1, 1, 1, kv_len}, q.options().dtype(at::kBool));
+  if (window > 0 && window < kv_len) {
+    auto pos = at::arange(kv_len, q.options().dtype(at::kLong));
+    keep = keep.logical_and((pos >= (kv_len - window)).view({1, 1, 1, kv_len}));
+  }
+  if (kv_mask.has_value() && kv_mask->defined()) {
+    keep = keep.logical_and(kv_mask->to(at::kBool).view({-1, 1, 1, kv_len}));
+  }
+  scores = scores.masked_fill(keep.logical_not(), -std::numeric_limits<float>::infinity());
+  if (sinks.has_value() && sinks->defined()) {
+    auto sink = sinks->to(at::kFloat).view({1, heads, 1, 1}).expand({q.size(0), heads, 1, 1});
+    scores = at::cat({scores, sink}, -1);
+    auto w = at::softmax(scores, -1).slice(-1, 0, kv_len);
+    return at::nan_to_num(at::matmul(w, vf)).squeeze(2).to(q.scalar_type());
+  }
+  auto w = at::nan_to_num(at::softmax(scores, -1));
+  return at::matmul(w, vf).squeeze(2).to(q.scalar_type());
+}
+
 at::Tensor qgemv_cpu(
     const at::Tensor& x,
     const at::Tensor& qweight,
@@ -396,6 +502,9 @@ TORCH_LIBRARY(infer, m) {
       "fused_add_rms_norm(Tensor(a!) x, Tensor(b!) residual, Tensor weight, "
       "float eps, float weight_offset) -> ()");
   m.def("act_mul(Tensor gate, Tensor up, str act) -> Tensor");
+  m.def(
+      "gated_rms_norm(Tensor x, Tensor gate, Tensor weight, float eps, int group, "
+      "bool gate_first) -> Tensor");
   m.def("act_and_mul(Tensor gate_up, str act) -> Tensor");
   m.def(
       "rope_inplace(Tensor(a!) q, Tensor(b!) k, Tensor cos, Tensor sin, "
@@ -421,12 +530,19 @@ TORCH_LIBRARY(infer, m) {
       "mamba2_scan(Tensor x, Tensor dt_raw, Tensor dt_bias, Tensor a_log, Tensor b, "
       "Tensor c, Tensor d, Tensor(a!) state, bool has_state, float dt_lo, "
       "float dt_hi) -> Tensor");
+  m.def(
+      "attn_decode(Tensor q, Tensor k, Tensor v, Tensor? kv_mask, Tensor? sinks, "
+      "float scale, int window, float softcap) -> Tensor");
+  m.def(
+      "gdn_decode(Tensor q, Tensor k, Tensor v, Tensor g_log, Tensor beta, "
+      "Tensor(a!) state) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(infer, CPU, m) {
   m.impl("rms_norm", TORCH_FN(infer::rms_norm_cpu));
   m.impl("fused_add_rms_norm", TORCH_FN(infer::fused_add_rms_norm_cpu));
   m.impl("act_mul", TORCH_FN(infer::act_mul_cpu));
+  m.impl("gated_rms_norm", TORCH_FN(infer::gated_rms_norm_cpu));
   m.impl("act_and_mul", TORCH_FN(infer::act_and_mul_cpu));
   m.impl("rope_inplace", TORCH_FN(infer::rope_inplace_cpu));
   m.impl("gemv", TORCH_FN(infer::gemv_cpu));
@@ -436,6 +552,8 @@ TORCH_LIBRARY_IMPL(infer, CPU, m) {
   m.impl("moe_combine", TORCH_FN(infer::moe_combine_cpu));
   m.impl("qmoe_gemv", TORCH_FN(infer::qmoe_gemv_cpu));
   m.impl("mamba2_scan", TORCH_FN(infer::mamba2_scan_cpu));
+  m.impl("attn_decode", TORCH_FN(infer::attn_decode_cpu));
+  m.impl("gdn_decode", TORCH_FN(infer::gdn_decode_cpu));
 }
 
 #ifdef WITH_CUDA
@@ -443,6 +561,7 @@ TORCH_LIBRARY_IMPL(infer, CUDA, m) {
   m.impl("rms_norm", TORCH_FN(infer::rms_norm_cuda));
   m.impl("fused_add_rms_norm", TORCH_FN(infer::fused_add_rms_norm_cuda));
   m.impl("act_mul", TORCH_FN(infer::act_mul_cuda));
+  m.impl("gated_rms_norm", TORCH_FN(infer::gated_rms_norm_cuda));
   m.impl("act_and_mul", TORCH_FN(infer::act_and_mul_cuda));
   m.impl("rope_inplace", TORCH_FN(infer::rope_inplace_cuda));
   m.impl("gemv", TORCH_FN(infer::gemv_cuda));
@@ -452,6 +571,8 @@ TORCH_LIBRARY_IMPL(infer, CUDA, m) {
   m.impl("moe_combine", TORCH_FN(infer::moe_combine_cuda));
   m.impl("qmoe_gemv", TORCH_FN(infer::qmoe_gemv_cuda));
   m.impl("mamba2_scan", TORCH_FN(infer::mamba2_scan_cuda));
+  m.impl("attn_decode", TORCH_FN(infer::attn_decode_cuda));
+  m.impl("gdn_decode", TORCH_FN(infer::gdn_decode_cuda));
 }
 #endif
 

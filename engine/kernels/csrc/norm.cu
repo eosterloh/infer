@@ -141,6 +141,93 @@ __global__ void fused_add_rms_norm_scalar_kernel(
   }
 }
 
+// The gated norm the recurrent mixers need. Mamba-2 gates before the norm
+// (RMS over x * silu(gate), per group), Gated DeltaNet gates after it. Either
+// way the reference builds half a dozen fp32 temporaries the width of the
+// hidden state, per layer, per token.
+template <typename T>
+__global__ void gated_rms_norm_kernel(
+    const T* __restrict__ x,
+    const T* __restrict__ gate,
+    const T* __restrict__ weight,
+    T* __restrict__ out,
+    int group,
+    float eps,
+    bool gate_first) {
+  const int64_t row = blockIdx.x;
+  const T* __restrict__ row_x = x + row * group;
+  const T* __restrict__ row_g = gate + row * group;
+  T* __restrict__ row_o = out + row * group;
+
+  float acc = 0.0f;
+  for (int i = threadIdx.x; i < group; i += blockDim.x) {
+    float value = static_cast<float>(row_x[i]);
+    if (gate_first) {
+      value *= silu(static_cast<float>(row_g[i]));
+    }
+    acc += value * value;
+  }
+  const float inv = rsqrtf(block_reduce_sum(acc) / static_cast<float>(group) + eps);
+  for (int i = threadIdx.x; i < group; i += blockDim.x) {
+    const float g = silu(static_cast<float>(row_g[i]));
+    const float w = static_cast<float>(weight[i]);
+    float value = static_cast<float>(row_x[i]);
+    if (gate_first) {
+      value = value * g * inv * w;
+    } else {
+      value = value * inv * w * g;
+    }
+    row_o[i] = static_cast<T>(value);
+  }
+}
+
+at::Tensor gated_rms_norm_cuda(
+    const at::Tensor& x,
+    const at::Tensor& gate,
+    const at::Tensor& weight,
+    double eps,
+    int64_t group,
+    bool gate_first) {
+  const at::cuda::OptionalCUDAGuard guard(at::device_of(x));
+  auto input = x.contiguous();
+  auto g = gate.contiguous();
+  auto w = weight.contiguous().view(-1);
+  TORCH_CHECK(input.sizes() == g.sizes(), "gated_rms_norm: gate shape mismatch");
+  TORCH_CHECK(group > 0 && input.numel() % group == 0, "gated_rms_norm: bad group");
+  TORCH_CHECK(w.numel() == group, "gated_rms_norm: weight must match the group");
+  TORCH_CHECK(input.scalar_type() == w.scalar_type(), "gated_rms_norm: dtype mismatch");
+  auto out = at::empty_like(input);
+  const int64_t rows = input.numel() / group;
+  if (rows == 0) {
+    return out;
+  }
+  const int threads = threads_for(static_cast<int>(group));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_SWITCH(
+      input.scalar_type(),
+      "gated_rms_norm_cuda",
+      AT_DISPATCH_CASE(at::kBFloat16, [&] {
+        using T = at::BFloat16;
+        gated_rms_norm_kernel<T><<<rows, threads, 0, stream>>>(
+            input.data_ptr<T>(), g.data_ptr<T>(), w.data_ptr<T>(), out.data_ptr<T>(),
+            static_cast<int>(group), static_cast<float>(eps), gate_first);
+      })
+      AT_DISPATCH_CASE(at::kHalf, [&] {
+        using T = at::Half;
+        gated_rms_norm_kernel<T><<<rows, threads, 0, stream>>>(
+            input.data_ptr<T>(), g.data_ptr<T>(), w.data_ptr<T>(), out.data_ptr<T>(),
+            static_cast<int>(group), static_cast<float>(eps), gate_first);
+      })
+      AT_DISPATCH_CASE(at::kFloat, [&] {
+        using T = float;
+        gated_rms_norm_kernel<T><<<rows, threads, 0, stream>>>(
+            input.data_ptr<T>(), g.data_ptr<T>(), w.data_ptr<T>(), out.data_ptr<T>(),
+            static_cast<int>(group), static_cast<float>(eps), gate_first);
+      }));
+  AT_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
 #define INFER_LAUNCH_NORM(T, VEC)                                              \
   do {                                                                         \
     const int vectors = static_cast<int>(hidden / VEC);                        \

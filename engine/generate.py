@@ -6,6 +6,7 @@ from collections.abc import Iterator
 
 import torch
 
+from engine.graph import GraphDecoder
 from engine.model import DecoderModel
 from engine.mtp import NativeMTP
 from engine.sample import SamplingParams, make_generator, select_next_id
@@ -106,7 +107,24 @@ def generate_greedy(
         return
     yield _emit(next_id)
 
-    for _ in range(max_new_tokens - 1):
+    remaining = max_new_tokens - 1
+    # Greedy decode has no host-side decisions inside the step, so it can run
+    # from a captured graph. Anything that breaks capture falls back here.
+    if remaining > 0 and params.temperature <= 0.0:
+        decoder = GraphDecoder.create(
+            model, cache, length=cache.seq_len(), budget=remaining
+        )
+        if decoder is not None and decoder.capture(next_id):
+            while remaining > 0 and decoder.room():
+                next_id = decoder.step()
+                remaining -= 1
+                if next_id in eos_ids:
+                    decoder.release()
+                    return
+                yield _emit(next_id)
+            decoder.release()
+
+    for _ in range(remaining):
         step = torch.tensor([[next_id]], dtype=torch.long, device=device)
         logits = model.forward(step, cache=cache, logits_to_keep=1)
         next_id = _pick(logits)

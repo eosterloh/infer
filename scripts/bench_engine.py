@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from engine import kernels  # noqa: E402
 from engine.agent_api import load_engine  # noqa: E402
 
 FINGERPRINT_PROMPT = "The capital of France is Paris, and the capital of Italy is"
@@ -49,18 +50,36 @@ def _fresh_prefill(model, tokens: torch.Tensor) -> float:
 
 
 @torch.inference_mode()
-def _decode_loop(model, tokens: torch.Tensor, steps: int) -> float:
+def _decode_loop(model, tokens: torch.Tensor, steps: int, graph: bool = False) -> float:
     cache = model.make_cache(batch_size=1, device=model.device, dtype=model.dtype)
     logits = model.forward(tokens, cache=cache)
     next_id = int(torch.argmax(logits[0, -1, :]).item())
+    decoder = None
+    if graph:
+        from engine.graph import GraphDecoder
+
+        decoder = GraphDecoder.create(
+            model, cache, length=cache.seq_len(), budget=steps + 1
+        )
+        if decoder is not None and not decoder.capture(next_id):
+            decoder = None
+        if decoder is None:
+            raise SystemExit("graph capture failed; rerun without --graph")
     _sync(model.device)
     t0 = time.perf_counter()
-    for _ in range(steps):
-        step = torch.tensor([[next_id]], dtype=torch.long, device=model.device)
-        logits = model.forward(step, cache=cache)
-        next_id = int(torch.argmax(logits[0, -1, :]).item())
+    if decoder is not None:
+        for _ in range(steps):
+            next_id = decoder.step()
+    else:
+        for _ in range(steps):
+            step = torch.tensor([[next_id]], dtype=torch.long, device=model.device)
+            logits = model.forward(step, cache=cache)
+            next_id = int(torch.argmax(logits[0, -1, :]).item())
     _sync(model.device)
-    return time.perf_counter() - t0
+    elapsed = time.perf_counter() - t0
+    if decoder is not None:
+        decoder.release()
+    return elapsed
 
 
 @torch.inference_mode()
@@ -110,13 +129,22 @@ def main() -> int:
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default=None)
     p.add_argument("--tag", default="run")
+    p.add_argument("--quant", default=None, choices=["int4", "nvfp4", "fp8"])
+    p.add_argument("--graph", action="store_true", help="time the captured decode step")
     p.add_argument("--out", type=Path, default=ROOT / "bench" / "results.jsonl")
     p.add_argument("--fingerprint-tokens", type=int, default=16)
     p.add_argument("--skip-fingerprint", action="store_true")
     args = p.parse_args()
 
+    if args.graph:
+        import os
+
+        os.environ["INFER_CUDA_GRAPH"] = "1"
+
     t_load = time.perf_counter()
-    engine = load_engine(args.model, device=args.device, dtype=args.dtype)
+    engine = load_engine(
+        args.model, device=args.device, dtype=args.dtype, quant=args.quant
+    )
     load_s = time.perf_counter() - t_load
     model = engine.model
 
@@ -130,7 +158,10 @@ def main() -> int:
         _decode_loop(model, tokens[:, :8], 2)
 
     prefill_times = [_fresh_prefill(model, tokens) for _ in range(args.reps)]
-    decode_times = [_decode_loop(model, tokens, args.decode) for _ in range(args.reps)]
+    decode_times = [
+        _decode_loop(model, tokens, args.decode, graph=args.graph)
+        for _ in range(args.reps)
+    ]
 
     prefill_s = statistics.median(prefill_times)
     decode_s = statistics.median(decode_times)
@@ -142,6 +173,9 @@ def main() -> int:
         "model_dir": str(args.model),
         "recipe": model.config.recipe_id,
         "params": engine.n_params,
+        "quant": args.quant,
+        "graph": bool(args.graph),
+        "kernels": bool(kernels.available()),
         "dtype": str(model.dtype),
         "device": str(model.device),
         "load_seconds": round(load_s, 2),
@@ -156,6 +190,8 @@ def main() -> int:
     }
     if torch.cuda.is_available():
         record["peak_mem_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 3)
+    if getattr(engine, "quantization", None):
+        record["quantization"] = engine.quantization
     if not args.skip_fingerprint:
         record["fingerprint"] = fingerprint(engine, args.fingerprint_tokens)
 

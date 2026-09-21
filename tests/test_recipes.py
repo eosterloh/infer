@@ -53,6 +53,20 @@ def _run_folder(tmp_path: Path, raw: dict, recipe: str) -> None:
     assert pre.shape[-1] == cfg.vocab_size
     assert step.shape == (1, 1, cfg.vocab_size)
 
+    # A decode step takes different code than a prefill row — a fused decode
+    # attention, a GEMV instead of a GEMM — so it has to land on the same
+    # logits the full-sequence pass gives for that position.
+    long_ids = torch.cat([ids, ids[:, :1]], dim=1)
+    full = model.forward(long_ids)
+    warm = model.make_cache(
+        batch_size=1, device=ids.device, dtype=engine_w["embed.weight"].dtype
+    )
+    model.forward(long_ids[:, :-1], cache=warm)
+    decoded = model.forward(long_ids[:, -1:], cache=warm)
+    torch.testing.assert_close(
+        decoded[0, -1], full[0, -1], atol=2e-4, rtol=2e-4
+    )
+
     write_hf_folder(folder, cfg, engine_w)
     inv_ok = validate_name_map(cfg, __import__("safetensors.torch", fromlist=["load_file"]).load_file(str(folder / "model.safetensors")).keys())
     assert inv_ok

@@ -154,6 +154,14 @@ class KVCache:
             )
         self._capacity = max(self._capacity, target)
 
+    def reserve(self, positions: int) -> None:
+        """Grow the buffers to hold ``positions`` without moving them later.
+
+        A captured decode step bakes in the buffer addresses, so the whole
+        generation has to fit in the capacity that exists at capture time.
+        """
+        self._grow(int(positions))
+
     # --- CUDA graph mode ----------------------------------------------
     def enable_graph_mode(self, window: int, slot: torch.Tensor) -> None:
         """Freeze shapes for capture: write at ``slot``, read ``[:window]``.
@@ -422,6 +430,9 @@ class RuntimeState:
         self, mask: torch.Tensor | None, new_tokens: int
     ) -> torch.Tensor | None:
         return self.kv.prepare_padding_mask(mask, new_tokens)
+
+    def reserve(self, positions: int) -> None:
+        self.kv.reserve(positions)
 
     def enable_graph_mode(self, window: int, slot: torch.Tensor) -> None:
         self.kv.enable_graph_mode(window, slot)
