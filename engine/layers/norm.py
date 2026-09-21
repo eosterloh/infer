@@ -16,11 +16,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 def gemma_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Gemma: normalize then multiply (1 + weight)."""
-    orig_dtype = x.dtype
-    x_f = x.float()
-    var = x_f.pow(2).mean(dim=-1, keepdim=True)
-    x_f = x_f * torch.rsqrt(var + eps)
-    return (x_f * (1.0 + weight.float())).to(orig_dtype)
+    return kernel_rms_norm(x, weight, eps, weight_offset=1.0)
 
 
 def layer_norm(

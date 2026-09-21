@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from engine.layers.linear import dense
 from engine.layers.norm import rms_norm
 from engine.layers.rope import apply_rope
 
@@ -36,15 +37,15 @@ def mla_attention(
     qk = nope + rope_d
 
     if f"{p}.attn.q_a.weight" in weights:
-        q = F.linear(x, weights[f"{p}.attn.q_a.weight"])
+        q = dense(x, weights[f"{p}.attn.q_a.weight"])
         q = rms_norm(q, weights[f"{p}.attn.q_a_norm.weight"], config.rms_norm_eps)
-        q = F.linear(q, weights[f"{p}.attn.q_b.weight"])
+        q = dense(q, weights[f"{p}.attn.q_b.weight"])
     else:
-        q = F.linear(x, weights[f"{p}.attn.q.weight"])
+        q = dense(x, weights[f"{p}.attn.q.weight"])
     q = q.view(b, s, nq, qk).transpose(1, 2)
     q_pass, q_rot = torch.split(q, [nope, rope_d], dim=-1)
 
-    compressed = F.linear(x, weights[f"{p}.attn.kv_a.weight"])
+    compressed = dense(x, weights[f"{p}.attn.kv_a.weight"])
     kv_nope, k_rot = torch.split(compressed, [kv_lora, rope_d], dim=-1)
     kv_nope = rms_norm(kv_nope, weights[f"{p}.attn.kv_a_norm.weight"], config.rms_norm_eps)
 
@@ -64,7 +65,7 @@ def mla_attention(
         k_rot = k_rot_t.transpose(1, 2).reshape(b, s, rope_d)
     k_rot = k_rot.view(b, s, 1, rope_d).expand(b, s, nq, rope_d).transpose(1, 2)
 
-    kv = F.linear(kv_nope, weights[f"{p}.attn.kv_b.weight"])
+    kv = dense(kv_nope, weights[f"{p}.attn.kv_b.weight"])
     kv = kv.view(b, s, nq, nope + vdh).transpose(1, 2)
     k_nope, v = torch.split(kv, [nope, vdh], dim=-1)
     k = torch.cat((k_nope, q_rot.new_empty(b, nq, s, rope_d)), dim=-1)
@@ -93,4 +94,4 @@ def mla_attention(
         )
     attn = torch.softmax(scores + causal, dim=-1).to(dtype=v.dtype)
     out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(b, s_new, nq * vdh)
-    return F.linear(out, weights[f"{p}.attn.o.weight"])
+    return dense(out, weights[f"{p}.attn.o.weight"])

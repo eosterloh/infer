@@ -8,10 +8,22 @@ from engine.config import ModelConfig
 from engine.schedule import MixerKind, build_schedule
 
 
+CACHE_BLOCK = 256
+
+
+def _round_up(value: int, block: int = CACHE_BLOCK) -> int:
+    return ((value + block - 1) // block) * block
+
+
 class KVCache:
     """Per-layer attention K/V cache (RoPE'd K/V before GQA repeat).
 
-    Layout: k, v : [batch, n_kv_heads, seq, head_dim]
+    Layout: k, v : [batch, n_kv_heads, capacity, head_dim]
+
+    The buffers are allocated once and written in place. Growing the sequence
+    costs one slice assignment, not a reallocate-and-copy of the whole cache,
+    and a fixed ``max_seq_len`` keeps the pointers stable enough to capture a
+    decode step in a CUDA graph.
     """
 
     def __init__(
@@ -21,6 +33,7 @@ class KVCache:
         batch_size: int = 1,
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        max_seq_len: int | None = None,
     ):
         self.config = config
         self.batch_size = batch_size
@@ -29,10 +42,32 @@ class KVCache:
         self.n_layers = config.num_hidden_layers
         self.n_kv = config.num_key_value_heads
         self.head_dim = config.head_dim
-        self.k: list[torch.Tensor | None] = [None] * self.n_layers
-        self.v: list[torch.Tensor | None] = [None] * self.n_layers
+        # Buffers are [B, heads, capacity, dim]; `k`/`v` stay the public views.
+        self._k_buf: list[torch.Tensor | None] = [None] * self.n_layers
+        self._v_buf: list[torch.Tensor | None] = [None] * self.n_layers
+        self._layer_len: list[int] = [0] * self.n_layers
+        self._capacity = 0
+        self.max_seq_len = int(max_seq_len) if max_seq_len else None
         self._seq_len = 0
         self.padding_mask: torch.Tensor | None = None
+
+    # --- buffer views -------------------------------------------------
+    @property
+    def k(self) -> list[torch.Tensor | None]:
+        return [
+            buf[:, :, : self._layer_len[i]] if buf is not None else None
+            for i, buf in enumerate(self._k_buf)
+        ]
+
+    @property
+    def v(self) -> list[torch.Tensor | None]:
+        return [
+            buf[:, :, : self._layer_len[i]] if buf is not None else None
+            for i, buf in enumerate(self._v_buf)
+        ]
+
+    def capacity(self) -> int:
+        return self._capacity
 
     def empty(self) -> bool:
         return self._seq_len == 0
@@ -41,10 +76,16 @@ class KVCache:
         return self._seq_len
 
     def clear(self) -> None:
-        self.k = [None] * self.n_layers
-        self.v = [None] * self.n_layers
+        self._layer_len = [0] * self.n_layers
         self._seq_len = 0
         self.padding_mask = None
+
+    def reset_buffers(self) -> None:
+        """Drop the allocations as well as the lengths."""
+        self._k_buf = [None] * self.n_layers
+        self._v_buf = [None] * self.n_layers
+        self._capacity = 0
+        self.clear()
 
     def truncate(self, seq_len: int) -> None:
         """Discard cached positions at and after ``seq_len``."""
@@ -53,17 +94,58 @@ class KVCache:
             return
         if seq_len < 0 or seq_len > self._seq_len:
             raise ValueError(f"cannot truncate KV length {self._seq_len} to {seq_len}")
-        self.k = [
-            tensor[:, :, :seq_len].contiguous() if tensor is not None else None
-            for tensor in self.k
-        ]
-        self.v = [
-            tensor[:, :, :seq_len].contiguous() if tensor is not None else None
-            for tensor in self.v
-        ]
+        # Rolling back is just a length change; the stale tail is never read.
+        self._layer_len = [min(length, seq_len) for length in self._layer_len]
         if self.padding_mask is not None:
             self.padding_mask = self.padding_mask[:, :seq_len].contiguous()
         self._seq_len = seq_len
+
+    def _grow(self, needed: int) -> None:
+        if needed <= self._capacity:
+            return
+        if self.max_seq_len is not None:
+            if needed > self.max_seq_len:
+                raise ValueError(
+                    f"KV cache needs {needed} positions > max_seq_len {self.max_seq_len}"
+                )
+            target = self.max_seq_len
+        else:
+            target = max(_round_up(needed), self._capacity * 2)
+        for i, buf in enumerate(self._k_buf):
+            if buf is None:
+                continue
+            for store in (self._k_buf, self._v_buf):
+                old = store[i]
+                assert old is not None
+                shape = list(old.shape)
+                shape[2] = target
+                new = torch.empty(shape, device=old.device, dtype=old.dtype)
+                length = self._layer_len[i]
+                if length:
+                    new[:, :, :length] = old[:, :, :length]
+                store[i] = new
+        self._capacity = target
+
+    def _allocate_layer(
+        self, layer: int, k_new: torch.Tensor, v_new: torch.Tensor, needed: int
+    ) -> None:
+        target = (
+            self.max_seq_len
+            if self.max_seq_len is not None
+            else max(_round_up(needed), self._capacity)
+        )
+        if self.max_seq_len is not None and needed > self.max_seq_len:
+            raise ValueError(
+                f"KV cache needs {needed} positions > max_seq_len {self.max_seq_len}"
+            )
+        # MLA keys and values have different head dims, so size each separately.
+        for store, ref in ((self._k_buf, k_new), (self._v_buf, v_new)):
+            store[layer] = torch.empty(
+                (ref.shape[0], ref.shape[1], target, ref.shape[3]),
+                device=ref.device,
+                dtype=ref.dtype,
+            )
+        self._capacity = max(self._capacity, target)
 
     def prepare_padding_mask(
         self, mask: torch.Tensor | None, new_tokens: int
@@ -121,15 +203,20 @@ class KVCache:
         if k_new.shape[2] != v_new.shape[2]:
             raise ValueError(f"k/v seq mismatch: {k_new.shape} vs {v_new.shape}")
 
-        if self.k[layer] is None:
-            self.k[layer] = k_new
-            self.v[layer] = v_new
-        else:
-            self.k[layer] = torch.cat([self.k[layer], k_new], dim=2)
-            self.v[layer] = torch.cat([self.v[layer], v_new], dim=2)
-
-        self._seq_len = int(self.k[layer].shape[2])
-        return self.k[layer], self.v[layer]
+        base = self._layer_len[layer]
+        end = base + int(k_new.shape[2])
+        if self._k_buf[layer] is None:
+            self._allocate_layer(layer, k_new, v_new, end)
+        elif end > self._capacity:
+            self._grow(end)
+        k_buf = self._k_buf[layer]
+        v_buf = self._v_buf[layer]
+        assert k_buf is not None and v_buf is not None
+        k_buf[:, :, base:end] = k_new
+        v_buf[:, :, base:end] = v_new
+        self._layer_len[layer] = end
+        self._seq_len = end
+        return k_buf[:, :, :end], v_buf[:, :, :end]
 
     def begin_speculative(self) -> None:
         if getattr(self, "_spec_len", None) is not None:

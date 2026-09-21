@@ -5,13 +5,18 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from engine.kernels import silu_mul
+from engine.kernels import act_and_mul, act_mul
+from engine.layers.linear import dense
 
 
 def _gelu(x: torch.Tensor, act: str) -> torch.Tensor:
     if act in {"gelu_pytorch_tanh", "gelu_new", "gelu_fast"}:
         return F.gelu(x, approximate="tanh")
     return F.gelu(x)
+
+
+def _fused_gelu_kind(act: str) -> str:
+    return "gelu_tanh" if act in {"gelu_pytorch_tanh", "gelu_new", "gelu_fast"} else "gelu"
 
 
 def mlp(
@@ -27,24 +32,24 @@ def mlp(
 ) -> torch.Tensor:
     gated = w_gate is not w_up
     if act in {"silu", "swiglu"}:
-        return F.linear(
-            silu_mul(F.linear(x, w_gate, b_gate), F.linear(x, w_up, b_up)),
+        return dense(
+            act_mul(dense(x, w_gate, b_gate), dense(x, w_up, b_up), "silu"),
             w_down,
             b_down,
         )
     if act in {"gelu", "gelu_new", "gelu_pytorch_tanh"}:
-        up = F.linear(x, w_up, b_up)
+        up = dense(x, w_up, b_up)
         if gated:
-            up = _gelu(F.linear(x, w_gate, b_gate), act) * up
+            up = act_mul(dense(x, w_gate, b_gate), up, _fused_gelu_kind(act))
         else:
             up = _gelu(up, act)
-        return F.linear(up, w_down, b_down)
+        return dense(up, w_down, b_down)
     if act in {"relu2", "relu_squared", "squared_relu"}:
-        h = F.linear(x, w_up, b_up)
-        return F.linear(torch.square(F.relu(h)), w_down, b_down)
+        h = dense(x, w_up, b_up)
+        return dense(torch.square(F.relu(h)), w_down, b_down)
     if act == "relu":
-        h = F.linear(x, w_up, b_up)
-        return F.linear(F.relu(h), w_down, b_down)
+        h = dense(x, w_up, b_up)
+        return dense(F.relu(h), w_down, b_down)
     raise ValueError(f"unsupported mlp act {act!r}")
 
 
@@ -57,13 +62,13 @@ def mlp_from_weights(
     p = f"layers.{layer}"
     sub = weights.get(f"{p}.mlp.sub_norm.weight")
     if f"{p}.mlp.gate_up.weight" in weights:
-        gate, up = weights[f"{p}.mlp.gate_up.weight"].chunk(2, dim=0)
-        h = F.silu(F.linear(x, gate)) * F.linear(x, up)
+        # One GEMM over the packed projection, then split inside the kernel.
+        h = act_and_mul(dense(x, weights[f"{p}.mlp.gate_up.weight"]), "silu")
         if sub is not None:
             from engine.layers.norm import rms_norm
 
             h = rms_norm(h, sub, 1e-5)
-        return F.linear(h, weights[f"{p}.mlp.down.weight"])
+        return dense(h, weights[f"{p}.mlp.down.weight"])
     if f"{p}.mlp.c_fc.weight" in weights:
         return mlp(
             x,
@@ -90,11 +95,13 @@ def mlp_from_weights(
     if sub is not None:
         from engine.layers.norm import rms_norm
 
-        h = F.silu(F.linear(x, gate, weights.get(f"{p}.mlp.gate.bias"))) * F.linear(
-            x, up, weights.get(f"{p}.mlp.up.bias")
+        h = act_mul(
+            dense(x, gate, weights.get(f"{p}.mlp.gate.bias")),
+            dense(x, up, weights.get(f"{p}.mlp.up.bias")),
+            "silu",
         )
         h = rms_norm(h, sub, 1e-5)
-        return F.linear(h, down, weights.get(f"{p}.mlp.down.bias"))
+        return dense(h, down, weights.get(f"{p}.mlp.down.bias"))
     return mlp(
         x,
         gate,

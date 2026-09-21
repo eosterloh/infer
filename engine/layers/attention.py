@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
+from engine.layers.linear import dense
 from engine.layers.norm import gemma_rms_norm, rms_norm
 from engine.layers.rope import apply_rope
 
@@ -120,6 +122,70 @@ def build_alibi(
     return bias.expand(1, nq, s_new, s_total)
 
 
+def _attention_mode() -> str:
+    """``auto`` uses SDPA where the math allows it; ``eager`` forces Python."""
+    return os.environ.get("INFER_ATTENTION", "auto").strip().lower()
+
+
+def causal_keep_mask(
+    s_new: int,
+    s_total: int,
+    device: torch.device,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    """[s_new, s_total] bool — True where a query may read a key."""
+    q_pos = torch.arange(s_total - s_new, s_total, device=device).unsqueeze(1)
+    k_pos = torch.arange(s_total, device=device).unsqueeze(0)
+    keep = k_pos <= q_pos
+    if sliding_window:
+        keep = keep & (k_pos > q_pos - sliding_window)
+    return keep
+
+
+def sdpa_attend(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    sliding_window: int | None = None,
+    padding_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fused attention over [B, heads, S, D] tensors. GQA stays unexpanded.
+
+    Keeping K/V at their stored head count means flash attention reads the
+    cache once instead of materializing an nq-head copy of it, and the scores
+    never exist in memory.
+    """
+    nq, nkv = q.shape[1], k.shape[1]
+    s_new, s_total = q.shape[2], k.shape[2]
+    attn_mask: torch.Tensor | None = None
+    is_causal = False
+    if padding_mask is None and not sliding_window:
+        if s_new == s_total and s_new > 1:
+            is_causal = True
+        elif s_new > 1:
+            attn_mask = causal_keep_mask(s_new, s_total, q.device)[None, None]
+    else:
+        keep = causal_keep_mask(s_new, s_total, q.device, sliding_window)[None, None]
+        if padding_mask is not None:
+            keep = keep & padding_mask[:, -s_total:].bool()[:, None, None, :]
+        attn_mask = keep
+    out = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=nq != nkv and nkv > 0,
+    )
+    if padding_mask is not None:
+        # Rows whose every key is masked come back NaN; the eager path zeroes them.
+        out = torch.nan_to_num(out)
+    return out
+
+
 def _causal_mask(
     s_new: int,
     s_total: int,
@@ -204,9 +270,9 @@ def attention(
 ) -> torch.Tensor:
     """Causal GQA attention. x: [B, S_new, H]."""
     b, s_new, _ = x.shape
-    q = F.linear(x, w_q, b_q)
-    k = F.linear(x, w_k, b_k)
-    v = F.linear(x, w_v, b_v)
+    q = dense(x, w_q, b_q)
+    k = dense(x, w_k, b_k)
+    v = dense(x, w_v, b_v)
     if clip_qkv is not None:
         q = q.clamp(-clip_qkv, clip_qkv)
         k = k.clamp(-clip_qkv, clip_qkv)
@@ -264,15 +330,48 @@ def attention(
         k, v = cache.update(layer, k, v)
     s_total = k.shape[2]
 
-    k = repeat_kv(k, nq // nkv)
-    v = repeat_kv(v, nq // nkv)
-
     if attention_multiplier is not None:
         scale = float(attention_multiplier)
     elif query_pre_attn_scalar is not None:
         scale = float(query_pre_attn_scalar) ** -0.5
     else:
         scale = 1.0 / math.sqrt(hd)
+
+    if attention_mask is not None and (
+        attention_mask.dim() != 2 or attention_mask.shape[0] != b
+    ):
+        raise ValueError(
+            f"expected attention_mask [B,S], got {tuple(attention_mask.shape)}"
+        )
+
+    fused_ok = (
+        _attention_mode() != "eager"
+        and sinks is None
+        and not alibi
+        and not attn_logit_softcapping
+        and q.is_floating_point()
+    )
+    if fused_ok:
+        out = sdpa_attend(
+            q,
+            k,
+            v,
+            scale=scale,
+            sliding_window=sliding_window,
+            padding_mask=attention_mask,
+        )
+        out = out.transpose(1, 2).contiguous().view(b, s_new, nq * hd)
+        if gate is not None:
+            out = out * torch.sigmoid(gate)
+        if sub_norm is not None:
+            out = rms_norm(out, sub_norm, rms_eps)
+        out = dense(out, w_o, b_o)
+        if attention_mask is not None:
+            out = out * attention_mask[:, -s_new:, None].to(dtype=out.dtype)
+        return out
+
+    k = repeat_kv(k, nq // nkv)
+    v = repeat_kv(v, nq // nkv)
     scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
     if alibi:
         bias = build_alibi(nq, s_new, s_total, x.device, alibi_kind, alibi_bias_max)
@@ -439,23 +538,27 @@ def attention_from_weights(
     sliding_window = _layer_sliding_window(config, spec_index)
 
     if kind in {"gpt2", "gpt_bigcode"}:
-        qkv = F.linear(x, weights[f"{p}.attn.c_attn.weight"], weights.get(f"{p}.attn.c_attn.bias"))
+        qkv = dense(x, weights[f"{p}.attn.c_attn.weight"], weights.get(f"{p}.attn.c_attn.bias"))
         q, k, v = _split_qkv(qkv, nq, nkv, hd)
         b, s_new, _ = x.shape
         if cache is not None:
             k, v = cache.update(spec_index, k, v)
-        k = repeat_kv(k, nq // max(nkv, 1)) if nkv else k
-        v = repeat_kv(v, nq // max(nkv, 1)) if nkv else v
-        s_total = k.shape[2]
         scale = 1.0 / math.sqrt(hd)
-        scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
-        causal = _causal_mask(s_new, s_total, x.device, scores.dtype)
-        weights_s = torch.softmax(scores + causal, dim=-1).to(dtype=v.dtype)
-        out = torch.matmul(weights_s, v).transpose(1, 2).contiguous().view(b, s_new, nq * hd)
-        return F.linear(out, weights[f"{p}.attn.c_proj.weight"], weights.get(f"{p}.attn.c_proj.bias"))
+        if _attention_mode() != "eager" and q.is_floating_point():
+            out = sdpa_attend(q, k, v, scale=scale)
+        else:
+            k = repeat_kv(k, nq // max(nkv, 1)) if nkv else k
+            v = repeat_kv(v, nq // max(nkv, 1)) if nkv else v
+            s_total = k.shape[2]
+            scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+            causal = _causal_mask(s_new, s_total, x.device, scores.dtype)
+            weights_s = torch.softmax(scores + causal, dim=-1).to(dtype=v.dtype)
+            out = torch.matmul(weights_s, v)
+        out = out.transpose(1, 2).contiguous().view(b, s_new, nq * hd)
+        return dense(out, weights[f"{p}.attn.c_proj.weight"], weights.get(f"{p}.attn.c_proj.bias"))
 
     if kind == "fused_qkv":
-        qkv = F.linear(x, weights[f"{p}.attn.qkv.weight"], weights.get(f"{p}.attn.qkv.bias"))
+        qkv = dense(x, weights[f"{p}.attn.qkv.weight"], weights.get(f"{p}.attn.qkv.bias"))
         recipe = config.recipe_id
         raw = config.raw or {}
         if getattr(config, "clip_qkv", None):
@@ -476,11 +579,23 @@ def attention_from_weights(
             )
         if cache is not None:
             k, v = cache.update(spec_index, k, v)
+        scale = 1.0 / math.sqrt(hd)
+        s_new = q.shape[2]
+        if (
+            _attention_mode() != "eager"
+            and not getattr(config, "alibi", False)
+            and q.is_floating_point()
+        ):
+            # Matches the eager branch below: no sliding-window / padding mask here.
+            out = sdpa_attend(q, k, v, scale=scale)
+            out = out.transpose(1, 2).contiguous().view(x.shape[0], s_new, nq * hd)
+            return dense(
+                out, weights[f"{p}.attn.o.weight"], weights.get(f"{p}.attn.o.bias")
+            )
         if recipe not in {"gpt_neox", "bloom"}:
             k = repeat_kv(k, nq // max(nkv, 1)) if nkv else k
             v = repeat_kv(v, nq // max(nkv, 1)) if nkv else v
-        scale = 1.0 / math.sqrt(hd)
-        s_new, s_total = q.shape[2], k.shape[2]
+        s_total = k.shape[2]
         scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
         if getattr(config, "alibi", False):
             bias = build_alibi(
@@ -500,7 +615,7 @@ def attention_from_weights(
         causal = _causal_mask(s_new, s_total, x.device, scores.dtype)
         attn_w = torch.softmax(scores + causal, dim=-1).to(dtype=v.dtype)
         out = torch.matmul(attn_w, v).transpose(1, 2).contiguous().view(x.shape[0], s_new, nq * hd)
-        return F.linear(out, weights[f"{p}.attn.o.weight"], weights.get(f"{p}.attn.o.bias"))
+        return dense(out, weights[f"{p}.attn.o.weight"], weights.get(f"{p}.attn.o.bias"))
 
     if kind == "mla":
         from engine.layers.mla import mla_attention

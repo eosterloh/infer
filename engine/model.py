@@ -13,6 +13,7 @@ from engine.layers import (
     build_rope_cos_sin,
     decoder_block,
 )
+from engine.layers.linear import dense
 from engine.layers.norm import apply_norm
 from engine.schedule import MixerKind, build_schedule
 
@@ -102,8 +103,14 @@ class DecoderModel:
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         return_hidden: bool = False,
+        logits_to_keep: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Token IDs or precomputed embeddings → logits, optionally final hidden."""
+        """Token IDs or precomputed embeddings → logits, optionally final hidden.
+
+        ``logits_to_keep=n`` projects only the last ``n`` positions through the
+        LM head. Decoding needs one; on a 512-token prefill the head is about a
+        fifth of the arithmetic, so generate always asks for one.
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("provide exactly one of input_ids or inputs_embeds")
         if input_ids is not None and input_ids.dim() != 2:
@@ -221,6 +228,8 @@ class DecoderModel:
                     cache.advance(s)
 
         pre_norm_hidden = x
+        if logits_to_keep is not None and 0 < int(logits_to_keep) < x.shape[1]:
+            x = x[:, -int(logits_to_keep) :]
         hidden = apply_norm(
             x,
             self.weights,
@@ -228,7 +237,7 @@ class DecoderModel:
             self.config.rms_norm_eps,
             self.config.norm_kind,
         )
-        logits = F.linear(
+        logits = dense(
             hidden,
             self.weights["lm_head.weight"],
             self.weights.get("lm_head.bias"),

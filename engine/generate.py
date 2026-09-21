@@ -87,7 +87,7 @@ def generate_greedy(
 
     if not use_cache:
         for _ in range(max_new_tokens):
-            logits = model.forward(tokens, cache=None)
+            logits = model.forward(tokens, cache=None, logits_to_keep=1)
             next_id = _pick(logits)
             tokens = torch.cat(
                 [tokens, torch.tensor([[next_id]], dtype=torch.long, device=device)],
@@ -100,7 +100,7 @@ def generate_greedy(
 
     cache = model.make_cache(batch_size=1, device=device, dtype=model.dtype)
 
-    logits = model.forward(tokens, cache=cache)
+    logits = model.forward(tokens, cache=cache, logits_to_keep=1)
     next_id = _pick(logits)
     if next_id in eos_ids:
         return
@@ -108,7 +108,7 @@ def generate_greedy(
 
     for _ in range(max_new_tokens - 1):
         step = torch.tensor([[next_id]], dtype=torch.long, device=device)
-        logits = model.forward(step, cache=cache)
+        logits = model.forward(step, cache=cache, logits_to_keep=1)
         next_id = _pick(logits)
         if next_id in eos_ids:
             break
@@ -188,7 +188,7 @@ def generate_multimodal_greedy(
     generator = make_generator(params.seed, device)
     cache = model.make_cache(batch_size=1, device=device, dtype=model.dtype)
     logits = model.forward(
-        cache=cache, inputs_embeds=embeds, position_ids=position_ids
+        cache=cache, inputs_embeds=embeds, position_ids=position_ids, logits_to_keep=1
     )
     assert isinstance(logits, torch.Tensor)
     next_id = select_next_id(logits[0, -1], params, generator)
@@ -207,13 +207,15 @@ def generate_multimodal_greedy(
 
         step = torch.tensor([[next_id]], dtype=torch.long, device=device)
         if rope_delta is None:
-            logits = model.forward(step, cache=cache)
+            logits = model.forward(step, cache=cache, logits_to_keep=1)
         else:
             position = torch.arange(
                 cache.seq_len(), cache.seq_len() + 1, device=device, dtype=torch.long
             ).view(1, 1, 1)
             position = position.expand(3, 1, 1) + rope_delta.to(device).view(1, 1, 1)
-            logits = model.forward(step, cache=cache, position_ids=position)
+            logits = model.forward(
+                step, cache=cache, position_ids=position, logits_to_keep=1
+            )
         assert isinstance(logits, torch.Tensor)
         next_id = select_next_id(logits[0, -1], params, generator)
 
@@ -297,6 +299,7 @@ def generate_mtp_greedy(
             position_ids=prefill_positions,
             attention_mask=prefill_mask,
             return_hidden=True,
+            logits_to_keep=1,
         )
     else:
         logits, target_hidden = model.forward(
@@ -305,6 +308,7 @@ def generate_mtp_greedy(
             position_ids=prefill_positions,
             attention_mask=prefill_mask,
             return_hidden=True,
+            logits_to_keep=1,
         )
     assert isinstance(logits, torch.Tensor)
     seed = int(torch.argmax(logits[0, -1]).item())

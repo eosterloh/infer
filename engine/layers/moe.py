@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 
 from engine.config import ModelConfig
+from engine.kernels import act_mul
+from engine.layers.linear import dense
 
 
 def _relu2(x: torch.Tensor) -> torch.Tensor:
@@ -19,14 +21,14 @@ def expert_mlp(
     act: str,
 ) -> torch.Tensor:
     """NemotronHMLP: down(act(up(x))). No SwiGLU gate."""
-    h = F.linear(x, w_up)
+    h = dense(x, w_up)
     if act in {"relu2", "relu_squared", "squared_relu"}:
         h = _relu2(h)
     elif act == "silu":
         h = F.silu(h)
     else:
         raise ValueError(f"unsupported moe/mlp act {act!r}")
-    return F.linear(h, w_down)
+    return dense(h, w_down)
 
 
 def route_topk(
@@ -79,7 +81,7 @@ def expert_swiglu(
     w_up: torch.Tensor,
     w_down: torch.Tensor,
 ) -> torch.Tensor:
-    return F.linear(F.silu(F.linear(x, w_gate)) * F.linear(x, w_up), w_down)
+    return dense(act_mul(dense(x, w_gate), dense(x, w_up), "silu"), w_down)
 
 
 def softmax_topk(

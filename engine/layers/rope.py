@@ -7,6 +7,7 @@ import math
 import torch
 
 from engine.config import ModelConfig
+from engine.kernels import rope_inplace
 
 
 def _inv_freq_default(dim: int, base: float, device: torch.device) -> torch.Tensor:
@@ -126,7 +127,13 @@ def apply_rope(
     *,
     interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """q/k: [B, heads, S, hd]; cos/sin: [B, S, rotary_dim] (may be < hd)."""
+    """q/k: [B, heads, S, hd]; cos/sin: [B, S, rotary_dim] (may be < hd).
+
+    Every caller reassigns q and k, so the compiled kernel is free to rotate
+    them where they already live instead of building new tensors.
+    """
+    if rope_inplace(q, k, cos, sin, interleaved=interleaved):
+        return q, k
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
     if interleaved:
