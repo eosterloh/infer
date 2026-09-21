@@ -105,6 +105,7 @@ def test_rms_norm_weight_offset_is_gemma_form() -> None:
     assert torch.allclose(got, ref, atol=2e-5, rtol=2e-5)
 
 
+@compiled_only
 @cuda_only
 def test_cuda_extension_loaded() -> None:
     ext = load_extension()
@@ -238,6 +239,7 @@ def _rope_reference(
         rope_mod.rope_inplace = original
 
 
+@compiled_only
 @cuda_only
 @pytest.mark.parametrize("interleaved", [False, True])
 @pytest.mark.parametrize("seq", [1, 37, 512])
@@ -267,6 +269,7 @@ def test_cuda_rope_matches_python(interleaved: bool, seq: int, b: int) -> None:
     assert_no_worse_than_python(k, want_k, exact_k)
 
 
+@compiled_only
 @cuda_only
 def test_cuda_rope_partial_rotary_leaves_tail_untouched() -> None:
     torch.manual_seed(10)
@@ -998,6 +1001,7 @@ def test_attn_decode_empty_mask_gives_zeros() -> None:
     assert torch.count_nonzero(got) == 0
 
 
+@compiled_only
 @cuda_only
 def test_attn_decode_bf16_no_worse_than_python() -> None:
     from engine.kernels import attn_decode
@@ -1017,6 +1021,7 @@ def test_attn_decode_bf16_no_worse_than_python() -> None:
     assert_no_worse_than_python(got, python, exact)
 
 
+@compiled_only
 @cuda_only
 def test_attn_decode_reads_a_cache_view() -> None:
     """The engine passes ``buf[:, :, :len]``; a strided view must still work."""

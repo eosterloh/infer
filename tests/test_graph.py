@@ -17,6 +17,7 @@ import torch
 from engine.agent_api import load_engine
 from engine.config import ModelConfig
 from engine.graph import GraphDecoder, enabled
+from engine.kernels import available as kernels_available
 from engine.synth import random_engine_weights, write_config, write_hf_folder
 
 _LLAMA = {
@@ -196,6 +197,13 @@ def test_replayed_tokens_match_the_eager_ones(
     cache = model.make_cache(batch_size=1, device=model.device, dtype=model.dtype)
     model.forward(prompt, cache=cache, logits_to_keep=1)
     runner = GraphDecoder.create(model, cache, length=prompt.shape[1], budget=8)
+    if runner is None:
+        # The one thing that legitimately blocks these shapes is an MoE layer
+        # with no fused dispatch behind it, which is INFER_KERNELS=0. Capture
+        # has to decline there rather than tear down mid-capture, so a None here
+        # is the expected answer and the eager tokens are still the answer.
+        assert not kernels_available(), f"{shape}: capture declined with kernels built"
+        return
     assert runner is not None, f"{shape}: nothing about this cache blocks capture"
     assert runner.capture(want[0]), (
         f"{shape}: capture declined, so its first replay disagreed with eager"

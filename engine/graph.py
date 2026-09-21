@@ -36,6 +36,35 @@ def _round_up(value: int, block: int = BLOCK) -> int:
     return ((int(value) + block - 1) // block) * block
 
 
+def _needs_expert_loop(model) -> bool:
+    """Whether this model's MoE layers would dispatch experts from Python.
+
+    The reference dispatch asks ``torch.where`` which tokens an expert received,
+    and that has to know the answer on the host, so it synchronizes. A capture
+    does not survive one: it ends in cudaErrorStreamCaptureInvalidated, thrown by
+    ``capture_end`` rather than by the call that caused it. Declining here says
+    so where the reason is still legible, instead of leaving a torn-down capture
+    and a generic exception for the caller to interpret.
+    """
+    from engine.kernels import available
+    from engine.layers.moe import expert_stack
+    from engine.schedule import FfnKind
+
+    weights = getattr(model, "weights", None)
+    routed = [
+        spec
+        for spec in (getattr(model.config, "layers", None) or [])
+        if spec.ffn is FfnKind.MOE
+    ]
+    if not weights or not routed:
+        return False
+    # Stacked weights are what the fused kernel reads, and the kernel is what
+    # keeps the routing on the device; either one missing is the Python loop.
+    if not available():
+        return True
+    return any(expert_stack(weights, f"layers.{spec.index}") is None for spec in routed)
+
+
 class GraphDecoder:
     """One captured greedy decode step, replayed until the window runs out."""
 
@@ -46,6 +75,8 @@ class GraphDecoder:
             return None
         kv = getattr(cache, "kv", cache)
         if not hasattr(kv, "enable_graph_mode") or kv.capacity() == 0:
+            return None
+        if _needs_expert_loop(model):
             return None
         return cls(model, cache, length=length, budget=budget)
 
