@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from engine.layers.attention import causal_keep_mask
 from engine.layers.linear import dense
 from engine.layers.norm import rms_norm
 from engine.layers.rope import apply_rope
@@ -25,6 +26,9 @@ def mla_attention(
     sin: torch.Tensor,
     config: ModelConfig,
     cache: KVCache | RuntimeState | None = None,
+    *,
+    key_mask: torch.Tensor | None = None,
+    q_start: torch.Tensor | int | None = None,
 ) -> torch.Tensor:
     """x: [B, S, H] → [B, S, H]. Caches expanded K/V for greedy decode."""
     p = f"layers.{layer}"
@@ -79,19 +83,23 @@ def mla_attention(
     scale = 1.0 / math.sqrt(qk)
     scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
     s_new, s_total = q.shape[2], k.shape[2]
-    if s_new == s_total:
+    if s_new == s_total and q_start is None:
         causal = torch.triu(
             torch.full((s_new, s_total), float("-inf"), device=x.device, dtype=scores.dtype),
             diagonal=1,
         )
     else:
-        q_pos = torch.arange(s_total - s_new, s_total, device=x.device)[:, None]
-        k_pos = torch.arange(s_total, device=x.device)[None, :]
-        causal = torch.where(
-            k_pos > q_pos,
-            torch.tensor(float("-inf"), device=x.device, dtype=scores.dtype),
-            torch.zeros((), device=x.device, dtype=scores.dtype),
-        )
-    attn = torch.softmax(scores + causal, dim=-1).to(dtype=v.dtype)
+        keep = causal_keep_mask(s_new, s_total, x.device, q_start=q_start)
+        # masked_fill, not where(..., tensor(-inf)): building a device scalar out
+        # of a Python float is an unpinned host copy, which a capture rejects.
+        causal = torch.zeros((s_new, s_total), device=x.device, dtype=scores.dtype)
+        causal = causal.masked_fill(~keep, float("-inf"))
+    scores = scores + causal
+    # Without this, a left-padded batch reads its padding and a captured graph
+    # reads the zeroed tail of a buffer that runs past the live length.
+    if key_mask is not None:
+        valid = key_mask[:, -s_total:].to(device=x.device, dtype=torch.bool)
+        scores = scores.masked_fill(~valid[:, None, None, :], float("-inf"))
+    attn = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
     out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(b, s_new, nq * vdh)
     return dense(out, weights[f"{p}.attn.o.weight"])

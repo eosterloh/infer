@@ -314,6 +314,27 @@ def _clone_states(states) -> list[torch.Tensor | None]:
     return [s.clone() if s is not None else None for s in states]
 
 
+def _restore_states(live, saved) -> list[torch.Tensor | None]:
+    """Put ``saved`` back without moving the buffers the layers write through.
+
+    A captured CUDA graph holds the addresses of the state tensors it recorded,
+    so handing the cache fresh tensors here would leave every replay writing to
+    a buffer nobody reads. Copying keeps the address and still leaves the
+    snapshot independent, which is what a second rollback needs.
+    """
+    out: list[torch.Tensor | None] = []
+    for index, want in enumerate(saved):
+        have = live[index] if index < len(live) else None
+        if want is None:
+            out.append(None)
+        elif have is not None and have.shape == want.shape and have.dtype == want.dtype:
+            have.copy_(want)
+            out.append(have)
+        else:
+            out.append(want.clone())
+    return out
+
+
 class RuntimeState:
     """Unified decode state for hybrid models (attention KV + Mamba conv/SSM).
 
@@ -579,8 +600,8 @@ class RuntimeState:
         self.kv.truncate(int(snapshot["kv_len"]))
         self._token_len = int(snapshot["token_len"])
         self._mamba_ready = list(snapshot["ready"])  # type: ignore[arg-type]
-        self.conv_states = _clone_states(snapshot["conv"])  # type: ignore[arg-type]
-        self.ssm_states = _clone_states(snapshot["ssm"])  # type: ignore[arg-type]
+        self.conv_states = _restore_states(self.conv_states, snapshot["conv"])  # type: ignore[arg-type]
+        self.ssm_states = _restore_states(self.ssm_states, snapshot["ssm"])  # type: ignore[arg-type]
 
     # --- attention passthrough ---
     def update(

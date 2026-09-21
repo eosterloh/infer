@@ -220,6 +220,7 @@ class DecoderModel:
                 use_rope=self.use_rope,
                 attention_mask=effective_mask,
                 kv_mask=kv_mask,
+                q_positions=position_ids,
             )
 
         if cache is not None and hasattr(cache, "advance"):

@@ -115,3 +115,93 @@ def test_graph_mode_cache_writes_land_at_the_slot(tmp_path: Path) -> None:
 
     kv.disable_graph_mode()
     assert kv.graph_mode is False
+
+
+_GRAPH_SHAPES = {
+    # A window shorter than the captured buffer: the case where measuring the
+    # window from the buffer's end instead of the query's position masks off
+    # every real key and the layer returns zeros.
+    "sliding": {**_LLAMA, "sliding_window": 8, "use_sliding_window": True},
+    # MLA and the differential path build their masks by hand, so they are the
+    # two most likely to ignore the validity mask a fixed buffer needs.
+    "mla": {
+        **_LLAMA,
+        "architectures": ["DeepseekV3ForCausalLM"],
+        "model_type": "deepseek_v3",
+        "q_lora_rank": 16,
+        "kv_lora_rank": 16,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 8,
+        "v_head_dim": 8,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "first_k_dense_replace": 1,
+    },
+    "diff": {
+        **_LLAMA,
+        "architectures": ["DiffLlamaForCausalLM"],
+        "model_type": "diffllama",
+    },
+    # A mixer whose state is updated in place, which is what capture requires of
+    # it: the recorded graph writes through the address it saw at capture time.
+    "hybrid": {
+        **_LLAMA,
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "layer_norm_epsilon": 1e-5,
+        "hybrid_override_pattern": "M*",
+        "mamba_num_heads": 4,
+        "mamba_head_dim": 16,
+        "ssm_state_size": 16,
+        "n_groups": 1,
+        "conv_kernel": 4,
+        "mamba_hidden_act": "silu",
+        "chunk_size": 16,
+    },
+}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="capture needs a GPU")
+@pytest.mark.parametrize("shape", sorted(_GRAPH_SHAPES))
+def test_replayed_tokens_match_the_eager_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Capture has to produce the eager tokens, and has to actually happen.
+
+    ``capture()`` checks its own first replay and declines on a mismatch, so a
+    bug shows up as a decline rather than a wrong answer — which is why this
+    asserts capture succeeded before it asserts anything about the tokens.
+    """
+    monkeypatch.setenv("INFER_CUDA_GRAPH", "1")
+    folder = write_config(tmp_path / shape, _GRAPH_SHAPES[shape])
+    cfg = ModelConfig.from_pretrained(folder)
+    write_hf_folder(folder, cfg, random_engine_weights(cfg, seed=7))
+    engine = load_engine(folder, device="cuda", dtype="bfloat16")
+    model = engine.model
+    prompt = torch.randint(0, 64, (1, 12), device="cuda")
+
+    def eager_tokens(count: int) -> list[int]:
+        cache = model.make_cache(batch_size=1, device=model.device, dtype=model.dtype)
+        logits = model.forward(prompt, cache=cache, logits_to_keep=1)
+        out = [int(logits[0, -1].argmax().item())]
+        for _ in range(count - 1):
+            step = torch.tensor([[out[-1]]], device="cuda")
+            logits = model.forward(step, cache=cache, logits_to_keep=1)
+            out.append(int(logits[0, -1].argmax().item()))
+        return out
+
+    want = eager_tokens(6)
+
+    cache = model.make_cache(batch_size=1, device=model.device, dtype=model.dtype)
+    model.forward(prompt, cache=cache, logits_to_keep=1)
+    runner = GraphDecoder.create(model, cache, length=prompt.shape[1], budget=8)
+    assert runner is not None, f"{shape}: nothing about this cache blocks capture"
+    assert runner.capture(want[0]), (
+        f"{shape}: capture declined, so its first replay disagreed with eager"
+    )
+    got = [want[0]]
+    while len(got) < len(want) and runner.room():
+        got.append(runner.step())
+    runner.release()
+    assert got == want, f"{shape}: replay diverged from eager at {got} vs {want}"

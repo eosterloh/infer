@@ -133,9 +133,23 @@ def causal_keep_mask(
     s_total: int,
     device: torch.device,
     sliding_window: int | None = None,
+    q_start: torch.Tensor | int | None = None,
 ) -> torch.Tensor:
-    """[s_new, s_total] bool — True where a query may read a key."""
-    q_pos = torch.arange(s_total - s_new, s_total, device=device).unsqueeze(1)
+    """[s_new, s_total] bool — True where a query may read a key.
+
+    ``q_start`` is the position of the first query. It defaults to the end of the
+    key buffer, which holds whenever the buffer is exactly the live length, but
+    CUDA-graph decode reads a fixed buffer that runs past it: there the window has
+    to be measured from the query's own position or it excludes every real key.
+    It may be a device scalar so the mask stays capturable.
+    """
+    if q_start is None:
+        q_start = s_total - s_new
+    offset = torch.arange(s_new, device=device).unsqueeze(1)
+    if isinstance(q_start, torch.Tensor):
+        q_pos = q_start.reshape(-1)[:1].to(device=device, dtype=torch.long) + offset
+    else:
+        q_pos = int(q_start) + offset
     k_pos = torch.arange(s_total, device=device).unsqueeze(0)
     keep = k_pos <= q_pos
     if sliding_window:
@@ -165,8 +179,9 @@ def decode_attend(
     s_total = k.shape[2]
     window = int(sliding_window or 0)
     if window and key_mask is not None and s_total > window:
-        # The mask means the live length is below s_total, so "the last `window`
-        # keys" cannot be read off the buffer length. Let SDPA handle it.
+        # The kernel measures its window back from the end of the buffer, and a
+        # mask means the live length is below that, so the band would sit past
+        # the real keys. SDPA gets the query's position and can place it.
         return None
     out = kernels.attn_decode(
         q[:, :, 0],
@@ -189,6 +204,7 @@ def sdpa_attend(
     scale: float,
     sliding_window: int | None = None,
     padding_mask: torch.Tensor | None = None,
+    q_start: torch.Tensor | int | None = None,
 ) -> torch.Tensor:
     """Fused attention over [B, heads, S, D] tensors. GQA stays unexpanded.
 
@@ -200,13 +216,15 @@ def sdpa_attend(
     s_new, s_total = q.shape[2], k.shape[2]
     attn_mask: torch.Tensor | None = None
     is_causal = False
-    if padding_mask is None and not sliding_window:
+    if padding_mask is None and not sliding_window and q_start is None:
         if s_new == s_total and s_new > 1:
             is_causal = True
         elif s_new > 1:
             attn_mask = causal_keep_mask(s_new, s_total, q.device)[None, None]
     else:
-        keep = causal_keep_mask(s_new, s_total, q.device, sliding_window)[None, None]
+        keep = causal_keep_mask(
+            s_new, s_total, q.device, sliding_window, q_start=q_start
+        )[None, None]
         if padding_mask is not None:
             keep = keep & padding_mask[:, -s_total:].bool()[:, None, None, :]
         attn_mask = keep
@@ -245,26 +263,14 @@ def _causal_mask(
                 torch.ones((s_new, s_total), device=device, dtype=torch.bool),
                 diagonal=1 - sliding_window,
             )
-            causal = torch.where(
-                band,
-                torch.zeros((), device=device, dtype=dtype),
-                torch.tensor(float("-inf"), device=device, dtype=dtype),
-            )
+            causal = torch.zeros((s_new, s_total), device=device, dtype=dtype)
+            causal = causal.masked_fill(~band, float("-inf"))
         return causal
-    q_pos = torch.arange(s_total - s_new, s_total, device=device, dtype=torch.long)[:, None]
-    k_pos = torch.arange(s_total, device=device, dtype=torch.long)[None, :]
-    causal = torch.where(
-        k_pos > q_pos,
-        torch.tensor(float("-inf"), device=device, dtype=dtype),
-        torch.zeros((), device=device, dtype=dtype),
-    )
-    if sliding_window:
-        causal = torch.where(
-            k_pos < (q_pos - sliding_window + 1),
-            torch.tensor(float("-inf"), device=device, dtype=dtype),
-            causal,
-        )
-    return causal
+    # masked_fill takes the scalar as an argument; torch.tensor(-inf, device=cuda)
+    # is an unpinned host copy, which is illegal inside a graph capture.
+    keep = causal_keep_mask(s_new, s_total, device, sliding_window)
+    causal = torch.zeros((s_new, s_total), device=device, dtype=dtype)
+    return causal.masked_fill(~keep, float("-inf"))
 
 
 def attention(
@@ -307,6 +313,7 @@ def attention(
     qk_norm_after_rope: bool = False,
     sub_norm: torch.Tensor | None = None,
     kv_mask: torch.Tensor | None = None,
+    q_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Causal GQA attention. x: [B, S_new, H].
 
@@ -393,6 +400,11 @@ def attention(
     if kv_mask is not None:
         key_mask = kv_mask if key_mask is None else (key_mask.bool() & kv_mask.bool())
 
+    # A kv_mask is the signal that the key buffer runs past the live length, which
+    # is the one case where the query does not sit at its end. Everywhere else
+    # q_start stays None and the mask is built exactly as before.
+    q_start = q_positions if (kv_mask is not None and q_positions is not None) else None
+
     fused_ok = _attention_mode() != "eager" and not alibi and q.is_floating_point()
     out = None
     if fused_ok:
@@ -415,6 +427,7 @@ def attention(
                 scale=scale,
                 sliding_window=sliding_window,
                 padding_mask=key_mask,
+                q_start=q_start,
             )
     if out is not None:
         out = out.transpose(1, 2).contiguous().view(b, s_new, nq * hd)
@@ -450,21 +463,11 @@ def attention(
             diagonal=1,
         )
     else:
-        q_pos = torch.arange(
-            s_total - s_new, s_total, device=x.device, dtype=torch.long
-        )[:, None]
-        k_pos = torch.arange(s_total, device=x.device, dtype=torch.long)[None, :]
-        causal = torch.where(
-            k_pos > q_pos,
-            torch.tensor(float("-inf"), device=x.device, dtype=scores.dtype),
-            torch.tensor(0.0, device=x.device, dtype=scores.dtype),
+        keep = causal_keep_mask(
+            s_new, s_total, x.device, sliding_window, q_start=q_start
         )
-        if sliding_window:
-            causal = torch.where(
-                k_pos < (q_pos - sliding_window + 1),
-                torch.tensor(float("-inf"), device=x.device, dtype=scores.dtype),
-                causal,
-            )
+        causal = torch.zeros((s_new, s_total), device=x.device, dtype=scores.dtype)
+        causal = causal.masked_fill(~keep, float("-inf"))
     if sliding_window and s_new == s_total:
         band = torch.tril(
             torch.ones((s_new, s_total), device=x.device, dtype=torch.bool),
@@ -524,6 +527,8 @@ def differential_attention(
     *,
     use_rope: bool = True,
     attention_mask: torch.Tensor | None = None,
+    key_mask: torch.Tensor | None = None,
+    q_start: torch.Tensor | int | None = None,
 ) -> torch.Tensor:
     """Differential Transformer attention (DiffLlama)."""
     p = f"layers.{layer}"
@@ -546,11 +551,21 @@ def differential_attention(
     s_total = k.shape[2]
     scale = 1.0 / math.sqrt(hd)
     scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
-    causal = _causal_mask(s_new, s_total, x.device, scores.dtype)
+    if s_new == s_total and q_start is None:
+        causal = _causal_mask(s_new, s_total, x.device, scores.dtype)
+    else:
+        keep = causal_keep_mask(s_new, s_total, x.device, q_start=q_start)
+        # masked_fill, not where(..., tensor(-inf)): building a device scalar out
+        # of a Python float is an unpinned host copy, which a capture rejects.
+        causal = torch.zeros((s_new, s_total), device=x.device, dtype=scores.dtype)
+        causal = causal.masked_fill(~keep, float("-inf"))
     scores = scores + causal
-    if attention_mask is not None:
-        key_mask = attention_mask[:, -s_total:].to(device=x.device, dtype=torch.bool)
-        scores = scores.masked_fill(~key_mask[:, None, None, :], float("-inf"))
+    # Neither mask reached this path before, so a left-padded batch read its
+    # padding and a captured graph read the zeroed tail of a fixed buffer.
+    valid = key_mask if key_mask is not None else attention_mask
+    if valid is not None:
+        keep_k = valid[:, -s_total:].to(device=x.device, dtype=torch.bool)
+        scores = scores.masked_fill(~keep_k[:, None, None, :], float("-inf"))
     attn = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
     out1 = torch.matmul(attn, v1).transpose(1, 2).contiguous()
     out2 = torch.matmul(attn, v2).transpose(1, 2).contiguous()
@@ -585,11 +600,23 @@ def attention_from_weights(
     use_rope: bool = True,
     attention_mask: torch.Tensor | None = None,
     kv_mask: torch.Tensor | None = None,
+    q_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     p = f"layers.{spec_index}"
     nq, nkv, hd = config.num_attention_heads, config.num_key_value_heads, config.head_dim
     kind = config.attention_kind
     sliding_window = _layer_sliding_window(config, spec_index)
+    # The packed-QKV branches below used to mask on kv_mask alone, which left a
+    # left-padded batch attending to its padding.
+    key_mask = attention_mask
+    if kv_mask is not None:
+        key_mask = kv_mask if key_mask is None else (key_mask.bool() & kv_mask.bool())
+    q_start = q_positions if (kv_mask is not None and q_positions is not None) else None
+
+    def _mask_out(out: torch.Tensor, s_new: int) -> torch.Tensor:
+        if attention_mask is None:
+            return out
+        return out * attention_mask[:, -s_new:, None].to(dtype=out.dtype)
 
     if kind in {"gpt2", "gpt_bigcode"}:
         qkv = dense(x, weights[f"{p}.attn.c_attn.weight"], weights.get(f"{p}.attn.c_attn.bias"))
@@ -599,19 +626,28 @@ def attention_from_weights(
             k, v = cache.update(spec_index, k, v)
         scale = 1.0 / math.sqrt(hd)
         if _attention_mode() != "eager" and q.is_floating_point():
-            out = decode_attend(q, k, v, scale=scale, key_mask=kv_mask)
+            out = decode_attend(q, k, v, scale=scale, key_mask=key_mask)
             if out is None:
-                out = sdpa_attend(q, k, v, scale=scale, padding_mask=kv_mask)
+                out = sdpa_attend(
+                    q, k, v, scale=scale, padding_mask=key_mask, q_start=q_start
+                )
         else:
             k = repeat_kv(k, nq // max(nkv, 1)) if nkv else k
             v = repeat_kv(v, nq // max(nkv, 1)) if nkv else v
             s_total = k.shape[2]
             scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
             causal = _causal_mask(s_new, s_total, x.device, scores.dtype)
-            weights_s = torch.softmax(scores + causal, dim=-1).to(dtype=v.dtype)
+            scores = scores + causal
+            if key_mask is not None:
+                keep = key_mask[:, -s_total:].to(device=x.device, dtype=torch.bool)
+                scores = scores.masked_fill(~keep[:, None, None, :], float("-inf"))
+            weights_s = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
             out = torch.matmul(weights_s, v)
         out = out.transpose(1, 2).contiguous().view(b, s_new, nq * hd)
-        return dense(out, weights[f"{p}.attn.c_proj.weight"], weights.get(f"{p}.attn.c_proj.bias"))
+        out = dense(
+            out, weights[f"{p}.attn.c_proj.weight"], weights.get(f"{p}.attn.c_proj.bias")
+        )
+        return _mask_out(out, s_new)
 
     if kind == "fused_qkv":
         qkv = dense(x, weights[f"{p}.attn.qkv.weight"], weights.get(f"{p}.attn.qkv.bias"))
@@ -642,14 +678,29 @@ def attention_from_weights(
             and not getattr(config, "alibi", False)
             and q.is_floating_point()
         ):
-            # Matches the eager branch below: no sliding-window / padding mask here.
-            out = decode_attend(q, k, v, scale=scale, key_mask=kv_mask)
+            out = decode_attend(
+                q,
+                k,
+                v,
+                scale=scale,
+                sliding_window=sliding_window,
+                key_mask=key_mask,
+            )
             if out is None:
-                out = sdpa_attend(q, k, v, scale=scale, padding_mask=kv_mask)
+                out = sdpa_attend(
+                    q,
+                    k,
+                    v,
+                    scale=scale,
+                    sliding_window=sliding_window,
+                    padding_mask=key_mask,
+                    q_start=q_start,
+                )
             out = out.transpose(1, 2).contiguous().view(x.shape[0], s_new, nq * hd)
-            return dense(
+            out = dense(
                 out, weights[f"{p}.attn.o.weight"], weights.get(f"{p}.attn.o.bias")
             )
+            return _mask_out(out, s_new)
         if recipe not in {"gpt_neox", "bloom"}:
             k = repeat_kv(k, nq // max(nkv, 1)) if nkv else k
             v = repeat_kv(v, nq // max(nkv, 1)) if nkv else v
@@ -670,15 +721,30 @@ def attention_from_weights(
                 scores = scores * scale + bias
         else:
             scores = scores * scale
-        causal = _causal_mask(s_new, s_total, x.device, scores.dtype)
-        attn_w = torch.softmax(scores + causal, dim=-1).to(dtype=v.dtype)
+        causal = _causal_mask(s_new, s_total, x.device, scores.dtype, sliding_window)
+        scores = scores + causal
+        if key_mask is not None:
+            keep = key_mask[:, -s_total:].to(device=x.device, dtype=torch.bool)
+            scores = scores.masked_fill(~keep[:, None, None, :], float("-inf"))
+        attn_w = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
         out = torch.matmul(attn_w, v).transpose(1, 2).contiguous().view(x.shape[0], s_new, nq * hd)
-        return dense(out, weights[f"{p}.attn.o.weight"], weights.get(f"{p}.attn.o.bias"))
+        out = dense(out, weights[f"{p}.attn.o.weight"], weights.get(f"{p}.attn.o.bias"))
+        return _mask_out(out, s_new)
 
     if kind == "mla":
         from engine.layers.mla import mla_attention
 
-        return mla_attention(x, weights, spec_index, cos, sin, config, cache=cache)
+        return mla_attention(
+            x,
+            weights,
+            spec_index,
+            cos,
+            sin,
+            config,
+            cache=cache,
+            key_mask=key_mask,
+            q_start=q_start,
+        )
 
     if kind == "diff":
         return differential_attention(
@@ -691,6 +757,8 @@ def attention_from_weights(
             cache=cache,
             use_rope=use_rope,
             attention_mask=attention_mask,
+            key_mask=key_mask,
+            q_start=q_start,
         )
 
     return attention(
@@ -736,4 +804,5 @@ def attention_from_weights(
         qk_norm_after_rope=config.recipe_id == "hunyuan_v1_moe",
         sub_norm=weights.get(f"{p}.attn.sub_norm.weight"),
         kv_mask=kv_mask,
+        q_positions=q_positions,
     )

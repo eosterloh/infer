@@ -133,6 +133,13 @@ class GraphDecoder:
 
     def _arm(self, token_id: int) -> None:
         """Point every buffer at the step that follows ``self.length``."""
+        # A hybrid mixer advances its state every time the step runs, and arming
+        # happens once per warmup pass and again before the verifying replay.
+        # Without putting the state back, each of those leaves the recurrence a
+        # token further along than the eager reference it is checked against.
+        saved = getattr(self, "_saved", None)
+        if saved is not None and "hybrid" in saved:
+            self.cache.restore(saved["hybrid"])
         self.ids.fill_(int(token_id))
         self.positions.fill_(self.length)
         self.slot.fill_(self.length)
