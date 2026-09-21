@@ -261,6 +261,83 @@ __global__ void qmoe_gemv_kernel(
 
 // Straight unpack to the compute dtype, used for prefill (hand the result to
 // cuBLAS) and as the parity reference.
+//
+// This runs over every weight of every packed layer on every prefill, so it is
+// the entire cost of a quantized prefill beyond the GEMM itself. Eight elements
+// per thread: one packed word in, one 16-byte vector out, and the row index
+// comes from blockIdx.y instead of a 64-bit division of the flat index — that
+// division alone cost more than the conversion it indexed.
+template <typename scalar_t, int KIND>
+__global__ void dequant_vec_kernel(
+    const uint8_t* __restrict__ qweight,
+    const scalar_t* __restrict__ scales,
+    const uint8_t* __restrict__ scales_u8,
+    const scalar_t* __restrict__ zeros,
+    const float* __restrict__ channel_scale,
+    float global_scale,
+    scalar_t* __restrict__ out,
+    int n_cols,
+    int k_dim,
+    int group_size,
+    int group_shift,
+    int groups_per_row) {
+  constexpr int kPer = 8;
+  const int chunks_per_row = k_dim / kPer;
+  const int chunk = blockIdx.x * blockDim.x + threadIdx.x;
+  if (chunk >= chunks_per_row) {
+    return;
+  }
+  const int col = chunk * kPer;
+
+  for (int64_t row = blockIdx.y; row < n_cols; row += gridDim.y) {
+    const int64_t flat = row * k_dim + col;
+    float value[kPer];
+    float scale = 1.0f;
+    float zero = 0.0f;
+
+    if (KIND == kQuantFp8) {
+      const uint2 raw = *reinterpret_cast<const uint2*>(qweight + flat);
+      const uint32_t words[2] = {raw.x, raw.y};
+#pragma unroll
+      for (int w = 0; w < 2; ++w) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          value[w * 4 + b] = fp8_e4m3_to_float((words[w] >> (b * 8)) & 0xFFu);
+        }
+      }
+      scale = channel_scale ? channel_scale[row] : global_scale;
+    } else {
+      const uint32_t word = *reinterpret_cast<const uint32_t*>(qweight + (flat >> 1));
+      // Eight columns starting at a multiple of eight never straddle a group,
+      // so one scale covers the whole vector.
+      const int64_t g = row * groups_per_row +
+                        (group_shift >= 0 ? (col >> group_shift) : (col / group_size));
+      if (KIND == kQuantInt4) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+          value[i] = static_cast<float>((word >> (i * 4)) & 0xFu);
+        }
+        scale = to_f(scales[g]);
+        zero = zeros ? to_f(zeros[g]) : 0.0f;
+      } else {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+          value[i] = fp4_e2m1_to_float((word >> (i * 4)) & 0xFu);
+        }
+        scale = fp8_e4m3_to_float(scales_u8[g]) *
+                (channel_scale ? channel_scale[row] : global_scale);
+      }
+    }
+
+    Vec<scalar_t, kPer> packed;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+      packed.v[i] = static_cast<scalar_t>(value[i] * scale + zero);
+    }
+    *reinterpret_cast<Vec<scalar_t, kPer>*>(out + flat) = packed;
+  }
+}
+
 template <typename scalar_t, int KIND>
 __global__ void dequant_kernel(
     const uint8_t* __restrict__ qweight,
@@ -436,10 +513,35 @@ void launch_dequant(
   const scalar_t* zero_t =
       (zeros.has_value() && zeros->defined()) ? zeros->data_ptr<scalar_t>() : nullptr;
   const int threads = 256;
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
+  // Vector path: eight columns per thread, which needs a width that divides by
+  // eight and groups that do not split a vector.
+  const bool vectorizable =
+      a.k_dim % 8 == 0 && (KIND == kQuantFp8 || a.group_size % 8 == 0);
+  if (vectorizable) {
+    int shift = -1;
+    for (int bit = 0; bit < 31; ++bit) {
+      if ((int64_t{1} << bit) == a.group_size) {
+        shift = bit;
+        break;
+      }
+    }
+    const int64_t chunks = a.k_dim / 8;
+    const dim3 grid(
+        static_cast<unsigned>((chunks + threads - 1) / threads),
+        static_cast<unsigned>(std::min<int64_t>(a.n_cols, 32768)));
+    dequant_vec_kernel<scalar_t, KIND><<<grid, threads, 0, stream>>>(
+        a.qweight, scale_t, a.scales_u8, zero_t, a.channel_scale, a.global_scale,
+        out.data_ptr<scalar_t>(), static_cast<int>(a.n_cols), static_cast<int>(a.k_dim),
+        static_cast<int>(a.group_size), shift, static_cast<int>(a.groups_per_row));
+    return;
+  }
+
   const int64_t total = a.n_cols * a.k_dim;
   const int blocks =
       static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 8192));
-  dequant_kernel<scalar_t, KIND><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  dequant_kernel<scalar_t, KIND><<<blocks, threads, 0, stream>>>(
       a.qweight, scale_t, a.scales_u8, zero_t, a.channel_scale, a.global_scale,
       out.data_ptr<scalar_t>(), static_cast<int>(a.n_cols), static_cast<int>(a.k_dim),
       static_cast<int>(a.group_size), static_cast<int>(a.groups_per_row));

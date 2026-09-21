@@ -126,11 +126,7 @@ def quantize_state_dict(
         packed = by_storage.get(key)
         if packed is None:
             dense = tensor.contiguous()
-            packed = (
-                quantize(dense, kind)
-                if kind == "fp8"
-                else quantize(dense, kind, group_size=group)
-            )
+            packed = quantize(dense, kind, group_size=group)
             by_storage[key] = packed
             del dense
         out[name] = packed
@@ -164,11 +160,7 @@ def _quantize_stacks(
             if group is None or k_dim % 64 != 0:
                 continue
             flat = block.reshape(experts * n_cols, k_dim)
-            packed = (
-                quantize(flat, kind)
-                if kind == "fp8"
-                else quantize(flat, kind, group_size=group)
-            )
+            packed = quantize(flat, kind, group_size=group)
             packed.experts = experts
             packed.expert_cols = int(n_cols)
             fields[field] = packed

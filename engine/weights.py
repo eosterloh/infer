@@ -408,9 +408,7 @@ def _pack_in_place(
     group = group_for_quant(kind, int(tensor.shape[1]), group_size)
     if group is None:
         return
-    packed = (
-        quantize(tensor, kind) if kind == "fp8" else quantize(tensor, kind, group_size=group)
-    )
+    packed = quantize(tensor, kind, group_size=group)
     state[name] = packed
     del tensor
 

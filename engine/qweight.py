@@ -28,24 +28,6 @@ KIND_FP8 = 2
 _KIND_CODE = {"int4": KIND_INT4, "nvfp4": KIND_NVFP4, "fp8": KIND_FP8}
 _BITS = {"int4": 4.0, "nvfp4": 4.0, "fp8": 8.0}
 
-# One shared scratch buffer per device holds the widest dequantized matrix, so
-# the prefill path can hand cuBLAS a BF16 weight without a fresh allocation per
-# layer and without keeping a second copy of the model alive.
-_SCRATCH: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
-
-
-def _scratch(numel: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (device, dtype)
-    buf = _SCRATCH.get(key)
-    if buf is None or buf.numel() < numel:
-        buf = torch.empty(numel, device=device, dtype=dtype)
-        _SCRATCH[key] = buf
-    return buf[:numel]
-
-
-def clear_scratch() -> None:
-    _SCRATCH.clear()
-
 
 @dataclass
 class QuantWeight:
@@ -129,19 +111,6 @@ class QuantWeight:
             except Exception:
                 pass
         return python_dequantize(self).to(dtype)
-
-    def dequantize_into_scratch(self) -> torch.Tensor:
-        """Dequantize into the shared buffer; valid until the next call."""
-        ops = _ops()
-        if ops is None or not self.qweight.is_cuda:
-            return self.dequantize()
-        buf = _scratch(self.numel(), self.qweight.device, self.compute_dtype)
-        view = buf.view(self.out_features, self.in_features)
-        try:
-            view.copy_(self.dequantize())
-            return view
-        except Exception:
-            return self.dequantize()
 
     def linear(self, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         return qlinear(x, self, bias)
@@ -383,9 +352,17 @@ def quantize_nvfp4(
 
 
 def quantize_fp8(
-    weight: torch.Tensor, *, compute_dtype: torch.dtype | None = None
+    weight: torch.Tensor,
+    *,
+    compute_dtype: torch.dtype | None = None,
+    group_size: int | None = None,
 ) -> QuantWeight:
-    """Per-row E4M3: near lossless, half the bytes of BF16."""
+    """Per-row E4M3: near lossless, half the bytes of BF16.
+
+    ``group_size`` is accepted and ignored — an FP8 row is its own group — so
+    callers can pass the same arguments for every kind.
+    """
+    del group_size
     n, k = weight.shape
     dtype = compute_dtype or (
         weight.dtype if weight.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
@@ -461,8 +438,9 @@ def qlinear(
     """``x @ w.T + bias`` against packed weights.
 
     Small row counts go through the fused GEMV, which never materializes the
-    BF16 weight. Wide prefills dequantize into the shared scratch buffer and
-    hand the work to cuBLAS, where tensor cores dominate.
+    BF16 weight. Wide prefills unpack it once and hand the work to cuBLAS, where
+    tensor cores dominate; the unpacked copy is transient and the allocator hands
+    the same block back every layer.
 
     Where "small" ends is a real crossover, not a guess: the fused path pays
     ``2·M`` scalar FLOPs per weight element, the dequantize path pays about four

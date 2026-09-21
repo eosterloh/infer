@@ -37,6 +37,11 @@ step "2. kernel parity"
 step "2b. quantized GEMV / MoE parity + bandwidth"
 "$PY" scripts/check_quant.py || fail=1
 
+step "2c. where the packed GEMV stops beating dequantize+cuBLAS"
+for kind in nvfp4 int4 fp8; do
+  "$PY" scripts/bench_qgemm.py --kind "$kind" | tee "bench/qgemm.$kind.txt" | tail -12
+done
+
 step "3. full suite"
 "$PY" -m pytest tests -q || fail=1
 
