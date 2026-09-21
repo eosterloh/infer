@@ -31,6 +31,22 @@ _BASE = {
 }
 
 
+def _decode_matches_prefill(model, ids: torch.Tensor, *, atol: float, rtol: float) -> None:
+    """A decode step must land on the logits the full pass gives for that row.
+
+    Decode takes different code than prefill — fused attention over the cache, a
+    GEMV instead of a GEMM, a grouped dispatch instead of a loop — so this is the
+    assertion that catches a fast path whose math drifted from the reference.
+    """
+    full = model.forward(ids)
+    warm = model.make_cache(batch_size=1, device=ids.device, dtype=model.dtype)
+    model.forward(ids[:, :-1], cache=warm)
+    decoded = model.forward(ids[:, -1:], cache=warm)
+    torch.testing.assert_close(
+        decoded[0, -1].float(), full[0, -1].float(), atol=atol, rtol=rtol
+    )
+
+
 def _run_folder(tmp_path: Path, raw: dict, recipe: str) -> None:
     folder = write_config(tmp_path / recipe, raw)
     cfg = ModelConfig.from_pretrained(folder)
@@ -53,19 +69,8 @@ def _run_folder(tmp_path: Path, raw: dict, recipe: str) -> None:
     assert pre.shape[-1] == cfg.vocab_size
     assert step.shape == (1, 1, cfg.vocab_size)
 
-    # A decode step takes different code than a prefill row — a fused decode
-    # attention, a GEMV instead of a GEMM — so it has to land on the same
-    # logits the full-sequence pass gives for that position.
     long_ids = torch.cat([ids, ids[:, :1]], dim=1)
-    full = model.forward(long_ids)
-    warm = model.make_cache(
-        batch_size=1, device=ids.device, dtype=engine_w["embed.weight"].dtype
-    )
-    model.forward(long_ids[:, :-1], cache=warm)
-    decoded = model.forward(long_ids[:, -1:], cache=warm)
-    torch.testing.assert_close(
-        decoded[0, -1], full[0, -1], atol=2e-4, rtol=2e-4
-    )
+    _decode_matches_prefill(model, long_ids, atol=2e-4, rtol=2e-4)
 
     write_hf_folder(folder, cfg, engine_w)
     inv_ok = validate_name_map(cfg, __import__("safetensors.torch", fromlist=["load_file"]).load_file(str(folder / "model.safetensors")).keys())
@@ -79,6 +84,21 @@ def _run_folder(tmp_path: Path, raw: dict, recipe: str) -> None:
     eng = load_engine(folder, device="cpu", dtype="float32")
     text = eng.generate("hi", max_new_tokens=2, apply_chat_template=False)
     assert isinstance(text, str)
+
+    # Only load_engine stacks MoE experts, so the grouped dispatch the fused
+    # kernels exist for is unreachable from the model built above.
+    _decode_matches_prefill(eng.model, long_ids, atol=2e-4, rtol=2e-4)
+
+    if torch.cuda.is_available():
+        # The same assertion where it counts: real kernels, BF16, on the GPU.
+        # Every recipe in this file reaches it, which is the only CUDA coverage
+        # the integration tests have.
+        gpu = load_engine(folder, device="cuda", dtype="bfloat16")
+        _decode_matches_prefill(
+            gpu.model, long_ids.to("cuda"), atol=6e-2, rtol=6e-2
+        )
+        del gpu
+        torch.cuda.empty_cache()
 
 
 def test_mistral_dropin(tmp_path: Path) -> None:

@@ -385,6 +385,7 @@ def test_quantization_round_trip_stays_close(kind: str) -> None:
     assert err < limit, f"{kind} round trip error {err:.4f}"
 
 
+@compiled_only
 @pytest.mark.parametrize("kind", QUANT_KINDS)
 @pytest.mark.parametrize("rows", [1, 4, 6, 12, 17, 32, 70])
 def test_qgemv_matches_dequantized_linear(kind: str, rows: int) -> None:
@@ -409,6 +410,7 @@ def test_qgemv_matches_dequantized_linear(kind: str, rows: int) -> None:
     assert rel < 5e-3, f"{kind} qgemv rel error {rel:.2e}"
 
 
+@compiled_only
 @pytest.mark.parametrize("group", [32, 64, 128])
 @pytest.mark.parametrize("k", [128, 2048, 4096])
 def test_qgemv_int4_group_sizes_line_up_with_scales(group: int, k: int) -> None:

@@ -251,7 +251,11 @@ def test_memory_floor_stops_a_load_before_the_pool_runs_out(
 
 def test_fused_path_chunks_past_the_kernels_row_budget() -> None:
     """The row cap is a measured choice, not the kernel's register count."""
+    from engine.kernels import available
     from engine.qweight import KERNEL_ROW_LIMIT, fused_qlinear, python_dequantize, quantize
+
+    if not available():
+        pytest.skip("the fused path is the compiled op")
 
     torch.manual_seed(4)
     w = torch.randn(320, 512, dtype=torch.bfloat16) * 0.02
@@ -269,7 +273,11 @@ def test_fused_path_chunks_past_the_kernels_row_budget() -> None:
 
 
 def test_fused_path_declines_shapes_it_cannot_pack() -> None:
+    from engine.kernels import available
     from engine.qweight import fused_qlinear, quantize
+
+    if not available():
+        pytest.skip("the fused path is the compiled op")
 
     qw = quantize(torch.randn(64, 512, dtype=torch.bfloat16) * 0.02, kind="int4", group_size=128)
     assert fused_qlinear(torch.randn(4, 256, dtype=torch.bfloat16), qw) is None  # wrong width
