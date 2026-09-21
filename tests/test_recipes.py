@@ -31,20 +31,33 @@ _BASE = {
 }
 
 
-def _decode_matches_prefill(model, ids: torch.Tensor, *, atol: float, rtol: float) -> None:
+def _decode_matches_prefill(
+    model,
+    ids: torch.Tensor,
+    *,
+    atol: float | None = None,
+    rtol: float | None = None,
+    ulps: int | None = None,
+) -> None:
     """A decode step must land on the logits the full pass gives for that row.
 
     Decode takes different code than prefill — fused attention over the cache, a
     GEMV instead of a GEMM, a grouped dispatch instead of a loop — so this is the
     assertion that catches a fast path whose math drifted from the reference.
+
+    ``ulps`` scales the tolerance to the logits' own magnitude, which is the only
+    honest way to compare two BF16 reduction orders: one ulp at a logit of 17 is
+    0.125, so a fixed atol either passes everything or fails on arithmetic.
     """
     full = model.forward(ids)
     warm = model.make_cache(batch_size=1, device=ids.device, dtype=model.dtype)
     model.forward(ids[:, :-1], cache=warm)
     decoded = model.forward(ids[:, -1:], cache=warm)
-    torch.testing.assert_close(
-        decoded[0, -1].float(), full[0, -1].float(), atol=atol, rtol=rtol
-    )
+    want, got = full[0, -1].float(), decoded[0, -1].float()
+    if ulps is not None:
+        eps = torch.finfo(model.dtype).eps
+        atol, rtol = ulps * eps * want.abs().max().item(), 0.0
+    torch.testing.assert_close(got, want, atol=atol, rtol=rtol)
 
 
 def _run_folder(tmp_path: Path, raw: dict, recipe: str) -> None:
@@ -90,13 +103,18 @@ def _run_folder(tmp_path: Path, raw: dict, recipe: str) -> None:
     _decode_matches_prefill(eng.model, long_ids, atol=2e-4, rtol=2e-4)
 
     if torch.cuda.is_available():
-        # The same assertion where it counts: real kernels, BF16, on the GPU.
-        # Every recipe in this file reaches it, which is the only CUDA coverage
-        # the integration tests have.
+        # Two GPU passes, because they catch different things. fp32 leaves the
+        # kernels no rounding to hide behind: every recipe agrees to ~1e-5 there,
+        # so a mask, a window or a dtype that drifted between the two paths shows
+        # up immediately. It is also the only way a BF16-only bug like a router
+        # weight meeting a BF16 latent projection is visible at all.
+        strict = load_engine(folder, device="cuda", dtype="float32")
+        _decode_matches_prefill(strict.model, long_ids.to("cuda"), atol=1e-3, rtol=1e-3)
+        del strict
+        torch.cuda.empty_cache()
+        # Then BF16, where the kernels actually run, at the resolution BF16 has.
         gpu = load_engine(folder, device="cuda", dtype="bfloat16")
-        _decode_matches_prefill(
-            gpu.model, long_ids.to("cuda"), atol=6e-2, rtol=6e-2
-        )
+        _decode_matches_prefill(gpu.model, long_ids.to("cuda"), ulps=4)
         del gpu
         torch.cuda.empty_cache()
 

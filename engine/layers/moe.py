@@ -587,10 +587,15 @@ def _moe_nemotron(
         routed = fused_dispatch(expert_in, topk_indices, topk_weights, stack, act)
     if routed is None:
         routed = _dispatch_experts(expert_in, topk_indices, topk_weights, n_routed, run)
+    # Back to the activation dtype before the latent projection, not after: the
+    # combine multiplies by fp32 router weights, so `routed` comes back fp32 and
+    # latent_up is a BF16 weight. Casting afterwards left this path throwing on
+    # any GPU checkpoint, which an fp32 CPU run cannot show.
+    routed = routed.to(dtype=x.dtype)
     if latent:
-        routed = F.linear(routed, weights[f"{p}.moe.latent_up.weight"])
+        routed = dense(routed, weights[f"{p}.moe.latent_up.weight"])
 
-    routed = routed.view(*orig_shape).to(dtype=x.dtype)
+    routed = routed.view(*orig_shape)
     shared = expert_mlp(
         residuals,
         weights[f"{p}.moe.shared.up.weight"],
