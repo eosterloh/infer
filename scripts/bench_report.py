@@ -109,8 +109,15 @@ def _tolerance(logits: list[float]) -> float:
     return 0.05 + 0.01 * max((abs(v) for v in logits), default=0.0)
 
 
-def _logit_delta(base: dict, new: dict) -> float | None:
-    """Largest gap between the two runs' top-5 logits, or None if incomparable."""
+def _logit_delta(base: dict, new: dict, tol: float) -> float | None:
+    """Largest gap between the two runs' top-5 logits, or None if incomparable.
+
+    A top-5 list has a cut, and two tokens within a BF16 ulp of it trade places
+    for no reason worth reporting — Qwen2.5 does exactly that here, with its
+    first four logits bit-identical and rank five held by two tokens 0.125
+    apart. So a token only one run listed is fine while it sits at that cut, and
+    ``inf`` when it stands clear of it, which is what dropping a term looks like.
+    """
     fa, fb = base.get("fingerprint"), new.get("fingerprint")
     if not fa or not fb:
         return None
@@ -118,10 +125,16 @@ def _logit_delta(base: dict, new: dict) -> float | None:
     la, lb = fa.get("top5_logits"), fb.get("top5_logits")
     if not ids_a or not ids_b or not la or not lb:
         return None
-    if set(ids_a) != set(ids_b):
+    a_by, b_by = dict(zip(ids_a, la)), dict(zip(ids_b, lb))
+    shared = [token for token in ids_a if token in b_by]
+    if not shared:
         return float("inf")
-    by_id = dict(zip(ids_b, lb))
-    return max(abs(value - by_id[token]) for token, value in zip(ids_a, la))
+    for listed, other in ((a_by, b_by), (b_by, a_by)):
+        cut = min(other.values())
+        for token, value in listed.items():
+            if token not in other and value - cut > tol:
+                return float("inf")
+    return max(abs(a_by[token] - b_by[token]) for token in shared)
 
 
 def _verdict(base: dict, new: dict) -> tuple[str, bool]:
@@ -135,12 +148,12 @@ def _verdict(base: dict, new: dict) -> tuple[str, bool]:
     a, b = _ids(base), _ids(new)
     if a is None or b is None:
         return "no fingerprint", False
-    delta = _logit_delta(base, new)
     tol = _tolerance(base.get("fingerprint", {}).get("top5_logits") or [])
+    delta = _logit_delta(base, new, tol)
     if delta is None:
         return "no logits", False
     if delta == float("inf"):
-        return "DIFFERS (top-5 set changed)", True
+        return "DIFFERS (a top-5 token moved clear of the cut)", True
     if a[0] != b[0]:
         return f"DIFFERS (first token, Δlogit {delta:.3f})", True
     if delta > tol:

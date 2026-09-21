@@ -58,10 +58,15 @@ def test_a_moved_logit_fails_even_when_the_token_survives() -> None:
     assert bad and "Δlogit" in label
 
 
-def test_a_changed_candidate_set_fails() -> None:
-    swapped = _row([5, 6, 7, 8], [5, 6, 7, 8, 11], [20.0, 19.5, 18.0, 17.0, 16.0])
-    label, bad = report._verdict(BASE, swapped)
-    assert bad and "top-5 set" in label
+def test_a_swap_at_the_cut_passes_but_a_reordering_above_it_fails() -> None:
+    """Which of two equal logits makes rank five is arbitrary; rank two is not."""
+    at_the_cut = _row([5, 6, 7, 8], [5, 6, 7, 8, 11], [20.0, 19.5, 18.0, 17.0, 16.0])
+    label, bad = report._verdict(BASE, at_the_cut)
+    assert not bad, label
+
+    above_it = _row([5, 6, 7, 8], [5, 11, 7, 8, 9], [20.0, 19.5, 18.0, 17.0, 16.0])
+    label, bad = report._verdict(BASE, above_it)
+    assert bad and "clear of the cut" in label
 
 
 def test_tolerance_tracks_magnitude() -> None:
@@ -150,3 +155,33 @@ def test_strict_fails_when_a_tag_has_no_row(tmp_path, capsys, monkeypatch) -> No
     assert code == 1
     assert "graph/beta" in printed, "the missing model has to be named"
     assert "kernels/beta" not in printed
+
+
+def test_a_tie_at_the_bottom_of_the_top5_is_not_drift() -> None:
+    """Rank five trading places between two near-equal tokens says nothing.
+
+    These are the real numbers from Qwen2.5-1.5B on the Spark: the first four
+    logits identical to the bit, and the fifth held by two different tokens
+    0.125 apart — one BF16 ulp at that magnitude. Failing the run for that would
+    mean failing it for arithmetic.
+    """
+    base = _row(
+        [21718, 13, 15277], [21718, 32671, 1083, 1304, 30743],
+        [22.125, 19.0, 19.0, 18.75, 17.875], tag="origin",
+    )
+    kernels = _row(
+        [21718, 13, 15277], [21718, 32671, 1083, 1304, 47506],
+        [22.125, 19.0, 19.0, 18.75, 18.0],
+    )
+    label, bad = report._verdict(base, kernels)
+    assert not bad, label
+
+
+def test_a_token_that_should_have_made_the_list_is_drift() -> None:
+    """The cut only excuses a tie; a logit well clear of it is a real change."""
+    base = _row(
+        [5, 6], [5, 6, 7, 8, 9], [20.0, 19.5, 18.0, 17.0, 16.0], tag="origin"
+    )
+    intruder = _row([5, 6], [5, 6, 7, 8, 99], [20.0, 19.5, 18.0, 17.0, 19.2])
+    label, bad = report._verdict(base, intruder)
+    assert bad, label

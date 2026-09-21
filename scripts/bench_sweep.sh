@@ -30,8 +30,24 @@ fi
 # it every symlinked checkpoint measures a few hundred bytes and a 30B model
 # classifies as "small", which is how a big model ends up with a 512-token
 # prompt and an OOM instead of a row.
+# -L so the sizes resolve through the HF cache's symlinks, and the index first
+# where there is one: Mistral-7B ships a 14 GB consolidated copy beside its 14 GB
+# shards, and summing both classified a 7B model as too big to benchmark.
 weights_bytes() {
-  find -L "$1" -maxdepth 2 \( -name '*.safetensors' -o -name '*.gguf' -o -name '*.bin' \) \
+  local dir="$1" index
+  for index in "$dir"/model.safetensors.index.json "$dir"/pytorch_model.bin.index.json; do
+    [ -f "$index" ] || continue
+    "$PY" - "$index" <<'PY' && return 0
+import json, os, sys
+index = sys.argv[1]
+folder = os.path.dirname(index)
+with open(index) as fh:
+    files = set(json.load(fh).get("weight_map", {}).values())
+print(sum(os.path.getsize(os.path.realpath(os.path.join(folder, f)))
+          for f in files if os.path.exists(os.path.join(folder, f))))
+PY
+  done
+  find -L "$dir" -maxdepth 2 \( -name '*.safetensors' -o -name '*.gguf' -o -name '*.bin' \) \
     -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}'
 }
 
