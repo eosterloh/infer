@@ -304,3 +304,33 @@ def test_dequantize_honors_the_dtype_it_was_asked_for(kind: str) -> None:
     assert not torch.equal(exact, exact.to(torch.bfloat16).float()), (
         "fp32 unpack came back through bf16"
     )
+
+
+def test_preflight_trusts_the_kernel_on_an_integrated_gpu(tmp_path: Path, monkeypatch) -> None:
+    """The CUDA driver's "free" is not the budget when the pool is shared.
+
+    On the GB10 the device pool is the host pool, and the driver counts only
+    unused pages: right after a 55 GB checkpoint read it said 40 GB free while
+    the kernel said 122 GB of the same 131 GB was allocatable. Believing the
+    driver refused every model loaded after a large read.
+    """
+    from engine import agent_api
+
+    class Props:
+        is_integrated = 1
+
+    monkeypatch.setattr(agent_api.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(agent_api.torch.cuda, "get_device_properties", lambda _: Props())
+    monkeypatch.setattr(
+        agent_api.torch.cuda, "mem_get_info", lambda: (40 * 10**9, 131 * 10**9)
+    )
+    monkeypatch.setattr("engine.memory.available_bytes", lambda: 122 * 10**9)
+
+    folder = _folder(tmp_path, _LLAMA, "integrated")
+    report = agent_api.memory_preflight(folder, device="cuda", dtype="bfloat16", quant=None)
+    assert report["free_gb"] > 100, report
+
+    # A discrete GPU has its own pool, so there the driver is the authority.
+    Props.is_integrated = 0
+    report = agent_api.memory_preflight(folder, device="cuda", dtype="bfloat16", quant=None)
+    assert report["free_gb"] < 50, report

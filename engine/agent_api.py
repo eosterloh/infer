@@ -358,6 +358,16 @@ def memory_preflight(
     want = resident + transient
     if device.startswith("cuda") and torch.cuda.is_available():
         free, total = torch.cuda.mem_get_info()
+        # On an integrated GPU the device pool *is* the host pool, and the CUDA
+        # driver's "free" counts only unused pages: after reading a 55 GB
+        # checkpoint it reported 40 GB free where the kernel reported 122 GB
+        # available of the same 131 GB, the difference being page cache it would
+        # reclaim on demand. Taking the driver's word refused every model that
+        # followed a large read — including the 30B this engine is aimed at.
+        if getattr(torch.cuda.get_device_properties(0), "is_integrated", 0):
+            host_free = available_bytes()
+            if host_free is not None:
+                free = max(free, host_free)
     else:
         free = available_bytes()
         total = total_bytes()
