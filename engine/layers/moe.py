@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -206,6 +208,28 @@ def _stack_gemv(
     return moe_gemv(x, w, row_expert, row_input, bias)
 
 
+def fused_worth_it(tokens: int, topk: int, n_routed: int) -> bool:
+    """Whether the grouped GEMV beats a per-expert GEMM for this many tokens.
+
+    The grouped kernel gives every routed row its own warp, and that warp reads
+    the whole expert row it needs. Two rows on one expert therefore read that
+    expert twice. Decode has one row per expert at most, so it wins outright —
+    no host round trip, no synchronization per expert, and it is the only form
+    a CUDA graph can capture. A wide prefill is the opposite case: dozens of
+    rows land on each expert, and reading the weights once into a cuBLAS tile
+    beats reading them dozens of times.
+    """
+    if tokens <= 1:
+        return True
+    try:
+        limit = float(os.environ.get("INFER_MOE_FUSED_ROWS_PER_EXPERT", "2"))
+    except ValueError:
+        limit = 2.0
+    if n_routed <= 0:
+        return True
+    return (tokens * max(topk, 1)) <= limit * n_routed
+
+
 def fused_dispatch(
     flat: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -355,7 +379,7 @@ def moe(
     packed = f"{p}.moe.experts.gate_up.weight" in weights or (
         stack is not None and "gate_up" in stack
     )
-    if stack is not None:
+    if stack is not None and fused_worth_it(flat.shape[0], top_k, n_routed):
         fused = fused_dispatch(
             flat, topk_i, topk_w, stack, config.mlp_hidden_act or "silu"
         )
@@ -559,7 +583,7 @@ def _moe_nemotron(
         return expert_mlp(tok, expert["up"], expert["down"], act)
 
     routed = None
-    if stack is not None:
+    if stack is not None and fused_worth_it(expert_in.shape[0], top_k, n_routed):
         routed = fused_dispatch(expert_in, topk_indices, topk_weights, stack, act)
     if routed is None:
         routed = _dispatch_experts(expert_in, topk_indices, topk_weights, n_routed, run)

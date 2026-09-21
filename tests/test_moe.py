@@ -84,3 +84,45 @@ def test_moe_forward_shape_and_finite(tmp_path: Path) -> None:
     )
     assert idx.shape == (6, 2)
     assert weights.shape == (6, 2)
+
+
+def test_fused_dispatch_gate_follows_rows_per_expert() -> None:
+    """Decode always fuses; a wide prefill must not re-read every expert."""
+    from engine.layers.moe import fused_worth_it
+
+    assert fused_worth_it(1, 8, 128) is True
+    assert fused_worth_it(32, 8, 128) is True  # 2 rows per expert
+    assert fused_worth_it(33, 8, 128) is False
+    assert fused_worth_it(512, 8, 128) is False
+    assert fused_worth_it(8, 2, 8) is True
+    assert fused_worth_it(64, 2, 8) is False
+    # A router with no experts to spread over cannot be improved on.
+    assert fused_worth_it(512, 8, 0) is True
+
+
+def test_both_dispatch_paths_agree(tmp_path: Path, monkeypatch) -> None:
+    """The gate is a speed switch, so it must not move the numbers."""
+    from engine.layers.moe import moe
+    from engine.quantize import stack_moe_experts
+
+    torch.manual_seed(5)
+    cfg = _moe_cfg(tmp_path)
+    h = cfg.hidden_size
+    n_e, mi, si = cfg.n_routed_experts, cfg.moe_intermediate_size, cfg.moe_shared_expert_intermediate_size
+    w: dict[str, torch.Tensor] = {
+        "layers.0.moe.gate.weight": torch.randn(n_e, h),
+        "layers.0.moe.gate.e_score_correction_bias": torch.zeros(n_e),
+        "layers.0.moe.shared.up.weight": torch.randn(si, h),
+        "layers.0.moe.shared.down.weight": torch.randn(h, si),
+    }
+    for e in range(n_e):
+        w[f"layers.0.moe.experts.{e}.up.weight"] = torch.randn(mi, h)
+        w[f"layers.0.moe.experts.{e}.down.weight"] = torch.randn(h, mi)
+    stack_moe_experts(w)
+
+    x = torch.randn(1, 24, h)
+    monkeypatch.setenv("INFER_MOE_FUSED_ROWS_PER_EXPERT", "1000")
+    fused = moe(x, w, 0, cfg)
+    monkeypatch.setenv("INFER_MOE_FUSED_ROWS_PER_EXPERT", "0")
+    looped = moe(x, w, 0, cfg)
+    torch.testing.assert_close(fused, looped, atol=2e-5, rtol=2e-5)

@@ -314,8 +314,8 @@ struct QuantArgs {
   int64_t groups_per_row;
 };
 
-template <typename scalar_t, int KIND>
-void launch_qgemv(
+template <typename scalar_t, int KIND, int MMAX>
+void launch_qgemv_rows(
     const at::Tensor& x,
     const c10::optional<at::Tensor>& scales,
     const c10::optional<at::Tensor>& zeros,
@@ -329,11 +329,34 @@ void launch_qgemv(
   const int threads = 256;
   const int warps = threads / kWarpSize;
   const int blocks = static_cast<int>((a.n_cols + warps - 1) / warps);
-  qgemv_kernel<scalar_t, KIND, 8><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  qgemv_kernel<scalar_t, KIND, MMAX><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       x.data_ptr<scalar_t>(), a.qweight, scale_t, a.scales_u8, zero_t, a.channel_scale,
       a.global_scale, out.data_ptr<scalar_t>(), static_cast<int>(a.m_rows),
       static_cast<int>(a.n_cols), static_cast<int>(a.k_dim),
       static_cast<int>(a.group_size), static_cast<int>(a.groups_per_row));
+}
+
+// The row cap is a register budget: MMAX accumulators plus kPerLane dequantized
+// weights live in registers for the whole row, so a 32-row launch that only
+// needs four would halve its occupancy for nothing.
+template <typename scalar_t, int KIND>
+void launch_qgemv(
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& scales,
+    const c10::optional<at::Tensor>& zeros,
+    at::Tensor& out,
+    const QuantArgs& a) {
+  if (a.m_rows <= 1) {
+    launch_qgemv_rows<scalar_t, KIND, 1>(x, scales, zeros, out, a);
+  } else if (a.m_rows <= 4) {
+    launch_qgemv_rows<scalar_t, KIND, 4>(x, scales, zeros, out, a);
+  } else if (a.m_rows <= 8) {
+    launch_qgemv_rows<scalar_t, KIND, 8>(x, scales, zeros, out, a);
+  } else if (a.m_rows <= 16) {
+    launch_qgemv_rows<scalar_t, KIND, 16>(x, scales, zeros, out, a);
+  } else {
+    launch_qgemv_rows<scalar_t, KIND, 32>(x, scales, zeros, out, a);
+  }
 }
 
 template <typename scalar_t>
@@ -460,7 +483,7 @@ at::Tensor qgemv_cuda(
   const at::cuda::OptionalCUDAGuard guard(at::device_of(x));
   auto x_c = x.contiguous().view({-1, k_dim});
   const int64_t m_rows = x_c.size(0);
-  TORCH_CHECK(m_rows <= 8, "qgemv fast path handles at most 8 rows");
+  TORCH_CHECK(m_rows <= 32, "qgemv fast path handles at most 32 rows");
 
   auto out_shape = x.sizes().vec();
   out_shape.back() = n_cols;

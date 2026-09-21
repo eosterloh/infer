@@ -292,7 +292,7 @@ def test_quantization_round_trip_stays_close(kind: str) -> None:
 
 
 @pytest.mark.parametrize("kind", QUANT_KINDS)
-@pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("rows", [1, 4, 17, 32])
 def test_qgemv_matches_dequantized_linear(kind: str, rows: int) -> None:
     """The fused GEMV must equal a linear against the unpacked weight."""
     from engine.qweight import python_dequantize, qlinear, quantize

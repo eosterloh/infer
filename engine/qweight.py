@@ -14,6 +14,7 @@ Formats
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -445,6 +446,15 @@ def bits_per_weight(kind: str) -> float:
     return _BITS[kind]
 
 
+def _max_fused_rows() -> int:
+    """Rows the fused GEMV keeps; INFER_QGEMV_MAX_ROWS to sweep the crossover."""
+    try:
+        rows = int(os.environ.get("INFER_QGEMV_MAX_ROWS", "32"))
+    except ValueError:
+        return 32
+    return max(0, min(rows, 32))
+
+
 def qlinear(
     x: torch.Tensor, qw: QuantWeight, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -453,6 +463,14 @@ def qlinear(
     Small row counts go through the fused GEMV, which never materializes the
     BF16 weight. Wide prefills dequantize into the shared scratch buffer and
     hand the work to cuBLAS, where tensor cores dominate.
+
+    Where "small" ends is a real crossover, not a guess: the fused path pays
+    ``2·M`` scalar FLOPs per weight element, the dequantize path pays about four
+    extra bytes of traffic per weight element and then runs on tensor cores. On
+    GB10 those meet in the low hundreds of rows. The cap sits well inside that
+    at 32, which is also where a routed expert lands during a sparse prefill —
+    512 tokens over 128 experts at top-8 is 32 rows each, so the MoE prefill
+    stops dequantizing entirely.
     """
     ops = _ops()
     rows = x.numel() // x.shape[-1]
@@ -460,7 +478,7 @@ def qlinear(
         ops is not None
         and qw.qweight.is_cuda
         and x.is_cuda
-        and rows <= 8
+        and rows <= _max_fused_rows()
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.shape[-1] == qw.in_features
         and qw.in_features % 64 == 0
