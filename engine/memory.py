@@ -53,6 +53,26 @@ def floor_bytes() -> float:
     return gb * 1e9
 
 
+def _release_cached_blocks() -> None:
+    """Hand torch's unused device blocks back to the kernel.
+
+    ``del`` on a CUDA tensor returns its block to torch's caching allocator, not
+    to the system. On a discrete GPU that is invisible and free. Here the device
+    pool *is* the host pool, so a cached block is a page MemAvailable no longer
+    counts: stacking a 30B checkpoint's experts frees one layer at a time and
+    still walked the pool down to 5.7 GB, because every freed expert stayed in
+    the reserve. Giving them back costs a synchronize, which is nothing next to
+    the load it unblocks.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def check_floor(stage: str) -> None:
     """Raise while the machine is still responsive enough to raise.
 
@@ -63,6 +83,11 @@ def check_floor(stage: str) -> None:
     floor = floor_bytes()
     if floor <= 0:
         return
+    free = available_bytes()
+    if free is None or free >= floor:
+        return
+    # Reclaim before refusing: the shortage may be entirely torch's own reserve.
+    _release_cached_blocks()
     free = available_bytes()
     if free is None or free >= floor:
         return

@@ -249,6 +249,32 @@ def test_memory_floor_stops_a_load_before_the_pool_runs_out(
     memory.check_floor("unknown platform")
 
 
+def test_the_floor_reclaims_torch_reserve_before_it_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached block is not a shortage on a pool shared with the host.
+
+    Stacking a 30B checkpoint's experts frees one layer at a time, and every
+    freed tensor stayed in torch's allocator, where MemAvailable stops counting
+    it. The guard saw 5.7 GB and stopped a load that had 60 GB of its own reserve
+    to give back.
+    """
+    from engine import memory
+
+    reads = iter([int(1e9), int(80e9)])
+    released: list[bool] = []
+    monkeypatch.setattr(memory, "available_bytes", lambda: next(reads))
+    monkeypatch.setattr(memory, "_release_cached_blocks", lambda: released.append(True))
+    monkeypatch.setenv("INFER_MEM_FLOOR_GB", "6")
+    memory.check_floor("stacking experts for layers.45.moe")
+    assert released == [True], "the guard refused without reclaiming first"
+
+    # Still short after reclaiming is a real shortage, and still raises.
+    monkeypatch.setattr(memory, "available_bytes", lambda: int(1e9))
+    with pytest.raises(MemoryError, match="stopping before the pool"):
+        memory.check_floor("stacking experts for layers.45.moe")
+
+
 def test_fused_path_chunks_past_the_kernels_row_budget() -> None:
     """The row cap is a measured choice, not the kernel's register count."""
     from engine.kernels import available
