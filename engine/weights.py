@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 
 import torch
@@ -12,6 +13,7 @@ from safetensors.torch import load_file
 
 from engine.config import ModelConfig
 from engine.maps import is_ignored_hf_name, is_quant_aux, map_gguf_name, map_hf_name
+from engine.memory import check_floor
 from engine.quant import maybe_dequant_state
 
 _map_hf_name = map_hf_name
@@ -413,25 +415,60 @@ def _pack_in_place(
     del tensor
 
 
-def checkpoint_numel(model_dir: str | Path) -> int:
-    """Total elements in the checkpoint, read from shard headers only.
+_DTYPE_BYTES = {
+    "F64": 8, "I64": 8,
+    "F32": 4, "I32": 4,
+    "F16": 2, "BF16": 2, "I16": 2,
+    "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1,
+}
+
+_LAYER_EXPERT = re.compile(r"\.(\d+)\.[^.]*.*expert")
+
+
+def checkpoint_profile(model_dir: str | Path) -> dict[str, int]:
+    """Shapes and dtypes from the shard headers, without reading the tensors.
 
     Safetensors keeps its metadata at the head of the file, so this costs a few
     kilobytes of IO instead of a load, which is what makes it usable as a
-    preflight check before committing to a 60 GB model.
+    preflight check before committing to a 60 GB model. Besides the totals it
+    reports the two transients a load adds on top of the resident model: the
+    largest shard, and the largest single layer's worth of experts (which the
+    MoE stacking pass concatenates before it can free the parts).
     """
     from safetensors import safe_open
 
+    numel = 0
     total = 0
+    largest_shard = 0
+    experts: dict[str, int] = {}
     for shard in _shard_paths(Path(model_dir)):
+        shard_bytes = 0
         with safe_open(str(shard), framework="pt") as f:
             for key in f.keys():
-                shape = f.get_slice(key).get_shape()
+                sliced = f.get_slice(key)
                 count = 1
-                for dim in shape:
+                for dim in sliced.get_shape():
                     count *= int(dim)
-                total += count
-    return total
+                width = _DTYPE_BYTES.get(str(sliced.get_dtype()).upper(), 2)
+                numel += count
+                total += count * width
+                shard_bytes += count * width
+                found = _LAYER_EXPERT.search(key)
+                if found:
+                    layer = found.group(1)
+                    experts[layer] = experts.get(layer, 0) + count * width
+        largest_shard = max(largest_shard, shard_bytes)
+    return {
+        "numel": numel,
+        "bytes": total,
+        "shard_bytes": largest_shard,
+        "expert_layer_bytes": max(experts.values()) if experts else 0,
+    }
+
+
+def checkpoint_numel(model_dir: str | Path) -> int:
+    """Total elements in the checkpoint, read from shard headers only."""
+    return checkpoint_profile(model_dir)["numel"]
 
 
 def load_weights(
@@ -503,6 +540,9 @@ def load_weights(
                     min_numel=quant_min_numel,
                 )
         del piece
+        # One shard in, one chance to stop: the next shard needs about as much
+        # room as the one just consumed.
+        check_floor(f"shard {i}/{len(shards)}")
 
     validate_shapes(config, state)
     state = apply_tied_embeddings(config, state)

@@ -201,3 +201,49 @@ def test_memory_preflight_refuses_impossible_load(tmp_path: Path) -> None:
     assert report["estimate_gb"] > 0
     with pytest.raises(MemoryError):
         memory_preflight(folder, device="cpu", dtype=None, quant=None, headroom=1e-12)
+
+
+def test_checkpoint_profile_reports_load_transients(tmp_path: Path) -> None:
+    """The preflight needs the shard and one layer's experts, not just totals."""
+    from engine.weights import checkpoint_profile
+
+    folder = _folder(tmp_path, _MOE, "profile_moe")
+    profile = checkpoint_profile(folder)
+    assert profile["numel"] == checkpoint_numel(folder)
+    # One shard here, so it accounts for the whole file.
+    assert profile["shard_bytes"] == profile["bytes"]
+    # Qwen3-MoE ships packed [E, 2I, H] / [E, H, I] expert blocks per layer, and
+    # the fixture has one layer, so that is every expert byte in the file.
+    width = profile["bytes"] // profile["numel"]
+    per_expert = 3 * _MOE["moe_intermediate_size"] * _MOE["hidden_size"]
+    assert profile["expert_layer_bytes"] == width * _MOE["num_experts"] * per_expert
+
+    dense = checkpoint_profile(_folder(tmp_path, _LLAMA, "profile_dense"))
+    assert dense["expert_layer_bytes"] == 0
+
+
+def test_preflight_counts_the_stacking_transient(tmp_path: Path) -> None:
+    """Stacking experts needs room for a second copy of one layer's worth."""
+    folder = _folder(tmp_path, _MOE, "preflight_moe")
+    with_stack = memory_preflight(folder, device="cpu", dtype=None, quant=None)
+    assert with_stack["transient_gb"] > 0
+    assert with_stack["estimate_gb"] > with_stack["resident_gb"]
+
+
+def test_memory_floor_stops_a_load_before_the_pool_runs_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard is what turns a frozen machine into a stack trace."""
+    from engine import memory
+
+    monkeypatch.setattr(memory, "available_bytes", lambda: int(1e9))
+    monkeypatch.setenv("INFER_MEM_FLOOR_GB", "6")
+    with pytest.raises(MemoryError, match="stopping before the pool"):
+        memory.check_floor("shard 1/4")
+
+    monkeypatch.setenv("INFER_MEM_FLOOR_GB", "0")
+    memory.check_floor("shard 1/4")
+
+    monkeypatch.setenv("INFER_MEM_FLOOR_GB", "6")
+    monkeypatch.setattr(memory, "available_bytes", lambda: None)
+    memory.check_floor("unknown platform")

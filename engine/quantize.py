@@ -12,6 +12,7 @@ import re
 
 import torch
 
+from engine.memory import check_floor
 from engine.qweight import QuantWeight, concat_quant_weights, quantize
 
 # Projections the engine runs through `dense()`. Everything else is either tiny
@@ -271,6 +272,7 @@ def stack_moe_experts(weights: dict[str, object]) -> dict[str, float]:
         if not built or "up" not in built or "down" not in built:
             continue
         stacks[prefix] = built
+        check_floor(f"stacking experts for {prefix}")
         stacked_bytes += sum(
             t.stored_bytes() if isinstance(t, QuantWeight) else t.numel() * t.element_size()
             for t in built.values()

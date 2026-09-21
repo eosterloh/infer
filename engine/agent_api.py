@@ -333,12 +333,14 @@ def memory_preflight(
     does not raise a clean CUDA OOM — it takes the whole machine down with it.
     Returns the estimate; raises MemoryError when it does not fit.
     """
-    from engine.weights import checkpoint_numel
+    from engine.memory import available_bytes, total_bytes
+    from engine.weights import checkpoint_profile
 
     try:
-        params = checkpoint_numel(model_dir)
+        profile = checkpoint_profile(model_dir)
     except Exception:
         return {}
+    params = profile["numel"]
     per_param = 2.0
     if dtype in ("float32", "fp32", "float"):
         per_param = 4.0
@@ -346,18 +348,28 @@ def memory_preflight(
         # Packing happens shard by shard during the load, so the estimate is the
         # packed model plus room for the shard being converted.
         per_param = _QUANT_BYTES_PER_PARAM.get(quant.lower(), per_param)
-    want = params * per_param
+    resident = params * per_param
+    # Two transients ride on top of the resident model: the shard being read and
+    # converted, and — when the experts get stacked — one layer's worth of them
+    # existing twice while the block is concatenated.
+    transient = float(profile.get("shard_bytes", 0))
+    if os.environ.get("INFER_MOE_STACK", "1") != "0":
+        transient += float(profile.get("expert_layer_bytes", 0))
+    want = resident + transient
     if device.startswith("cuda") and torch.cuda.is_available():
         free, total = torch.cuda.mem_get_info()
     else:
-        page = os.sysconf("SC_PAGE_SIZE")
-        try:
-            free = os.sysconf("SC_AVPHYS_PAGES") * page
-        except (ValueError, OSError):
-            free = os.sysconf("SC_PHYS_PAGES") * page
-        total = os.sysconf("SC_PHYS_PAGES") * page
+        free = available_bytes()
+        total = total_bytes()
+        if free is None:
+            # No trustworthy reading of the pool: report, but do not refuse.
+            free = total
+        if free is None:
+            return {"params": float(params), "estimate_gb": want / 1e9}
     report = {
         "params": float(params),
+        "resident_gb": resident / 1e9,
+        "transient_gb": transient / 1e9,
         "estimate_gb": want / 1e9,
         "free_gb": free / 1e9,
         "total_gb": total / 1e9,
@@ -369,7 +381,8 @@ def memory_preflight(
             else "use a smaller checkpoint"
         )
         raise MemoryError(
-            f"{Path(model_dir).name} needs ~{want / 1e9:.1f} GB of weights but only "
+            f"{Path(model_dir).name} needs ~{want / 1e9:.1f} GB "
+            f"({resident / 1e9:.1f} resident + {transient / 1e9:.1f} transient) but only "
             f"{free / 1e9:.1f} GB is free ({total / 1e9:.0f} GB pool); {hint}. "
             "Set INFER_SKIP_PREFLIGHT=1 to try anyway."
         )
