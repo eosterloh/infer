@@ -131,6 +131,7 @@ Knobs, all off-by-default unless noted:
 | `INFER_QUANT=int4\|nvfp4\|fp8` | pack weights while loading (`INFER_QUANT_GROUP`, `INFER_QUANT_MIN_NUMEL`) |
 | `INFER_MOE_STACK=0` | keep per-expert tensors instead of one `[E, N, K]` block (default on) |
 | `INFER_QGEMV_MAX_ROWS` | rows the fused packed GEMV keeps before unpacking wins (default 16, measured; above 32 rows it chunks) |
+| `INFER_QUANT_HEAD` | pack the output head along with everything else (default 1; 0 costs 17-27% of decode and did not reliably improve the answer) |
 | `INFER_MOE_FUSED_ROWS_PER_EXPERT` | rows per expert above which prefill leaves the grouped GEMV (default 2) |
 | `INFER_MEM_FLOOR_GB` | abort a load with this much of the pool left (default 6, `0` disables) |
 | `INFER_SKIP_PREFLIGHT=1` | load anyway when the size estimate says it will not fit |

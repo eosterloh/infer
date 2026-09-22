@@ -50,15 +50,20 @@ MIN_QUANT_NUMEL = _MIN_NUMEL
 
 
 def quantize_head() -> bool:
-    """Whether the output head is packed with everything else.
+    """Whether the output head is packed with everything else. It is.
 
-    Set INFER_QUANT_HEAD=1 to pack it. It is the one projection whose error has
-    nothing downstream to absorb it: every other weight's rounding passes
-    through later layers and a softmax, while the head's lands directly on the
-    logits. Measured on the GB10 — see bench/REPORT.md — packing it is most of
-    the output drift a quantized run shows, for a fraction of its memory saving.
+    The head is the one projection whose rounding reaches the logits with no
+    later layer to absorb it, which makes holding it dense the obvious first
+    thing to try when a quantized run drifts. Measured on the GB10 at NVFP4, it
+    does not pay: decode gave up 17-27% (Llama-3.2-1B 173 to 133 tok/s, gemma-2
+    97 to 71) because at these vocabularies the head is worth several layers of
+    traffic, and the output did not reliably improve — Llama held 12 of 16
+    greedy tokens dense against 16 of 16 packed. Only Gemma-2 improved, and only
+    its logit gap (0.94 to 0.63). So NVFP4's drift is spread across the weights
+    rather than concentrated here. INFER_QUANT_HEAD=0 keeps it dense; the knob
+    stays because it is the right experiment to be able to repeat per model.
     """
-    return os.environ.get("INFER_QUANT_HEAD", "0") == "1"
+    return os.environ.get("INFER_QUANT_HEAD", "1") == "1"
 
 
 def is_quantizable_name(name: str) -> bool:
