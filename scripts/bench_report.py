@@ -73,11 +73,43 @@ def families_for(recipe: str | None) -> list[str]:
     return hits or [DENSE]
 
 
-def coverage(rows: list[dict], tag: str | None = None) -> list[str]:
+def checkpoints_on_disk(root: Path) -> dict[str, str]:
+    """``{folder name: model_type}`` for every checkpoint under ``root``.
+
+    The model_type in config.json is the recipe id for all but a couple of
+    recipes, and it is enough to say which families this host could have
+    measured — which is the difference between a family this machine has no
+    checkpoint for and one whose checkpoint quietly produced no row.
+    """
+    found: dict[str, str] = {}
+    if not root.is_dir():
+        return found
+    for folder in sorted(root.iterdir()):
+        config = folder / "config.json"
+        if not config.is_file():
+            continue
+        try:
+            with config.open() as handle:
+                model_type = json.load(handle).get("model_type")
+        except (OSError, ValueError):
+            continue
+        if model_type:
+            found[folder.name] = str(model_type)
+    return found
+
+
+def coverage(
+    rows: list[dict], tag: str | None = None, models_dir: Path | None = None
+) -> list[str]:
     """Which model families the sweep measured, and which it did not.
 
     Across every tag, not one of them: a family counts as covered if any run
     reached it, and a quantized sweep that skipped a model should not erase it.
+
+    With a models directory, an empty row says which of the two empties it is. A
+    family this host has no checkpoint for is a limit of the machine; a family
+    whose checkpoint is sitting right there and produced nothing is a result
+    missing from the sweep, and the two should not print the same way.
     """
     seen: dict[str, set[str]] = {name: set() for name, _ in FAMILIES}
     seen[DENSE] = set()
@@ -85,11 +117,25 @@ def coverage(rows: list[dict], tag: str | None = None) -> list[str]:
     for row in measured:
         for family in families_for(row.get("recipe")):
             seen[family].add(row["model"])
-    lines = ["## family coverage", ""]
-    lines.append("| family | models measured |")
-    lines.append("|---|---|")
+
+    on_disk: dict[str, set[str]] = {name: set() for name in seen}
+    for name, model_type in (
+        checkpoints_on_disk(models_dir) if models_dir else {}
+    ).items():
+        for family in families_for(model_type):
+            on_disk[family].add(name)
+
+    lines = ["## family coverage", "", "| family | models measured |", "|---|---|"]
     for family, models in seen.items():
-        lines.append(f"| {family} | {', '.join(sorted(models)) if models else '**none**'} |")
+        if models:
+            note = ", ".join(sorted(models))
+        elif models_dir is None:
+            note = "**none**"
+        elif on_disk[family]:
+            note = f"**none — {', '.join(sorted(on_disk[family]))} on disk, no row**"
+        else:
+            note = "*no checkpoint of this family on this host*"
+        lines.append(f"| {family} | {note} |")
     lines.append("")
     return lines
 
@@ -188,6 +234,12 @@ def main() -> int:
     p.add_argument("--tag", action="append", default=None, help="repeatable")
     p.add_argument("--out", type=Path, default=None)
     p.add_argument(
+        "--models",
+        type=Path,
+        default=Path.home() / "models",
+        help="checkpoint folder, to tell a family this host lacks from one it skipped",
+    )
+    p.add_argument(
         "--strict",
         action="store_true",
         help="exit non-zero if any tag changed a model's greedy output",
@@ -212,7 +264,7 @@ def main() -> int:
     host = next((r.get("host") for r in rows if r.get("host")), "unknown")
     lines.append(f"# infer benchmarks — {host}")
     lines.append("")
-    lines.extend(coverage(rows))
+    lines.extend(coverage(rows, models_dir=args.models))
     for tag in tags:
         new = measured[tag]
         for model in sorted(expected - set(new)):

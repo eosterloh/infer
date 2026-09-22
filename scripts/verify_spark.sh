@@ -133,7 +133,7 @@ step "4e. nvfp4 sweep"
 INFER_KERNELS=1 scripts/bench_sweep.sh nvfp4 "$SET" --quant nvfp4 || fail=1
 
 step "5. report — strict, so a faster wrong answer fails here"
-"$PY" scripts/bench_report.py --baseline origin --strict \
+"$PY" scripts/bench_report.py --baseline origin --strict --models "$MODELS" \
   --tag baseline --tag kernels --tag graph --tag nvfp4 --out bench/REPORT.md || fail=1
 
 echo

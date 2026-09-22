@@ -119,6 +119,34 @@ def test_family_coverage_names_every_kernel_group() -> None:
     assert "| MLA (compressed KV cache) | **none** |" in text
 
 
+def test_an_empty_family_says_whether_this_host_could_have_measured_it(
+    tmp_path: Path,
+) -> None:
+    """"none" is two different results and only one of them is a gap.
+
+    This host has no DeepSeek checkpoint, so MLA going unmeasured is a fact about
+    the machine. A Gemma-2 sitting in the same folder with no row is a sweep that
+    skipped a family it had, which the per-tag row check cannot see: it holds
+    every tag to the models *some* tag managed, and a model no tag ever loaded is
+    absent from that set too.
+    """
+    models = tmp_path / "models"
+    for name, model_type in (("gemma-2-2b-it", "gemma2"), ("llama1b", "llama")):
+        (models / name).mkdir(parents=True)
+        (models / name / "config.json").write_text(f'{{"model_type": "{model_type}"}}')
+    (models / "not-a-checkpoint").mkdir()
+
+    rows = [dict(BASE, model="llama1b", recipe="llama", tag="kernels")]
+    text = "\n".join(report.coverage(rows, "kernels", models_dir=models))
+    assert "gemma-2-2b-it on disk, no row" in text
+    assert "| MLA (compressed KV cache) | *no checkpoint of this family on this host* |" in text
+    assert report.checkpoints_on_disk(models) == {
+        "gemma-2-2b-it": "gemma2",
+        "llama1b": "llama",
+    }
+    assert report.checkpoints_on_disk(tmp_path / "nowhere") == {}
+
+
 def test_strict_fails_when_a_tag_has_no_row(tmp_path, capsys, monkeypatch) -> None:
     """A configuration that crashed on a model must not read as a clean sweep.
 
