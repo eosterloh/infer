@@ -274,12 +274,57 @@ def _preamble(baseline: str, tags: list[str], rows: list[dict]) -> list[str]:
     return out
 
 
+def _compare(
+    tag: str, new: dict[str, dict], base: dict[str, dict], base_name: str
+) -> tuple[list[str], list[str]]:
+    """One tag's table against one baseline, plus the drift it should fail for."""
+    lines = [
+        f"## {tag} vs {base_name}",
+        "",
+        "| model | params | decode tok/s base | decode tok/s new | speedup "
+        "| prefill tok/s base | prefill tok/s new | speedup | output |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    drifted: list[str] = []
+    for model, row in sorted(new.items()):
+        b = base.get(model)
+        params = f"{(row.get('params') or 0) / 1e9:.2f}B"
+        if b is None:
+            # The pre-work revision cannot load every checkpoint here — some of
+            # these recipes are part of the work — so "no before" is a real
+            # answer for those, not a hole in the measurement.
+            lines.append(
+                f"| {model} | {params} | — | {row['decode_tok_s']} | — | — "
+                f"| {row['prefill_tok_s']} | — | no {base_name} row |"
+            )
+            continue
+        verdict, bad = _verdict(b, row)
+        # Quantization changes the weights, so its output is expected to move; a
+        # kernel or a captured graph has no such excuse.
+        if bad and not row.get("quant"):
+            drifted.append(f"{tag} vs {base_name}/{model}: {verdict}")
+        lines.append(
+            f"| {model} | {params} "
+            f"| {b['decode_tok_s']} | {row['decode_tok_s']} "
+            f"| {row['decode_tok_s'] / b['decode_tok_s']:.2f}x "
+            f"| {b['prefill_tok_s']} | {row['prefill_tok_s']} "
+            f"| {row['prefill_tok_s'] / b['prefill_tok_s']:.2f}x | {verdict} |"
+        )
+    lines.append("")
+    return lines, drifted
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--results", type=Path, default=ROOT / "bench" / "results.jsonl")
     p.add_argument("--baseline", default="baseline")
     p.add_argument("--tag", action="append", default=None, help="repeatable")
     p.add_argument("--out", type=Path, default=None)
+    p.add_argument(
+        "--against",
+        default="baseline",
+        help="second baseline, compared after the first; the anchor every model has",
+    )
     p.add_argument(
         "--models",
         type=Path,
@@ -320,39 +365,33 @@ def main() -> int:
         if not new:
             absent.append(f"{tag}: produced no rows at all")
             continue
-        lines.append(f"## {tag} vs {args.baseline}")
-        lines.append("")
-        lines.append(
-            "| model | params | decode tok/s base | decode tok/s new | speedup "
-            "| prefill tok/s base | prefill tok/s new | speedup | output |"
-        )
-        lines.append("|---|---|---|---|---|---|---|---|---|")
-        for model, row in sorted(new.items()):
-            b = base.get(model)
-            if b is None:
-                # The pre-work revision cannot load every checkpoint here — some
-                # of these recipes are part of the work — so "no before" is a
-                # real answer for those, not a hole in the measurement.
-                lines.append(
-                    f"| {model} | {(row.get('params') or 0) / 1e9:.2f}B | — | "
-                    f"{row['decode_tok_s']} | — | — | {row['prefill_tok_s']} | — | "
-                    f"no {args.baseline} row |"
-                )
-                continue
-            d_gain = row["decode_tok_s"] / b["decode_tok_s"]
-            p_gain = row["prefill_tok_s"] / b["prefill_tok_s"]
-            verdict, bad = _verdict(b, row)
-            # Quantization changes the weights, so its output is expected to
-            # move; a kernel or a captured graph has no such excuse.
-            if bad and not row.get("quant"):
-                drifted.append(f"{tag}/{model}: {verdict}")
-            lines.append(
-                f"| {model} | {(row.get('params') or 0) / 1e9:.2f}B "
-                f"| {b['decode_tok_s']} | {row['decode_tok_s']} | {d_gain:.2f}x "
-                f"| {b['prefill_tok_s']} | {row['prefill_tok_s']} | {p_gain:.2f}x "
-                f"| {verdict} |"
-            )
-        lines.append("")
+        body, moved = _compare(tag, new, base, args.baseline)
+        lines.extend(body)
+        drifted.extend(moved)
+
+    # Then against the same code with the extension off, which is the only anchor
+    # every checkpoint has. The pre-work revision cannot load the hybrid, the
+    # sliding-window or the legacy families at all — support for several of them
+    # is part of this work — so a table anchored only there leaves three of the
+    # five families measured here with no before/after at all.
+    second = args.against
+    if second and second != args.baseline and second in {r.get("tag") for r in rows}:
+        against = latest_by_model(rows, second)
+        if against:
+            lines += [
+                f"# versus `{second}`",
+                "",
+                f"Same engine, same checkpoints, `{second}` as the before. This is "
+                "what the kernels are worth on their own, and unlike the tables "
+                "above it covers every model measured.",
+                "",
+            ]
+            for tag in tags:
+                if tag == second or not measured[tag]:
+                    continue
+                body, moved = _compare(tag, measured[tag], against, second)
+                lines.extend(body)
+                drifted.extend(moved)
 
     if drifted:
         lines.append("## output drift")

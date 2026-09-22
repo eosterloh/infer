@@ -9,7 +9,11 @@ the first time it cries wolf, and one that never fires proves nothing.
 from __future__ import annotations
 
 import importlib.util
+import json
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("bench_report", ROOT / "scripts" / "bench_report.py")
@@ -145,6 +149,45 @@ def test_an_empty_family_says_whether_this_host_could_have_measured_it(
         "llama1b": "llama",
     }
     assert report.checkpoints_on_disk(tmp_path / "nowhere") == {}
+
+
+def test_the_second_anchor_covers_what_the_first_cannot_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A model with no origin row still needs a measured before/after.
+
+    The pre-work revision cannot load the hybrid, sliding-window or legacy
+    checkpoints — support for several of them is this work — so anchoring only
+    there leaves most of the families with a dash where their speedup goes.
+    """
+    rows = [
+        # Only the dense model exists at origin.
+        dict(BASE, model="llama1b", recipe="llama", tag="origin", decode_tok_s=10.0),
+        dict(BASE, model="llama1b", recipe="llama", tag="baseline", decode_tok_s=11.0),
+        dict(BASE, model="nano30b", recipe="nemotron_h", tag="baseline", decode_tok_s=9.0),
+        dict(BASE, model="llama1b", recipe="llama", tag="kernels", decode_tok_s=22.0),
+        dict(BASE, model="nano30b", recipe="nemotron_h", tag="kernels", decode_tok_s=27.0),
+    ]
+    results = tmp_path / "results.jsonl"
+    results.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    out = tmp_path / "REPORT.md"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bench_report.py", "--results", str(results), "--baseline", "origin",
+            "--tag", "baseline", "--tag", "kernels", "--out", str(out), "--strict",
+        ],
+    )
+    assert report.main() == 0
+    text = out.read_text()
+
+    # Against origin the hybrid has no before, which the table states plainly.
+    assert "| nano30b | 0.00B | — | 27.0 | — |" in text
+    # Against the anchor every model has, it gets its speedup: 9 -> 27.
+    assert "## kernels vs baseline" in text
+    assert "| nano30b | 0.00B | 9.0 | 27.0 | 3.00x" in text
+    assert "| llama1b | 0.00B | 11.0 | 22.0 | 2.00x" in text
 
 
 def test_strict_fails_when_a_tag_has_no_row(tmp_path, capsys, monkeypatch) -> None:
