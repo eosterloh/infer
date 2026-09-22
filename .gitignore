@@ -13,3 +13,7 @@ models/
 *.pt
 *.bin
 .DS_Store
+
+# The live sweep log, appended to on every run; snapshots are committed by date.
+bench/results.jsonl
+bench/*.err
