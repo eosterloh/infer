@@ -227,6 +227,53 @@ def _verdict(base: dict, new: dict) -> tuple[str, bool]:
     return f"same head, chain splits at {common}/{len(a)} (Δlogit {delta:.3f})", False
 
 
+_TAG_MEANINGS = {
+    "origin": "the engine before any of this work, at the revision named in the sweep",
+    "baseline": "this engine with the extension off, so the Python rework shows separately",
+    "kernels": "the compiled kernels, BF16 weights",
+    "graph": "the kernels plus a captured CUDA graph for the decode step",
+    "nvfp4": "the kernels with weights packed to NVFP4 at load",
+}
+
+
+def _preamble(baseline: str, tags: list[str], rows: list[dict]) -> list[str]:
+    """What the reader needs to trust the tables, in the file rather than a chat.
+
+    A committed artifact outlives the session that produced it, and a column of
+    ratios means nothing without knowing what changed between the two runs and
+    what "same" was allowed to mean.
+    """
+    git = next((r.get("git") for r in reversed(rows) if r.get("git")), None)
+    out = [
+        "Every number here was measured on the host named above. Each row is one "
+        "checkpoint from disk: a prefill of the stated length, then a fixed number "
+        "of greedy decode steps, best of the repetitions.",
+        "",
+        f"Each table compares one configuration against `{baseline}`:",
+        "",
+    ]
+    for tag in [baseline, *tags]:
+        meaning = _TAG_MEANINGS.get(tag)
+        if meaning:
+            out.append(f"- `{tag}` — {meaning}")
+    out += [
+        "",
+        "The **output** column is the correctness check, and it is deliberately not "
+        "an exact match on the whole greedy chain. Reassociating a reduction moves a "
+        "logit by about a BF16 ulp, and sixteen steps of greedy decoding turn one "
+        "near-tie into a completely different sentence. So a configuration passes on "
+        "its first token plus its top-5 logits staying within a tolerance that scales "
+        "with their magnitude, and the table says where the chain split when it did. "
+        "A configuration that changes precision is reported and never failed: its job "
+        "is to be faster and cheaper, and how much answer that costs is the finding, "
+        "not a bug.",
+        "",
+    ]
+    if git:
+        out += [f"Engine at `{git}`.", ""]
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--results", type=Path, default=ROOT / "bench" / "results.jsonl")
@@ -264,6 +311,7 @@ def main() -> int:
     host = next((r.get("host") for r in rows if r.get("host")), "unknown")
     lines.append(f"# infer benchmarks — {host}")
     lines.append("")
+    lines.extend(_preamble(args.baseline, tags, rows))
     lines.extend(coverage(rows, models_dir=args.models))
     for tag in tags:
         new = measured[tag]
