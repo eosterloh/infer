@@ -190,6 +190,29 @@ def test_the_second_anchor_covers_what_the_first_cannot_load(
     assert "| llama1b | 0.00B | 11.0 | 22.0 | 2.00x" in text
 
 
+def test_the_ceiling_says_a_flat_speedup_was_already_at_the_wall() -> None:
+    """A model reading 55 GB per token cannot beat 4.45 tok/s, kernels or not."""
+    measured = {
+        "kernels": {
+            # 27.78B bf16 = 55.6 GB/token, so ~4.5 tok/s is the whole budget.
+            "big": dict(BASE, model="big", params=27.78e9, decode_tok_s=4.46),
+            "small": dict(BASE, model="small", params=1.24e9, decode_tok_s=78.5),
+            # Neither of these moves two bytes per parameter.
+            "packed": dict(BASE, model="packed", params=1.5e9, decode_tok_s=173.0, quant="nvfp4"),
+            "moe": dict(BASE, model="moe", params=31.6e9, recipe="nemotron_h", decode_tok_s=32.2),
+        }
+    }
+    lines = report._roofline(measured, 247.3)
+    text = "\n".join(lines)
+
+    assert "| big | 55.56 | 4.5 | 4.46 | 100% |" in text
+    assert "| small | 2.48 | 99.7 | 78.5 | 79% |" in text
+    assert "packed" not in text and "moe" not in text
+    # The one with the least headroom is listed first, since that is the one a
+    # reader is about to ask why the kernels did nothing for.
+    assert text.index("| big |") < text.index("| small |")
+
+
 def test_strict_fails_when_a_tag_has_no_row(tmp_path, capsys, monkeypatch) -> None:
     """A configuration that crashed on a model must not read as a clean sweep.
 

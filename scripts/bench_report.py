@@ -274,6 +274,61 @@ def _preamble(baseline: str, tags: list[str], rows: list[dict]) -> list[str]:
     return out
 
 
+_MOE = next(ids for name, ids in FAMILIES if name.startswith("sparse MoE"))
+
+
+def _roofline(
+    measured: dict[str, dict[str, dict]], bandwidth: float
+) -> list[str]:
+    """How much of the memory bus each BF16 run reached, and so what is left.
+
+    Decode at batch one reads every weight once and does two flops per byte, so
+    ``params * 2 / bandwidth`` is a hard ceiling no kernel can beat. Without it a
+    table of speedups cannot distinguish a kernel that gained nothing because it
+    is badly written from one that gained nothing because the model was already
+    against the wall — which is the honest reading of Qwen3.8 below.
+
+    Only the BF16 rows: a packed row's bytes per weight are not two, and an MoE
+    row reads its routed experts rather than all of them, so total parameters is
+    the wrong divisor for both and the active count is not recorded here.
+    """
+    best: dict[str, tuple[float, float]] = {}
+    for got in measured.values():
+        for model, row in got.items():
+            if row.get("quant") or row.get("recipe") in _MOE:
+                continue
+            params = row.get("params") or 0
+            if not params:
+                continue
+            ceiling = bandwidth * 1e9 / (params * 2)
+            keep = best.get(model)
+            if keep is None or row["decode_tok_s"] > keep[0]:
+                best[model] = (row["decode_tok_s"], ceiling)
+    if not best:
+        return []
+    lines = [
+        "## how much of the memory bus is left",
+        "",
+        f"Measured read bandwidth on this host is **{bandwidth} GB/s** "
+        "(`scripts/bench_bandwidth.py`), against 273 GB/s on the specification. "
+        "A BF16 decode step reads every weight once, so the ceiling below is "
+        "`params x 2 bytes / bandwidth` and no kernel goes past it. Packed and "
+        "MoE runs are left out: neither moves two bytes per parameter.",
+        "",
+        "| model | GB read per token | ceiling tok/s | best measured | of ceiling |",
+        "|---|---|---|---|---|",
+    ]
+    # Least headroom first: that is the row a reader is about to ask why the
+    # kernels did nothing for.
+    for model, (got, ceiling) in sorted(best.items(), key=lambda kv: -kv[1][0] / kv[1][1]):
+        gb = bandwidth / ceiling
+        lines.append(
+            f"| {model} | {gb:.2f} | {ceiling:.1f} | {got} | {got / ceiling * 100:.0f}% |"
+        )
+    lines.append("")
+    return lines
+
+
 def _compare(
     tag: str, new: dict[str, dict], base: dict[str, dict], base_name: str
 ) -> tuple[list[str], list[str]]:
@@ -321,6 +376,13 @@ def main() -> int:
     p.add_argument("--tag", action="append", default=None, help="repeatable")
     p.add_argument("--out", type=Path, default=None)
     p.add_argument(
+        "--bandwidth-gbs",
+        type=float,
+        default=247.3,
+        help="measured read bandwidth; scripts/bench_bandwidth.py prints it "
+        "(default is the GB10 figure, 91%% of the 273 GB/s specification)",
+    )
+    p.add_argument(
         "--against",
         default="baseline",
         help="second baseline, compared after the first; the anchor every model has",
@@ -358,6 +420,7 @@ def main() -> int:
     lines.append("")
     lines.extend(_preamble(args.baseline, tags, rows))
     lines.extend(coverage(rows, models_dir=args.models))
+    lines.extend(_roofline(measured, args.bandwidth_gbs))
     for tag in tags:
         new = measured[tag]
         for model in sorted(expected - set(new)):
