@@ -491,10 +491,23 @@ def test_quantize_state_dict_only_touches_projections() -> None:
     }
     out = quantize_state_dict(dict(weights), kind="int4", min_numel=1024)
     assert isinstance(out["layers.0.attn.q.weight"], QuantWeight)
-    assert isinstance(out["lm_head.weight"], QuantWeight)
     assert isinstance(out["embed.weight"], torch.Tensor)
     assert isinstance(out["layers.0.input_norm.weight"], torch.Tensor)
     assert isinstance(out["layers.0.attn.q.bias"], torch.Tensor)
+    # The head's rounding is the one that reaches the logits unmediated, so it
+    # stays dense unless asked for by name.
+    assert isinstance(out["lm_head.weight"], torch.Tensor)
+
+
+def test_the_head_is_packed_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.qweight import QuantWeight
+    from engine.quantize import quantize_state_dict
+
+    torch.manual_seed(16)
+    weights = {"lm_head.weight": torch.randn(1024, 512, dtype=torch.bfloat16)}
+    monkeypatch.setenv("INFER_QUANT_HEAD", "1")
+    out = quantize_state_dict(dict(weights), kind="int4", min_numel=1024)
+    assert isinstance(out["lm_head.weight"], QuantWeight)
 
 
 # --- MoE grouped GEMV -------------------------------------------------

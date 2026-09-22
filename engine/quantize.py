@@ -8,6 +8,7 @@ whose inner dimension the kernel cannot vectorize stay in the compute dtype.
 
 from __future__ import annotations
 
+import os
 import re
 
 import torch
@@ -48,9 +49,21 @@ _MIN_NUMEL = 1 << 18
 MIN_QUANT_NUMEL = _MIN_NUMEL
 
 
+def quantize_head() -> bool:
+    """Whether the output head is packed with everything else.
+
+    Set INFER_QUANT_HEAD=1 to pack it. It is the one projection whose error has
+    nothing downstream to absorb it: every other weight's rounding passes
+    through later layers and a softmax, while the head's lands directly on the
+    logits. Measured on the GB10 — see bench/REPORT.md — packing it is most of
+    the output drift a quantized run shows, for a fraction of its memory saving.
+    """
+    return os.environ.get("INFER_QUANT_HEAD", "0") == "1"
+
+
 def is_quantizable_name(name: str) -> bool:
     if name == "lm_head.weight":
-        return True
+        return quantize_head()
     if any(name.endswith(suffix) for suffix in _PROJECTION_SUFFIXES):
         return True
     return bool(_MOE_EXPERT.search(name))
