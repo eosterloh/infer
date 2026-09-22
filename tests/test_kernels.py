@@ -164,7 +164,12 @@ def test_cuda_fused_add_rms_norm_matches_python(offset: float) -> None:
     normed, new_residual = fused_add_rms_norm(
         x.clone(), residual.clone(), w, 1e-5, offset
     )
-    torch.testing.assert_close(new_residual, want_residual, **BF16_TOL)
+    # The residual is the stream every later layer reads, and adding two BF16
+    # tensors has one right answer, so this is equality and not a tolerance.
+    torch.testing.assert_close(new_residual, want_residual, atol=0, rtol=0)
+    # `want` is the norm of that same BF16 residual, so this also holds the
+    # kernel to taking its variance from what it stored rather than from the
+    # wider sum behind it.
     assert_no_worse_than_python(normed, want, exact)
 
 

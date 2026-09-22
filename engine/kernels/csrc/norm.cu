@@ -96,9 +96,15 @@ __global__ void fused_add_rms_norm_kernel(
     const V res = rv[i];
 #pragma unroll
     for (int j = 0; j < VEC; ++j) {
-      const float sum = static_cast<float>(value.v[j]) + static_cast<float>(res.v[j]);
-      value.v[j] = static_cast<T>(sum);
-      acc += sum * sum;
+      value.v[j] = static_cast<T>(
+          static_cast<float>(value.v[j]) + static_cast<float>(res.v[j]));
+      // Square what was stored, not the fp32 sum behind it. The residual is a
+      // BF16 tensor either way, so norming the wider value would put this kernel
+      // a fraction of an ulp off its own definition in every layer of every
+      // model — the sort of standing difference that makes a later numerical bug
+      // hard to bisect. Rounding first costs a register move.
+      const float kept = static_cast<float>(value.v[j]);
+      acc += kept * kept;
     }
     cached[slot] = value;
     rv[i] = value;
@@ -130,9 +136,10 @@ __global__ void fused_add_rms_norm_scalar_kernel(
   T* __restrict__ row_r = residual + row * hidden;
   float acc = 0.0f;
   for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-    const float sum = static_cast<float>(row_x[i]) + static_cast<float>(row_r[i]);
-    row_r[i] = static_cast<T>(sum);
-    acc += sum * sum;
+    row_r[i] = static_cast<T>(
+        static_cast<float>(row_x[i]) + static_cast<float>(row_r[i]));
+    const float kept = static_cast<float>(row_r[i]);
+    acc += kept * kept;
   }
   const float inv = rsqrtf(block_reduce_sum(acc) / static_cast<float>(hidden) + eps);
   for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
