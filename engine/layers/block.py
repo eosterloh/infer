@@ -13,8 +13,18 @@ from engine.layers.mamba1 import mamba1
 from engine.layers.mamba2 import mamba2
 from engine.layers.mlp import mlp_from_weights
 from engine.layers.moe import moe
-from engine.layers.norm import apply_norm
+from engine.layers.norm import add_and_norm, apply_norm
 from engine.schedule import FfnKind, LayerSpec, MixerKind
+
+# Every one of these runs the same norm → mix → add; the kind only picks which
+# mixer `run_mixer` dispatches to, which it already decides for itself.
+_SEQUENTIAL_MIXERS = (
+    MixerKind.ATTENTION,
+    MixerKind.MAMBA2,
+    MixerKind.MAMBA1,
+    MixerKind.GATED_DELTANET,
+    MixerKind.NONE,
+)
 
 if TYPE_CHECKING:
     from engine.cache import KVCache, RuntimeState
@@ -141,43 +151,30 @@ def decoder_block(
             x = residual + h * scale
         return x
 
-    if spec.mixer == MixerKind.ATTENTION:
-        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
-        h = run_mixer(h)
-        x = x + h * scale
-    elif spec.mixer == MixerKind.MAMBA2:
-        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
-        h = run_mixer(h)
-        x = x + h * scale
-    elif spec.mixer == MixerKind.MAMBA1:
-        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
-        h = run_mixer(h)
-        x = x + h * scale
-    elif spec.mixer == MixerKind.GATED_DELTANET:
-        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
-        h = run_mixer(h)
-        x = x + h * scale
-    elif spec.mixer == MixerKind.NONE:
-        pass
-    else:
+    if spec.mixer not in _SEQUENTIAL_MIXERS:
         raise ValueError(f"unknown mixer: {spec.mixer}")
-
-    if spec.ffn == FfnKind.DENSE_MLP:
-        nkey = f"{p}.input_norm" if spec.mixer == MixerKind.NONE else f"{p}.post_attn_norm"
-        h = apply_norm(x, weights, nkey, config.rms_norm_eps, kind)
-        h = run_ffn(h)
-        x = x + h * scale
-    elif spec.ffn == FfnKind.MOE:
-        nkey = f"{p}.input_norm" if spec.mixer == MixerKind.NONE else f"{p}.post_attn_norm"
-        h = apply_norm(x, weights, nkey, config.rms_norm_eps, kind)
-        h = run_ffn(h)
-        x = x + h * scale
-    elif spec.ffn == FfnKind.NONE:
-        pass
-    else:
+    if spec.ffn not in (FfnKind.DENSE_MLP, FfnKind.MOE, FfnKind.NONE):
         raise ValueError(f"unknown ffn: {spec.ffn}")
 
-    return x
+    mixed = None
+    if spec.mixer != MixerKind.NONE:
+        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
+        mixed = run_mixer(h)
+
+    if spec.ffn == FfnKind.NONE:
+        return x if mixed is None else x + mixed * scale
+
+    nkey = f"{p}.input_norm" if spec.mixer == MixerKind.NONE else f"{p}.post_attn_norm"
+    if mixed is None:
+        h = apply_norm(x, weights, nkey, config.rms_norm_eps, kind)
+    else:
+        # The mixer's residual add and the FFN's norm read and write the same
+        # hidden state back to back, which is two passes over it per layer per
+        # token on a path where nothing else touches it in between.
+        h, x = add_and_norm(
+            mixed, x, weights, nkey, config.rms_norm_eps, kind, scale=scale
+        )
+    return x + run_ffn(h) * scale
 
 
 def transformer_block(

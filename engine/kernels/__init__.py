@@ -221,7 +221,11 @@ def python_gated_rms_norm(
     gf = torch.nn.functional.silu(gate.float().reshape(-1, group))
     value = xf * gf if gate_first else xf
     inv = torch.rsqrt(value.pow(2).mean(dim=-1, keepdim=True) + eps)
-    out = value * inv * weight.float().reshape(1, group)
+    # The variance is per group, the scale is per channel: Nemotron-H's eight
+    # groups share one `inter`-wide weight, which lines up with the consecutive
+    # rows one token became. A group-wide weight is the single-row case.
+    w = weight.float().reshape(-1, group)
+    out = ((value * inv).reshape(-1, w.shape[0], group) * w).reshape(-1, group)
     if not gate_first:
         out = out * gf
     return out.reshape(shape).to(x.dtype)
@@ -242,7 +246,17 @@ def gated_rms_norm(
     multiplies the normalized value (Gated DeltaNet).
     """
     ops = _ops()
-    if ops is not None and x.dtype == weight.dtype and x.shape == gate.shape:
+    if (
+        ops is not None
+        and x.dtype == weight.dtype
+        and x.shape == gate.shape
+        # Both implementations index the weight by group; a partial group would
+        # read past its end. The guard belongs with the assumption, not in the
+        # two callers that happen to make it.
+        and group > 0
+        and weight.numel() % group == 0
+        and (x.numel() // group) % max(1, weight.numel() // group) == 0
+    ):
         try:
             return ops.gated_rms_norm(
                 x, gate, weight, float(eps), int(group), bool(gate_first)

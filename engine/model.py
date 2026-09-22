@@ -132,7 +132,11 @@ class DecoderModel:
                 raise ValueError(
                     f"embedding hidden {h} != config hidden {self.config.hidden_size}"
                 )
-            x = inputs_embeds
+            # The layers update the residual stream in place (see add_and_norm),
+            # so the stream cannot be a tensor the caller still holds — a vision
+            # tower's merged embedding is reused across calls. Indexing
+            # embed.weight above already produces a fresh tensor; this does not.
+            x = inputs_embeds.clone()
         start_pos = cache.seq_len() if cache is not None else 0
         effective_mask = attention_mask
         if cache is not None:

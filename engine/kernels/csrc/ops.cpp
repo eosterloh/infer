@@ -183,7 +183,11 @@ at::Tensor gated_rms_norm_cpu(
   auto gf = at::silu(gate.to(at::kFloat).reshape({-1, group}));
   auto value = gate_first ? xf * gf : xf;
   auto inv = at::rsqrt(value.pow(2).mean(-1, /*keepdim=*/true) + eps);
-  auto out = value * inv * weight.to(at::kFloat).view({1, group});
+  // The variance is per group but the scale is per channel, so a weight that
+  // spans several groups lines up with the consecutive rows of one token.
+  TORCH_CHECK(weight.numel() % group == 0, "gated_rms_norm: weight must be whole groups");
+  auto wv = weight.to(at::kFloat).view({-1, group});
+  auto out = ((value * inv).view({-1, wv.size(0), group}) * wv).view({-1, group});
   if (!gate_first) {
     out = out * gf;
   }

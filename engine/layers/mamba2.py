@@ -29,7 +29,10 @@ def _rms_norm_gated(
     d = x.shape[-1]
     if d % group_size != 0:
         raise ValueError(f"hidden {d} not divisible by group_size {group_size}")
-    if weight.numel() == group_size:
+    # Nemotron-H's norm weight spans all eight groups, and requiring a
+    # group-wide one sent every Mamba layer of the model this engine is aimed at
+    # through the elementwise form below, temporaries and all.
+    if weight.numel() % group_size == 0:
         return gated_rms_norm(x, gate, weight, eps, group_size, gate_first=True)
     # A weight spanning the whole hidden state cannot be folded into the group
     # kernel, so that case keeps the elementwise form.

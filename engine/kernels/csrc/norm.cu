@@ -145,6 +145,10 @@ __global__ void fused_add_rms_norm_scalar_kernel(
 // (RMS over x * silu(gate), per group), Gated DeltaNet gates after it. Either
 // way the reference builds half a dozen fp32 temporaries the width of the
 // hidden state, per layer, per token.
+//
+// The variance is per group, but the scale is per channel: Nemotron-H's eight
+// groups share one `inter`-wide norm weight, so the weight has its own group
+// index. `weight_groups == 1` is the case where every group scales alike.
 template <typename T>
 __global__ void gated_rms_norm_kernel(
     const T* __restrict__ x,
@@ -152,11 +156,14 @@ __global__ void gated_rms_norm_kernel(
     const T* __restrict__ weight,
     T* __restrict__ out,
     int group,
+    int weight_groups,
     float eps,
     bool gate_first) {
   const int64_t row = blockIdx.x;
   const T* __restrict__ row_x = x + row * group;
   const T* __restrict__ row_g = gate + row * group;
+  const T* __restrict__ row_w =
+      weight + (weight_groups > 1 ? (row % weight_groups) * group : 0);
   T* __restrict__ row_o = out + row * group;
 
   float acc = 0.0f;
@@ -170,7 +177,7 @@ __global__ void gated_rms_norm_kernel(
   const float inv = rsqrtf(block_reduce_sum(acc) / static_cast<float>(group) + eps);
   for (int i = threadIdx.x; i < group; i += blockDim.x) {
     const float g = silu(static_cast<float>(row_g[i]));
-    const float w = static_cast<float>(weight[i]);
+    const float w = static_cast<float>(row_w[i]);
     float value = static_cast<float>(row_x[i]);
     if (gate_first) {
       value = value * g * inv * w;
@@ -194,10 +201,14 @@ at::Tensor gated_rms_norm_cuda(
   auto w = weight.contiguous().view(-1);
   TORCH_CHECK(input.sizes() == g.sizes(), "gated_rms_norm: gate shape mismatch");
   TORCH_CHECK(group > 0 && input.numel() % group == 0, "gated_rms_norm: bad group");
-  TORCH_CHECK(w.numel() == group, "gated_rms_norm: weight must match the group");
+  TORCH_CHECK(
+      w.numel() % group == 0, "gated_rms_norm: weight must be a whole number of groups");
   TORCH_CHECK(input.scalar_type() == w.scalar_type(), "gated_rms_norm: dtype mismatch");
   auto out = at::empty_like(input);
   const int64_t rows = input.numel() / group;
+  const int64_t weight_groups = w.numel() / group;
+  TORCH_CHECK(
+      rows % weight_groups == 0, "gated_rms_norm: rows do not divide by the weight groups");
   if (rows == 0) {
     return out;
   }
@@ -210,19 +221,22 @@ at::Tensor gated_rms_norm_cuda(
         using T = at::BFloat16;
         gated_rms_norm_kernel<T><<<rows, threads, 0, stream>>>(
             input.data_ptr<T>(), g.data_ptr<T>(), w.data_ptr<T>(), out.data_ptr<T>(),
-            static_cast<int>(group), static_cast<float>(eps), gate_first);
+            static_cast<int>(group), static_cast<int>(weight_groups),
+            static_cast<float>(eps), gate_first);
       })
       AT_DISPATCH_CASE(at::kHalf, [&] {
         using T = at::Half;
         gated_rms_norm_kernel<T><<<rows, threads, 0, stream>>>(
             input.data_ptr<T>(), g.data_ptr<T>(), w.data_ptr<T>(), out.data_ptr<T>(),
-            static_cast<int>(group), static_cast<float>(eps), gate_first);
+            static_cast<int>(group), static_cast<int>(weight_groups),
+            static_cast<float>(eps), gate_first);
       })
       AT_DISPATCH_CASE(at::kFloat, [&] {
         using T = float;
         gated_rms_norm_kernel<T><<<rows, threads, 0, stream>>>(
             input.data_ptr<T>(), g.data_ptr<T>(), w.data_ptr<T>(), out.data_ptr<T>(),
-            static_cast<int>(group), static_cast<float>(eps), gate_first);
+            static_cast<int>(group), static_cast<int>(weight_groups),
+            static_cast<float>(eps), gate_first);
       }));
   AT_CUDA_CHECK(cudaGetLastError());
   return out;

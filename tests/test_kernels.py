@@ -857,6 +857,37 @@ def test_gated_rms_norm_matches_mamba_expression() -> None:
     torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
 
 
+def test_gated_rms_norm_takes_a_weight_spanning_every_group() -> None:
+    """Nemotron-H normalizes per group and scales per channel.
+
+    Its `mamba.norm.weight` is `inter` wide across eight groups. Requiring a
+    group-wide weight sent every Mamba layer of that model to the elementwise
+    Python form, so the fused path has to accept the wider one and place each
+    group's slice against the right channels.
+    """
+    from engine.kernels import gated_rms_norm
+
+    torch.manual_seed(25)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    group, groups, rows = 64, 8, 5
+    inter = group * groups
+    x = torch.randn(1, rows, inter, device=device, dtype=torch.float32)
+    gate = torch.randn_like(x)
+    w = torch.randn(inter, device=device, dtype=torch.float32)
+
+    y = (x * torch.nn.functional.silu(gate)).reshape(1, rows, groups, group)
+    want = (y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + 1e-5)).reshape(x.shape) * w
+    got = gated_rms_norm(x, gate, w, 1e-5, group, gate_first=True)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+    # A per-group weight still means "every group scales alike".
+    narrow = w[:group]
+    tiled = gated_rms_norm(x, gate, narrow.repeat(groups), 1e-5, group, gate_first=True)
+    torch.testing.assert_close(
+        gated_rms_norm(x, gate, narrow, 1e-5, group, gate_first=True), tiled
+    )
+
+
 def test_gated_rms_norm_matches_gdn_expression() -> None:
     """gate_after must match Gated DeltaNet's norm-then-gate form."""
     from engine.kernels import gated_rms_norm
