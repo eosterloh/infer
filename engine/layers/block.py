@@ -50,7 +50,9 @@ def decoder_block(
     attention_mask: torch.Tensor | None = None,
     kv_mask: torch.Tensor | None = None,
     q_positions: torch.Tensor | None = None,
-) -> torch.Tensor:
+    incoming_delta: torch.Tensor | None = None,
+    defer_ffn_add: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """One scheduled layer: optional mixer residual + optional FFN residual."""
     p = f"layers.{spec.index}"
     layer = spec.index
@@ -58,6 +60,13 @@ def decoder_block(
     residual_kind = getattr(config, "residual_kind", "sequential") or "sequential"
     scale = float(getattr(config, "residual_multiplier", 1.0) or 1.0)
     layer_rope = _layer_use_rope(config, layer, use_rope)
+    # The carried FFN residual is only meaningful on the pre-norm sequential
+    # path, where the next thing that happens to it is this layer's input norm.
+    if residual_kind != "sequential":
+        if incoming_delta is not None:
+            x = x + incoming_delta * scale
+        incoming_delta = None
+        defer_ffn_add = False
 
     def run_mixer(h: torch.Tensor) -> torch.Tensor:
         if spec.mixer == MixerKind.ATTENTION:
@@ -158,15 +167,31 @@ def decoder_block(
 
     mixed = None
     if spec.mixer != MixerKind.NONE:
-        h = apply_norm(x, weights, f"{p}.input_norm", config.rms_norm_eps, kind)
+        nkey = f"{p}.input_norm"
+        if incoming_delta is None:
+            h = apply_norm(x, weights, nkey, config.rms_norm_eps, kind)
+        else:
+            # The previous layer's FFN residual was left unadded so this norm
+            # can fold it in. One pass instead of an add and a norm.
+            h, x = add_and_norm(
+                incoming_delta, x, weights, nkey, config.rms_norm_eps, kind, scale=scale
+            )
         mixed = run_mixer(h)
 
     if spec.ffn == FfnKind.NONE:
-        return x if mixed is None else x + mixed * scale
+        delta = None if mixed is None else mixed * scale
+        if defer_ffn_add:
+            return x, delta
+        return x if delta is None else x + delta
 
     nkey = f"{p}.input_norm" if spec.mixer == MixerKind.NONE else f"{p}.post_attn_norm"
     if mixed is None:
-        h = apply_norm(x, weights, nkey, config.rms_norm_eps, kind)
+        if incoming_delta is None:
+            h = apply_norm(x, weights, nkey, config.rms_norm_eps, kind)
+        else:
+            h, x = add_and_norm(
+                incoming_delta, x, weights, nkey, config.rms_norm_eps, kind, scale=scale
+            )
     else:
         # The mixer's residual add and the FFN's norm read and write the same
         # hidden state back to back, which is two passes over it per layer per
@@ -174,7 +199,10 @@ def decoder_block(
         h, x = add_and_norm(
             mixed, x, weights, nkey, config.rms_norm_eps, kind, scale=scale
         )
-    return x + run_ffn(h) * scale
+    ffn_out = run_ffn(h)
+    if defer_ffn_add:
+        return x, ffn_out
+    return x + ffn_out * scale
 
 
 def transformer_block(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from engine.kernels import act_and_mul, act_mul
+from engine.kernels import act_and_mul, act_mul, gemv_stack
 from engine.layers.linear import dense
 
 
@@ -32,11 +32,13 @@ def mlp(
 ) -> torch.Tensor:
     gated = w_gate is not w_up
     if act in {"silu", "swiglu"}:
-        return dense(
-            act_mul(dense(x, w_gate, b_gate), dense(x, w_up, b_up), "silu"),
-            w_down,
-            b_down,
-        )
+        stacked = gemv_stack(x, [w_gate, w_up], [b_gate, b_up]) if gated else None
+        if stacked is None:
+            gate_h = dense(x, w_gate, b_gate)
+            up = dense(x, w_up, b_up)
+        else:
+            gate_h, up = stacked
+        return dense(act_mul(gate_h, up, "silu"), w_down, b_down)
     if act in {"gelu", "gelu_new", "gelu_pytorch_tanh"}:
         up = dense(x, w_up, b_up)
         if gated:

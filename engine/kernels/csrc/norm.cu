@@ -412,4 +412,110 @@ void fused_add_rms_norm_cuda(
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
+// residual += x, then LayerNorm of the stored residual, written back over x.
+// GPT-2's add and its following LayerNorm are this pair, and each one is a
+// launch that moves a single token of hidden state. One pass does both.
+template <typename T>
+__global__ void fused_add_layer_norm_kernel(
+    T* __restrict__ x,
+    T* __restrict__ residual,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    int hidden,
+    float eps) {
+  const int64_t row = blockIdx.x;
+  T* __restrict__ row_x = x + row * hidden;
+  T* __restrict__ row_r = residual + row * hidden;
+
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    row_r[i] = static_cast<T>(
+        static_cast<float>(row_x[i]) + static_cast<float>(row_r[i]));
+    sum += static_cast<float>(row_r[i]);
+  }
+  const float mean = block_reduce_sum(sum) / static_cast<float>(hidden);
+
+  float var = 0.0f;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    const float diff = static_cast<float>(row_r[i]) - mean;
+    var += diff * diff;
+  }
+  const float inv = rsqrtf(block_reduce_sum(var) / static_cast<float>(hidden) + eps);
+
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    const float centered = (static_cast<float>(row_r[i]) - mean) * inv;
+    float y = centered * static_cast<float>(weight[i]);
+    if (bias != nullptr) {
+      y += static_cast<float>(bias[i]);
+    }
+    row_x[i] = static_cast<T>(y);
+  }
+}
+
+void fused_add_layer_norm_cuda(
+    at::Tensor& x,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    double eps) {
+  const at::cuda::OptionalCUDAGuard guard(at::device_of(x));
+  TORCH_CHECK(x.is_contiguous() && residual.is_contiguous(),
+              "fused_add_layer_norm needs contiguous x and residual");
+  TORCH_CHECK(x.sizes() == residual.sizes(), "fused_add_layer_norm shape mismatch");
+  auto w = weight.contiguous().view(-1);
+  const int hidden = static_cast<int>(x.size(-1));
+  TORCH_CHECK(hidden == w.numel(), "fused_add_layer_norm: weight must match hidden dim");
+  TORCH_CHECK(w.scalar_type() == x.scalar_type(), "fused_add_layer_norm weight dtype");
+  if (bias.has_value() && bias->defined()) {
+    TORCH_CHECK(bias->scalar_type() == x.scalar_type(), "fused_add_layer_norm bias dtype");
+  }
+  const int64_t rows = x.numel() / hidden;
+  if (rows == 0) {
+    return;
+  }
+  const float eps_f = static_cast<float>(eps);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_SWITCH(
+      x.scalar_type(),
+      "fused_add_layer_norm_cuda",
+      AT_DISPATCH_CASE(at::kBFloat16, [&] {
+        using T = at::BFloat16;
+        const T* bias_ptr = nullptr;
+        at::Tensor bias_c;
+        if (bias.has_value() && bias->defined()) {
+          TORCH_CHECK(bias->numel() == hidden, "fused_add_layer_norm bias size");
+          bias_c = bias->contiguous().view(-1);
+          bias_ptr = bias_c.data_ptr<T>();
+        }
+        fused_add_layer_norm_kernel<T><<<rows, 256, 0, stream>>>(
+            x.data_ptr<T>(), residual.data_ptr<T>(), w.data_ptr<T>(), bias_ptr, hidden, eps_f);
+      })
+      AT_DISPATCH_CASE(at::kHalf, [&] {
+        using T = at::Half;
+        const T* bias_ptr = nullptr;
+        at::Tensor bias_c;
+        if (bias.has_value() && bias->defined()) {
+          TORCH_CHECK(bias->numel() == hidden, "fused_add_layer_norm bias size");
+          bias_c = bias->contiguous().view(-1);
+          bias_ptr = bias_c.data_ptr<T>();
+        }
+        fused_add_layer_norm_kernel<T><<<rows, 256, 0, stream>>>(
+            x.data_ptr<T>(), residual.data_ptr<T>(), w.data_ptr<T>(), bias_ptr, hidden, eps_f);
+      })
+      AT_DISPATCH_CASE(at::kFloat, [&] {
+        using T = float;
+        const T* bias_ptr = nullptr;
+        at::Tensor bias_c;
+        if (bias.has_value() && bias->defined()) {
+          TORCH_CHECK(bias->numel() == hidden, "fused_add_layer_norm bias size");
+          bias_c = bias->contiguous().view(-1);
+          bias_ptr = bias_c.data_ptr<T>();
+        }
+        fused_add_layer_norm_kernel<T><<<rows, 256, 0, stream>>>(
+            x.data_ptr<T>(), residual.data_ptr<T>(), w.data_ptr<T>(), bias_ptr, hidden, eps_f);
+      }));
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace infer

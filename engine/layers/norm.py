@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 
+from engine.kernels import fused_add_layer_norm as kernel_add_layer_norm
 from engine.kernels import fused_add_rms_norm as kernel_add_rms_norm
 from engine.kernels import rms_norm as kernel_rms_norm
 
@@ -74,6 +75,23 @@ def add_and_norm(
     if offset is not None and scale == 1.0 and delta.shape == residual.shape:
         normed, residual = kernel_add_rms_norm(
             delta, residual, weights[f"{key}.weight"], eps, weight_offset=offset
+        )
+        return normed, residual
+    # LayerNorm has a mean, which the RMS kernel does not, so it has its own
+    # fused add. The residual add and this norm are adjacent for every GPT-2
+    # block and for the handoff from one layer's FFN into the next.
+    if (
+        kind == "layer"
+        and scale == 1.0
+        and delta.shape == residual.shape
+        and f"{key}.weight" in weights
+    ):
+        normed, residual = kernel_add_layer_norm(
+            delta,
+            residual,
+            weights[f"{key}.weight"],
+            weights.get(f"{key}.bias"),
+            eps,
         )
         return normed, residual
     residual = residual + delta * scale

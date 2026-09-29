@@ -19,6 +19,12 @@ void fused_add_rms_norm_cuda(
     const at::Tensor& weight,
     double eps,
     double weight_offset);
+void fused_add_layer_norm_cuda(
+    at::Tensor& x,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    double eps);
 at::Tensor gated_rms_norm_cuda(
     const at::Tensor& x,
     const at::Tensor& gate,
@@ -167,6 +173,19 @@ void fused_add_rms_norm_cpu(
   TORCH_CHECK(x.sizes() == residual.sizes(), "fused_add_rms_norm shape mismatch");
   residual.add_(x);
   x.copy_(rms_norm_cpu(residual, weight, eps, weight_offset));
+}
+
+void fused_add_layer_norm_cpu(
+    at::Tensor& x,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    double eps) {
+  TORCH_CHECK(x.sizes() == residual.sizes(), "fused_add_layer_norm shape mismatch");
+  residual.add_(x);
+  auto normalized = at::layer_norm(
+      residual, {residual.size(-1)}, weight, bias.value_or(at::Tensor()), eps);
+  x.copy_(normalized);
 }
 
 at::Tensor gated_rms_norm_cpu(
@@ -505,6 +524,9 @@ TORCH_LIBRARY(infer, m) {
   m.def(
       "fused_add_rms_norm(Tensor(a!) x, Tensor(b!) residual, Tensor weight, "
       "float eps, float weight_offset) -> ()");
+  m.def(
+      "fused_add_layer_norm(Tensor(a!) x, Tensor(b!) residual, Tensor weight, "
+      "Tensor? bias, float eps) -> ()");
   m.def("act_mul(Tensor gate, Tensor up, str act) -> Tensor");
   m.def(
       "gated_rms_norm(Tensor x, Tensor gate, Tensor weight, float eps, int group, "
@@ -545,6 +567,7 @@ TORCH_LIBRARY(infer, m) {
 TORCH_LIBRARY_IMPL(infer, CPU, m) {
   m.impl("rms_norm", TORCH_FN(infer::rms_norm_cpu));
   m.impl("fused_add_rms_norm", TORCH_FN(infer::fused_add_rms_norm_cpu));
+  m.impl("fused_add_layer_norm", TORCH_FN(infer::fused_add_layer_norm_cpu));
   m.impl("act_mul", TORCH_FN(infer::act_mul_cpu));
   m.impl("gated_rms_norm", TORCH_FN(infer::gated_rms_norm_cpu));
   m.impl("act_and_mul", TORCH_FN(infer::act_and_mul_cpu));
@@ -564,6 +587,7 @@ TORCH_LIBRARY_IMPL(infer, CPU, m) {
 TORCH_LIBRARY_IMPL(infer, CUDA, m) {
   m.impl("rms_norm", TORCH_FN(infer::rms_norm_cuda));
   m.impl("fused_add_rms_norm", TORCH_FN(infer::fused_add_rms_norm_cuda));
+  m.impl("fused_add_layer_norm", TORCH_FN(infer::fused_add_layer_norm_cuda));
   m.impl("act_mul", TORCH_FN(infer::act_mul_cuda));
   m.impl("gated_rms_norm", TORCH_FN(infer::gated_rms_norm_cuda));
   m.impl("act_and_mul", TORCH_FN(infer::act_and_mul_cuda));

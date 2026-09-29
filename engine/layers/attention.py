@@ -323,9 +323,13 @@ def attention(
     length, and the query it is decoding is always real.
     """
     b, s_new, _ = x.shape
-    q = dense(x, w_q, b_q)
-    k = dense(x, w_k, b_k)
-    v = dense(x, w_v, b_v)
+    stacked = kernels.gemv_stack(x, [w_q, w_k, w_v], [b_q, b_k, b_v])
+    if stacked is None:
+        q = dense(x, w_q, b_q)
+        k = dense(x, w_k, b_k)
+        v = dense(x, w_v, b_v)
+    else:
+        q, k, v = stacked
     if clip_qkv is not None:
         q = q.clamp(-clip_qkv, clip_qkv)
         k = k.clamp(-clip_qkv, clip_qkv)

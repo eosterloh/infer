@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+import weakref
 from pathlib import Path
 
 import torch
@@ -207,6 +208,39 @@ def fused_add_rms_norm(
     return python_rms_norm(residual, weight, eps, weight_offset), residual
 
 
+def fused_add_layer_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``residual += x`` then LayerNorm, the norm written over ``x``.
+
+    Same contract as :func:`fused_add_rms_norm`. GPT-2's residual add and the
+    LayerNorm that follows it are one pass; RMS models already had theirs.
+    """
+    ops = _ops()
+    if (
+        ops is not None
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and x.dtype == weight.dtype
+        and x.shape == residual.shape
+        and (bias is None or (bias.dtype == x.dtype and bias.numel() == weight.numel()))
+    ):
+        try:
+            ops.fused_add_layer_norm(x, residual, weight, bias, float(eps))
+            return x, residual
+        except Exception:
+            pass
+    residual = residual + x
+    normed = torch.nn.functional.layer_norm(
+        residual, (residual.shape[-1],), weight, bias, float(eps)
+    )
+    return normed, residual
+
+
 def python_gated_rms_norm(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -317,6 +351,108 @@ def gemv(
         return ops.gemv(x, weight, bias)
     except Exception:
         return None
+
+
+# One concatenated copy of projections that share an activation. Capped so a
+# large checkpoint cannot pin a second copy of itself on the shared Spark pool.
+# The key is the Python object id, not the storage address: the caching
+# allocator hands a freed block's address to the next tensor. A tensor cannot
+# be a WeakKeyDictionary key (its truth value is ambiguous), so the weakref
+# only drops the entry when that object is collected.
+_STACKED: dict[tuple[int, ...], tuple[torch.Tensor, torch.Tensor | None, int]] = {}
+_STACK_REFS: dict[int, weakref.ref] = {}
+_STACKED_BYTES = 0
+_STACKED_LIMIT = 1 << 30
+
+
+def _drop_stack(key: tuple[int, ...], watched: int | None = None) -> None:
+    global _STACKED_BYTES
+    try:
+        old = _STACKED.pop(key, None)
+        if watched is not None:
+            _STACK_REFS.pop(watched, None)
+    except Exception:
+        return
+    if old is not None:
+        _STACKED_BYTES -= old[2]
+
+
+def _watch_stack(weight: torch.Tensor, key: tuple[int, ...]) -> None:
+    watched = id(weight)
+    if watched in _STACK_REFS:
+        return
+
+    def _gone(_ref, k=key, i=watched) -> None:
+        _drop_stack(k, i)
+
+    _STACK_REFS[watched] = weakref.ref(weight, _gone)
+
+
+def gemv_stack(
+    x: torch.Tensor,
+    weights: list[torch.Tensor],
+    biases: list[torch.Tensor | None],
+) -> list[torch.Tensor] | None:
+    """One GEMV for several projections that share ``x``. None falls back.
+
+    At most four matrices, all ``[N_i, K]`` with the same ``K`` as ``x``. The
+    first call concatenates them; later calls reuse that matrix. The copy is
+    capped at a gigabyte so a large checkpoint does not keep two of itself.
+    """
+    ops = _ops()
+    if ops is None or not x.is_cuda or not weights or len(weights) > 4:
+        return None
+    if not all(type(weight) is torch.Tensor for weight in weights):
+        return None
+    if len(biases) != len(weights):
+        return None
+    k = weights[0].shape[-1]
+    if x.numel() != k or x.dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if k % 8:
+        return None
+    for weight, bias in zip(weights, biases):
+        if (
+            weight.dim() != 2
+            or not weight.is_contiguous()
+            or weight.shape[1] != k
+            or weight.dtype != x.dtype
+            or not weight.is_cuda
+        ):
+            return None
+        if bias is not None and (
+            bias.dtype != weight.dtype or bias.numel() != weight.shape[0] or not bias.is_cuda
+        ):
+            return None
+    # The multi-pointer kernel was slower than launching the projections
+    # separately. One contiguous matrix is faster, and the copy is paid once.
+    global _STACKED_BYTES
+    key = tuple(id(weight) for weight in weights)
+    cached = _STACKED.get(key)
+    if cached is None:
+        nbytes = sum(weight.numel() * weight.element_size() for weight in weights)
+        if _STACKED_BYTES + nbytes > _STACKED_LIMIT:
+            return None
+        stacked_w = torch.cat(list(weights), dim=0)
+        if any(bias is not None for bias in biases):
+            parts = [
+                bias
+                if bias is not None
+                else torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype)
+                for weight, bias in zip(weights, biases)
+            ]
+            stacked_b: torch.Tensor | None = torch.cat(parts, dim=0)
+            nbytes += stacked_b.numel() * stacked_b.element_size()
+        else:
+            stacked_b = None
+        _STACKED[key] = (stacked_w, stacked_b, nbytes)
+        _STACKED_BYTES += nbytes
+        _watch_stack(weights[0], key)
+        cached = _STACKED[key]
+    flat = gemv(x, cached[0], cached[1])
+    if flat is None:
+        return None
+    return list(flat.split([int(weight.shape[0]) for weight in weights], dim=-1))
 
 
 def moe_gemv(

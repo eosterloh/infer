@@ -200,7 +200,14 @@ class DecoderModel:
 
         types = getattr(self.config, "layer_types", ()) or ()
         layer_thetas = getattr(self.config, "layer_rope_theta", ()) or ()
-        for spec in self.layers:
+        # Leave each layer's FFN residual unadded so the next layer's input
+        # norm can fold the add in. The last layer still adds, because the
+        # final norm only sees the tokens logits are computed for.
+        residual_kind = getattr(self.config, "residual_kind", "sequential") or "sequential"
+        pending: torch.Tensor | None = None
+        n_layers = len(self.layers)
+        for index, spec in enumerate(self.layers):
+            defer = residual_kind == "sequential" and index + 1 < n_layers
             layer_cos, layer_sin = cos, sin
             if spec.index < len(layer_thetas):
                 theta = float(layer_thetas[spec.index])
@@ -214,7 +221,7 @@ class DecoderModel:
                 and "sliding" in str(types[spec.index]).lower()
             ):
                 layer_cos, layer_sin = local_cos, local_sin
-            x = decoder_block(
+            result = decoder_block(
                 x,
                 self.weights,
                 spec,
@@ -226,7 +233,14 @@ class DecoderModel:
                 attention_mask=effective_mask,
                 kv_mask=kv_mask,
                 q_positions=position_ids,
+                incoming_delta=pending,
+                defer_ffn_add=defer,
             )
+            if defer:
+                x, pending = result  # type: ignore[misc]
+            else:
+                x = result  # type: ignore[assignment]
+                pending = None
 
         if cache is not None and hasattr(cache, "advance"):
             if isinstance(cache, RuntimeState):
