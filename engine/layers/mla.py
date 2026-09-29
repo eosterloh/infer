@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
-from engine.layers.attention import causal_keep_mask
+from engine.layers.attention import causal_keep_mask, decode_attend, sdpa_attend
 from engine.layers.linear import dense
 from engine.layers.norm import rms_norm
 from engine.layers.rope import apply_rope
@@ -81,6 +82,27 @@ def mla_attention(
         k, v = cache.update(layer, k, v)
 
     scale = 1.0 / math.sqrt(qk)
+    # The score row is [heads, queries, cached keys]. Decode used to write that
+    # whole thing and softmax it; one query does not need it. The flash-decode
+    # kernel applies when K and V share a head dim, and SDPA covers MLA's real
+    # layouts, where V is shorter than QK. INFER_ATTENTION=eager keeps the
+    # matmul, which is the parity reference.
+    if os.environ.get("INFER_ATTENTION", "auto").strip().lower() != "eager":
+        attended = None
+        if q.shape[2] == 1:
+            attended = decode_attend(q, k, v, scale=scale, key_mask=key_mask)
+        if attended is None:
+            attended = sdpa_attend(
+                q,
+                k,
+                v,
+                scale=scale,
+                padding_mask=key_mask,
+                q_start=q_start,
+            )
+        out = attended.transpose(1, 2).contiguous().view(b, attended.shape[2], nq * vdh)
+        return dense(out, weights[f"{p}.attn.o.weight"])
+
     scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
     s_new, s_total = q.shape[2], k.shape[2]
     if s_new == s_total and q_start is None:

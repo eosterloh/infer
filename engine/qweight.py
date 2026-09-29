@@ -500,6 +500,14 @@ def qlinear(
     at 32, which is also where a routed expert lands during a sparse prefill —
     512 tokens over 128 experts at top-8 is 32 rows each, so the MoE prefill
     stops dequantizing entirely.
+
+    A wide NVFP4 prefill is slower than the same projection in BF16, and that
+    is the unpack, not a crossover set too high. Measured on the GB10 on
+    2026-09-29, a 4096×4096 weight: one row takes 0.21× the BF16 GEMV, which is
+    the decode win, and 128 to 512 rows take about 2× the BF16 GEMM. PyTorch on
+    this machine has ``scaled_mm`` and ``float4_e2m1fn_x2``, and cuBLAS rejects
+    the FP4 recipe with CUBLAS_STATUS_NOT_SUPPORTED, so there is no tensor-core
+    prefill to hand the wide case to. Decode stays on the fused kernel.
     """
     rows = x.numel() // x.shape[-1]
     if qw.qweight.is_cuda and x.is_cuda and rows <= _max_fused_rows():

@@ -24,6 +24,13 @@ if str(ROOT) not in sys.path:
 
 from engine.agent_api import load_engine  # noqa: E402
 from engine.layers.moe import EXPERT_STACK_KEY  # noqa: E402
+from engine.memory import available_bytes  # noqa: E402
+
+# The Spark shares one pool. A 30B load has already pinned it until SSH died,
+# so this refuses a checkpoint over 4 GB or a machine with under 40 GB free
+# unless the caller passes --allow-large.
+_MAX_WEIGHT_BYTES = 4 * 10**9
+_MIN_FREE_BYTES = 40 * 10**9
 
 
 def _bytes_of(value) -> int:
@@ -99,7 +106,29 @@ def main() -> int:
         default=273.0,
         help="peak memory bandwidth; GB10 is 273 GB/s",
     )
+    p.add_argument(
+        "--allow-large",
+        action="store_true",
+        help="load a checkpoint over 4 GB; the default refuses, the pool is shared",
+    )
     args = p.parse_args()
+
+    if not args.allow_large:
+        free = available_bytes()
+        if free is not None and free < _MIN_FREE_BYTES:
+            raise SystemExit(
+                f"refusing to load: {free / 1e9:.1f} GB free, want {_MIN_FREE_BYTES / 1e9:.0f} GB"
+            )
+        weight_bytes = sum(
+            path.stat().st_size
+            for path in args.model.rglob("*")
+            if path.suffix in {".safetensors", ".bin", ".gguf"} and path.is_file()
+        )
+        if weight_bytes > _MAX_WEIGHT_BYTES:
+            raise SystemExit(
+                f"refusing {args.model.name}: weights are {weight_bytes / 1e9:.1f} GB, "
+                "cap is 4 GB (--allow-large to override)"
+            )
 
     engine = load_engine(args.model, device="cuda", quant=args.quant)
     model = engine.model
