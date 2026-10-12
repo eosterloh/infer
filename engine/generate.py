@@ -23,8 +23,15 @@ def _eos_id_set(eos_token_id: int | list[int] | None) -> set[int]:
 
 
 def _delta_piece(tokenizer: Tokenizer, gen_ids: list[int], prev: str) -> tuple[str, str]:
-    """Decode the whole generated span so BPE fragments reassemble correctly."""
+    """Decode the whole generated span so BPE fragments reassemble correctly.
+
+    A trailing U+FFFD means a character's bytes are still arriving. Nothing is
+    emitted until it completes: byte-fallback decoders replace the whole run of
+    byte tokens meanwhile, so even text already sent can read as U+FFFD.
+    """
     text = tokenizer.decode(gen_ids, skip_special_tokens=False)
+    if text.endswith("\ufffd"):
+        return prev, ""
     if text.startswith(prev):
         return text, text[len(prev) :]
     return text, text if not prev else text
