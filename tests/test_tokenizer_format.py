@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from engine.tokenizer import Tokenizer
+from engine.generate import _delta_piece
+from engine.tokenizer import Tokenizer, _ByteTokenizer
 
 
 class _StubInner:
@@ -45,3 +46,31 @@ def test_format_for_generate_raw_opt_out() -> None:
     text, templated = tok.format_for_generate("Hello", apply_chat_template=False)
     assert templated is False
     assert text == "Hello"
+
+
+class _ByteFallbackInner(_ByteTokenizer):
+    """Decodes like HF ByteFallback: an unfinished run of byte tokens is all U+FFFD."""
+
+    def decode(self, ids, skip_special_tokens=True):
+        raw = bytes(ids)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            head = raw[: e.start].decode("utf-8")
+            return head[:-4] + "\ufffd" * (len(raw) - len(head) + 4)
+
+
+def _streamed(inner, text: str) -> str:
+    tok = Tokenizer(inner)
+    ids = tok.encode(text)
+    prev, pieces = "", []
+    for n in range(1, len(ids) + 1):
+        prev, piece = _delta_piece(tok, ids[:n], prev)
+        pieces.append(piece)
+    return "".join(pieces)
+
+
+def test_stream_waits_for_multibyte_characters() -> None:
+    text = 'caf\u00e9 \u2713 \U0001f600 "done"'
+    assert _streamed(_ByteTokenizer(), text) == text
+    assert _streamed(_ByteFallbackInner(), text) == text
