@@ -94,6 +94,12 @@ reply stops when the value closes, and it closes inside `max_new_tokens`
 whenever the budget can hold the schema's shortest value. Built for agents that
 answer with one JSON object per turn, like the lab experimenter.
 
+A reply that runs short of budget still parses, but its tail is written to fit:
+numbers shrink to one digit, strings end early. `eng.last_json_stats` says when
+that happened: `{"tokens": n, "forced": k}`, where `forced` counts the tokens the
+budget chose instead of the model. Treat `forced > 0` as a cut-short reply and
+ask again with more room.
+
 ```python
 schema = {
     "type": "object",
@@ -101,6 +107,7 @@ schema = {
     "required": ["tool", "args"],
 }
 eng.generate(prompt, max_new_tokens=128, json_schema=schema)   # str, always parses
+eng.last_json_stats                                            # {"tokens": 12, "forced": 0}
 eng.generate_json(prompt, schema)                              # parsed value
 eng.generate_json(prompt)                                      # any JSON value
 ```

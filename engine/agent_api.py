@@ -154,6 +154,7 @@ class Engine:
     processor: Any | None = None
     mtp: NativeMTP | None = None
     last_mtp_stats: dict[str, int] | None = None
+    last_json_stats: dict[str, int] | None = None
     quantization: dict[str, float] | None = None
 
     def generate(
@@ -171,8 +172,14 @@ class Engine:
         seed: int | None = None,
         json_schema: Any = None,
     ) -> str:
-        """Generate a completion. ``json_schema`` constrains it to valid JSON for that schema."""
+        """Generate a completion. ``json_schema`` constrains it to valid JSON for that schema.
+
+        With a schema, ``last_json_stats`` afterwards holds ``tokens`` and
+        ``forced``. ``forced`` > 0 means ``max_new_tokens`` ran short and the
+        tail of the value (often numbers cut to one digit) was written to fit.
+        """
         _check_structured(json_schema, num_speculative_tokens, enable_thinking)
+        self.last_json_stats = None if json_schema is None else {}
         if num_speculative_tokens:
             if self.mtp is None:
                 raise RuntimeError("this engine was not loaded with an MTP head")
@@ -206,6 +213,7 @@ class Engine:
                 top_p=top_p,
                 seed=seed,
                 json_schema=json_schema,
+                stats=self.last_json_stats,
             )
         )
 
@@ -221,7 +229,8 @@ class Engine:
 
         ``schema`` is a JSON Schema dict (``True`` = any JSON value). Raises
         StructuredOutputError, carrying the raw text, only when the budget was
-        too small to write even the shortest valid value.
+        too small to write even the shortest valid value. A value the budget
+        cut short still parses; check ``last_json_stats["forced"]``.
         """
         text = self.generate(prompt, max_new_tokens=max_new_tokens, json_schema=schema, **kwargs)
         try:
@@ -247,6 +256,7 @@ class Engine:
         json_schema: Any = None,
     ) -> Iterator[str]:
         _check_structured(json_schema, num_speculative_tokens, enable_thinking)
+        self.last_json_stats = None if json_schema is None else {}
         if num_speculative_tokens:
             if self.mtp is None:
                 raise RuntimeError("this engine was not loaded with an MTP head")
@@ -278,6 +288,7 @@ class Engine:
             top_p=top_p,
             seed=seed,
             json_schema=json_schema,
+            stats=self.last_json_stats,
         )
 
     def generate_messages(

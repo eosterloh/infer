@@ -978,6 +978,7 @@ def vocab_for(tokenizer: Any, vocab_size: int, eos_ids: Iterable[int]) -> TokenV
 
 _CANDIDATES = 64
 _SAMPLE_TRIES = 32
+_ILLEGAL, _LEGAL, _OVER_BUDGET = 0, 1, 2
 
 
 class JsonConstraint:
@@ -987,6 +988,10 @@ class JsonConstraint:
         self.grammar = grammar
         self.vocab = vocab
         self.states: States = initial_states(grammar)
+        # Tokens the budget chose over the model's own ranking. Nonzero means the
+        # tail of the value was written to fit, not because the model wanted it.
+        self.forced = 0
+        self._squeezed = False
         self._first_masks: dict[States, torch.Tensor] = {}
         self._mask_tensors: dict[tuple, torch.Tensor] = {}
 
@@ -1019,14 +1024,16 @@ class JsonConstraint:
             raise StructuredOutputError(f"token {token_id} ({data!r}) breaks the schema")
         self.states = nxt
 
-    def _legal(self, token_id: int, room: int, can_end: bool) -> bool:
+    def _verdict(self, token_id: int, room: int, can_end: bool) -> int:
         if token_id in self.vocab.eos_ids:
-            return can_end
+            return _LEGAL if can_end else _ILLEGAL
         data = self.vocab.token_bytes[token_id] if 0 <= token_id < len(self.vocab) else None
         if not data:
-            return False
+            return _ILLEGAL
         nxt = step(self.states, data)
-        return bool(nxt) and self._fits(nxt, room)
+        if not nxt:
+            return _ILLEGAL
+        return _LEGAL if self._fits(nxt, room) else _OVER_BUDGET
 
     def _first_byte_mask(self, device: torch.device) -> torch.Tensor:
         """Vocabulary mask of tokens whose first byte can come next (a superset of the legal ones)."""
@@ -1055,8 +1062,22 @@ class JsonConstraint:
         ``remaining`` counts the tokens left including this one. A token is legal
         when the matcher survives its bytes and the tokens left after it can
         still spell the shortest ending. If the budget is already shorter than
-        that, every token has to bring the end closer.
+        that, every token has to bring the end closer. A pick the budget changed
+        adds one to ``forced``.
         """
+        self._squeezed = False
+        token_id = self._choose(logits, params, generator, remaining)
+        if self._squeezed:
+            self.forced += 1
+        return token_id
+
+    def _choose(
+        self,
+        logits: torch.Tensor,
+        params: SamplingParams | None,
+        generator: torch.Generator | None,
+        remaining: int,
+    ) -> int:
         params = params or SamplingParams()
         row = logits.float()
         vocab_n = min(row.shape[-1], len(self.vocab))
@@ -1073,7 +1094,10 @@ class JsonConstraint:
             if token_id in tried:
                 return False
             tried.add(token_id)
-            return self._legal(token_id, room, can_end)
+            verdict = self._verdict(token_id, room, can_end)
+            if verdict == _OVER_BUDGET:
+                self._squeezed = True
+            return verdict == _LEGAL
 
         wants_end = False
         if params.greedy:
@@ -1117,6 +1141,7 @@ class JsonConstraint:
             if ok(token_id):
                 return token_id
         if tight_ending is not None:
+            self._squeezed = True
             if not tight_ending and can_end and self.vocab.eos_ids:
                 return min(self.vocab.eos_ids)
             first = self.vocab.spell(tight_ending)[1]

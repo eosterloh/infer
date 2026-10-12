@@ -247,6 +247,22 @@ def test_reply_closes_inside_a_tight_budget(byte_engine) -> None:
         assert matches(PACK, text), (budget, text)
 
 
+def test_engine_reports_when_the_budget_wrote_the_ending(byte_engine) -> None:
+    shortest = len(as_grammar(PACK).shortest)
+    byte_engine.generate("hi", max_new_tokens=shortest, apply_chat_template=False, json_schema=PACK)
+    stats = byte_engine.last_json_stats
+    assert 0 < stats["forced"] <= stats["tokens"] <= shortest
+
+    byte_engine.generate("hi", max_new_tokens=50, apply_chat_template=False, json_schema={"enum": ["yes", "no"]})
+    assert byte_engine.last_json_stats["forced"] == 0
+
+    list(byte_engine.stream("hi", max_new_tokens=shortest, apply_chat_template=False, json_schema=PACK))
+    assert byte_engine.last_json_stats["forced"] > 0
+
+    byte_engine.generate("hi", max_new_tokens=4, apply_chat_template=False)
+    assert byte_engine.last_json_stats is None
+
+
 def test_generate_json_and_stream(byte_engine) -> None:
     value = byte_engine.generate_json("hi", {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}, apply_chat_template=False)
     assert isinstance(value["ok"], bool)
@@ -374,6 +390,7 @@ def test_budget_is_counted_in_tokens_not_bytes() -> None:
         out += table[token]
     assert out == b"".join(pieces)
     assert constraint.done
+    assert constraint.forced == 0
 
 
 def test_a_budget_below_the_shortest_value_still_closes_in_the_fewest_tokens() -> None:
@@ -387,6 +404,7 @@ def test_a_budget_below_the_shortest_value_still_closes_in_the_fewest_tokens() -
         out += table[token]
     assert matches(schema, out), out
     assert constraint.done
+    assert constraint.forced > 0
 
 
 def test_a_model_that_stops_early_closes_instead_of_padding() -> None:

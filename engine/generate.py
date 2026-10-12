@@ -63,6 +63,7 @@ def generate_greedy(
     top_p: float | None = None,
     seed: int | None = None,
     json_schema: Any = None,
+    stats: dict[str, int] | None = None,
 ) -> Iterator[str]:
     """Yield decoded text pieces. temperature <= 0 is greedy argmax.
 
@@ -71,7 +72,9 @@ def generate_greedy(
 
     ``json_schema`` (a JSON Schema dict, or True for any JSON value) restricts
     every step to tokens that keep the reply valid for it; generation stops as
-    soon as the value is complete. See engine/structured.py.
+    soon as the value is complete. See engine/structured.py. With a schema,
+    ``stats`` gets ``tokens`` and ``forced``: how many of them the budget
+    chose instead of the model.
     """
     params = _sampling_params(temperature, top_k, top_p, seed)
     generator = make_generator(params.seed, model.device)
@@ -93,6 +96,8 @@ def generate_greedy(
         constraint = json_constraint(
             tokenizer, json_schema, vocab_size=model.config.vocab_size, eos_ids=eos_ids
         )
+        if stats is not None:
+            stats.update(tokens=0, forced=0)
     gen_ids: list[int] = []
     prev = ""
 
@@ -109,6 +114,9 @@ def generate_greedy(
             logits[0, -1, :], params, generator, remaining=max_new_tokens - len(gen_ids)
         )
         constraint.advance(next_id)
+        if stats is not None:
+            stats["tokens"] += 1
+            stats["forced"] = constraint.forced
         return next_id
 
     def _finished() -> bool:
@@ -181,6 +189,7 @@ def generate(
     top_p: float | None = None,
     seed: int | None = None,
     json_schema: Any = None,
+    stats: dict[str, int] | None = None,
 ) -> Iterator[str]:
     yield from generate_greedy(
         model,
@@ -195,6 +204,7 @@ def generate(
         top_p=top_p,
         seed=seed,
         json_schema=json_schema,
+        stats=stats,
     )
 
 
