@@ -182,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"json_ok=false ({e})")
         else:
             print("json_ok=true")
+    if eng.last_json_stats is not None:
+        print(f"json_stats={json.dumps(eng.last_json_stats, sort_keys=True)}")
     if eng.last_mtp_stats is not None:
         print(f"mtp_stats={json.dumps(eng.last_mtp_stats, sort_keys=True)}")
     print("generate_ok=true")
