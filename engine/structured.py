@@ -902,6 +902,9 @@ def token_byte_table(tokenizer: Any, vocab_size: int) -> list[bytes | None]:
     return [t or None for t in table]
 
 
+MAX_PIECE = 16  # longest token considered when spelling an ending; longer only lowers the count
+
+
 class TokenVocab:
     """Token id → bytes, plus each token's first byte as a device tensor for masking."""
 
@@ -910,9 +913,37 @@ class TokenVocab:
         self.token_bytes = [None if i in self.eos_ids else t for i, t in enumerate(token_bytes)]
         self._first = [t[0] if t else 256 for t in self.token_bytes]
         self._first_on: dict[str, torch.Tensor] = {}
+        self._piece_ids: dict[bytes, int] = {}
+        for i, t in enumerate(self.token_bytes):
+            if t and len(t) <= MAX_PIECE:
+                self._piece_ids.setdefault(t, i)
+        self._spelled: dict[bytes, tuple[int, int | None]] = {}
 
     def __len__(self) -> int:
         return len(self.token_bytes)
+
+    def spell(self, data: bytes) -> tuple[int, int | None]:
+        """Fewest tokens that write exactly ``data``, and the first of them.
+
+        The count is ``len(data) + 1`` or more when some byte has no token.
+        """
+        hit = self._spelled.get(data)
+        if hit is not None:
+            return hit
+        n = len(data)
+        cost = [0] * (n + 1)
+        first: list[int | None] = [None] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            best, pick = 2 * n + 2, None
+            for j in range(i + 1, min(n, i + MAX_PIECE) + 1):
+                token_id = self._piece_ids.get(data[i:j])
+                if token_id is not None and cost[j] + 1 < best:
+                    best, pick = cost[j] + 1, token_id
+            cost[i], first[i] = best, pick
+        if len(self._spelled) > 4096:
+            self._spelled.clear()
+        self._spelled[data] = (cost[0], first[0])
+        return cost[0], first[0]
 
     def first_byte(self, device: torch.device) -> torch.Tensor:
         key = str(device)
@@ -959,11 +990,14 @@ class JsonConstraint:
         """The value is complete and nothing more may follow it."""
         return all(len(s) == 1 and s[0].phase == 2 for s in self.states)
 
-    def closing_len(self, states: States | None = None) -> int:
-        return min(len(closing(s)) for s in (states or self.states))
+    def closing(self, states: States | None = None) -> bytes:
+        return min((closing(s) for s in (states or self.states)), key=len)
 
-    def closing(self) -> bytes:
-        return min((closing(s) for s in self.states), key=len)
+    def _fits(self, states: States, room: int) -> bool:
+        """Whether ``room`` tokens can still write the shortest ending of ``states``."""
+        ending = self.closing(states)
+        # One token per byte always works, so the token count only matters when that does not.
+        return len(ending) <= room or self.vocab.spell(ending)[0] <= room
 
     def advance(self, token_id: int) -> None:
         if token_id in self.vocab.eos_ids:
@@ -976,14 +1010,14 @@ class JsonConstraint:
             raise StructuredOutputError(f"token {token_id} ({data!r}) breaks the schema")
         self.states = nxt
 
-    def _legal(self, token_id: int, owe: int, can_end: bool) -> bool:
+    def _legal(self, token_id: int, room: int, can_end: bool) -> bool:
         if token_id in self.vocab.eos_ids:
             return can_end
         data = self.vocab.token_bytes[token_id] if 0 <= token_id < len(self.vocab) else None
         if not data:
             return False
         nxt = step(self.states, data)
-        return bool(nxt) and self.closing_len(nxt) <= owe
+        return bool(nxt) and self._fits(nxt, room)
 
     def _first_byte_mask(self, device: torch.device) -> torch.Tensor:
         """Vocabulary mask of tokens whose first byte can come next (a superset of the legal ones)."""
@@ -1011,21 +1045,26 @@ class JsonConstraint:
 
         ``remaining`` counts the tokens left including this one. A token is legal
         when the matcher survives its bytes and the tokens left after it can
-        still write the shortest ending — one byte per token, the worst case.
+        still spell the shortest ending. If the budget is already shorter than
+        that, every token has to bring the end closer.
         """
         params = params or SamplingParams()
         row = logits.float()
         vocab_n = min(row.shape[-1], len(self.vocab))
         row = row[:vocab_n]
         can_end = self.accepting
-        owe = max(remaining, self.closing_len()) - 1
+        ending = self.closing()
+        room = remaining - 1
+        tight = len(ending) > room
+        if tight:
+            room = max(room, self.vocab.spell(ending)[0] - 1)
         tried: set[int] = set()
 
         def ok(token_id: int) -> bool:
             if token_id in tried:
                 return False
             tried.add(token_id)
-            return self._legal(token_id, owe, can_end)
+            return self._legal(token_id, room, can_end)
 
         if params.greedy:
             first = int(torch.argmax(row).item())
@@ -1035,7 +1074,7 @@ class JsonConstraint:
             choice = self._sample(row, params, generator, ok, can_end)
             if choice is not None:
                 return choice
-        return self._scan(row, ok, can_end)
+        return self._scan(row, ok, can_end, ending if tight else None)
 
     def _allowed(self, device: torch.device, can_end: bool, n: int) -> torch.Tensor:
         mask = self._first_byte_mask(device)[:n]
@@ -1046,8 +1085,12 @@ class JsonConstraint:
                     mask[eos] = True
         return mask
 
-    def _scan(self, row: torch.Tensor, ok, can_end: bool) -> int:
-        """Walk the ranking, best first, until a token is legal."""
+    def _scan(self, row: torch.Tensor, ok, can_end: bool, tight_ending: bytes | None) -> int:
+        """Walk the ranking, best first, until a token is legal.
+
+        Short on budget (``tight_ending`` set), only the top candidates get a
+        look before the reply takes the cheapest spelling of its ending.
+        """
         masked = row.masked_fill(~self._allowed(row.device, can_end, row.shape[0]), float("-inf"))
         k = min(_CANDIDATES, masked.shape[0])
         values, ids = torch.topk(masked, k)
@@ -1056,6 +1099,12 @@ class JsonConstraint:
                 break
             if ok(token_id):
                 return token_id
+        if tight_ending is not None:
+            if not tight_ending and can_end and self.vocab.eos_ids:
+                return min(self.vocab.eos_ids)
+            first = self.vocab.spell(tight_ending)[1]
+            if first is not None:
+                return first
         order = torch.argsort(masked, descending=True).tolist()
         finite = torch.isfinite(masked).tolist()
         for token_id in order:
