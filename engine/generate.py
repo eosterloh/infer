@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import Any
 
 import torch
 
@@ -10,6 +11,7 @@ from engine.graph import GraphDecoder
 from engine.model import DecoderModel
 from engine.mtp import NativeMTP
 from engine.sample import SamplingParams, make_generator, select_next_id
+from engine.structured import json_constraint
 from engine.tokenizer import Tokenizer
 from engine.vision import multimodal_embeddings
 
@@ -60,11 +62,16 @@ def generate_greedy(
     top_k: int | None = None,
     top_p: float | None = None,
     seed: int | None = None,
+    json_schema: Any = None,
 ) -> Iterator[str]:
     """Yield decoded text pieces. temperature <= 0 is greedy argmax.
 
     If the folder shipped a chat template and `prompt` is a raw user string,
     wrap it automatically. Pass apply_chat_template=False to send raw tokens.
+
+    ``json_schema`` (a JSON Schema dict, or True for any JSON value) restricts
+    every step to tokens that keep the reply valid for it; generation stops as
+    soon as the value is complete. See engine/structured.py.
     """
     params = _sampling_params(temperature, top_k, top_p, seed)
     generator = make_generator(params.seed, model.device)
@@ -81,6 +88,11 @@ def generate_greedy(
     device = model.device
     tokens = torch.tensor([ids], dtype=torch.long, device=device)
     eos_ids = _eos_id_set(model.config.eos_token_id)
+    constraint = None
+    if json_schema is not None:
+        constraint = json_constraint(
+            tokenizer, json_schema, vocab_size=model.config.vocab_size, eos_ids=eos_ids
+        )
     gen_ids: list[int] = []
     prev = ""
 
@@ -91,7 +103,16 @@ def generate_greedy(
         return piece
 
     def _pick(logits: torch.Tensor) -> int:
-        return select_next_id(logits[0, -1, :], params, generator)
+        if constraint is None:
+            return select_next_id(logits[0, -1, :], params, generator)
+        next_id = constraint.pick(
+            logits[0, -1, :], params, generator, remaining=max_new_tokens - len(gen_ids)
+        )
+        constraint.advance(next_id)
+        return next_id
+
+    def _finished() -> bool:
+        return constraint is not None and constraint.done
 
     if not use_cache:
         for _ in range(max_new_tokens):
@@ -104,6 +125,8 @@ def generate_greedy(
             if next_id in eos_ids:
                 break
             yield _emit(next_id)
+            if _finished():
+                break
         return
 
     cache = model.make_cache(batch_size=1, device=device, dtype=model.dtype)
@@ -113,11 +136,14 @@ def generate_greedy(
     if next_id in eos_ids:
         return
     yield _emit(next_id)
+    if _finished():
+        return
 
     remaining = max_new_tokens - 1
     # Greedy decode has no host-side decisions inside the step, so it can run
-    # from a captured graph. Anything that breaks capture falls back here.
-    if remaining > 0 and params.temperature <= 0.0:
+    # from a captured graph. Anything that breaks capture falls back here. A
+    # schema is a host-side decision on every token, so it stays eager.
+    if remaining > 0 and params.temperature <= 0.0 and constraint is None:
         decoder = GraphDecoder.create(
             model, cache, length=cache.seq_len(), budget=remaining
         )
@@ -138,6 +164,8 @@ def generate_greedy(
         if next_id in eos_ids:
             break
         yield _emit(next_id)
+        if _finished():
+            break
 
 
 def generate(
@@ -152,6 +180,7 @@ def generate(
     top_k: int | None = None,
     top_p: float | None = None,
     seed: int | None = None,
+    json_schema: Any = None,
 ) -> Iterator[str]:
     yield from generate_greedy(
         model,
@@ -165,6 +194,7 @@ def generate(
         top_k=top_k,
         top_p=top_p,
         seed=seed,
+        json_schema=json_schema,
     )
 
 

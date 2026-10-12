@@ -56,6 +56,12 @@ def _apply_top_p(logits: torch.Tensor, top_p: float | None) -> torch.Tensor:
     return torch.empty_like(logits).scatter(-1, sorted_idx, sorted_logits)
 
 
+def filtered_logits(row: torch.Tensor, params: SamplingParams) -> torch.Tensor:
+    """Temperature, then top-k, then top-p — the distribution a sampled step draws from."""
+    scaled = row.float() / float(params.temperature)
+    return _apply_top_p(_apply_top_k(scaled, params.top_k), params.top_p)
+
+
 def select_next_id(
     logits: torch.Tensor,
     params: SamplingParams | None = None,
@@ -68,8 +74,7 @@ def select_next_id(
     row = logits.float()
     if params.greedy:
         return int(torch.argmax(row).item())
-    scaled = row / float(params.temperature)
-    filtered = _apply_top_p(_apply_top_k(scaled, params.top_k), params.top_p)
+    filtered = filtered_logits(row, params)
     if not torch.isfinite(filtered).any():
         return int(torch.argmax(row).item())
     probs = torch.softmax(filtered, dim=-1)

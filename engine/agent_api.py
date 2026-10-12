@@ -8,6 +8,7 @@ North star: Nemotron NVFP4 on DGX Spark — MTP lands with Super later.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -32,6 +33,7 @@ from engine.generate import (
 from engine.model import DecoderModel
 from engine.mtp import NativeMTP, build_mtp
 from engine.schedule import FfnKind, MixerKind
+from engine.structured import StructuredOutputError
 from engine.tokenizer import Tokenizer
 from engine.vision import validate_qwen35_vision_weights
 from engine.vision_mm import validate_vision_weights, vision_prefixes
@@ -167,7 +169,10 @@ class Engine:
         top_k: int | None = None,
         top_p: float | None = None,
         seed: int | None = None,
+        json_schema: Any = None,
     ) -> str:
+        """Generate a completion. ``json_schema`` constrains it to valid JSON for that schema."""
+        _check_structured(json_schema, num_speculative_tokens, enable_thinking)
         if num_speculative_tokens:
             if self.mtp is None:
                 raise RuntimeError("this engine was not loaded with an MTP head")
@@ -200,8 +205,31 @@ class Engine:
                 top_k=top_k,
                 top_p=top_p,
                 seed=seed,
+                json_schema=json_schema,
             )
         )
+
+    def generate_json(
+        self,
+        prompt: str,
+        schema: Any = True,
+        *,
+        max_new_tokens: int = 256,
+        **kwargs: Any,
+    ) -> Any:
+        """Generate under ``schema`` and return the parsed value.
+
+        ``schema`` is a JSON Schema dict (``True`` = any JSON value). Raises
+        StructuredOutputError, carrying the raw text, only when the budget was
+        too small to write even the shortest valid value.
+        """
+        text = self.generate(prompt, max_new_tokens=max_new_tokens, json_schema=schema, **kwargs)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            raise StructuredOutputError(
+                f"reply is not complete JSON after {max_new_tokens} tokens: {e}", text
+            ) from e
 
     def stream(
         self,
@@ -216,7 +244,9 @@ class Engine:
         top_k: int | None = None,
         top_p: float | None = None,
         seed: int | None = None,
+        json_schema: Any = None,
     ) -> Iterator[str]:
+        _check_structured(json_schema, num_speculative_tokens, enable_thinking)
         if num_speculative_tokens:
             if self.mtp is None:
                 raise RuntimeError("this engine was not loaded with an MTP head")
@@ -247,6 +277,7 @@ class Engine:
             top_k=top_k,
             top_p=top_p,
             seed=seed,
+            json_schema=json_schema,
         )
 
     def generate_messages(
@@ -314,6 +345,17 @@ class Engine:
             "config": self.config.summary(),
             "capabilities": self.capabilities.to_dict(),
         }
+
+
+def _check_structured(json_schema: Any, num_speculative_tokens: int, enable_thinking: bool) -> None:
+    if json_schema is None:
+        return
+    if num_speculative_tokens:
+        raise ValueError("json_schema does not combine with MTP speculative decode yet")
+    if enable_thinking:
+        # The schema governs the whole reply, so an open <think> block could
+        # never be written; the model would be forced straight into the JSON.
+        raise ValueError("json_schema constrains the whole reply; pass enable_thinking=False")
 
 
 _QUANT_BYTES_PER_PARAM = {"int4": 0.60, "nvfp4": 0.63, "fp8": 1.06}
