@@ -389,6 +389,20 @@ def test_a_budget_below_the_shortest_value_still_closes_in_the_fewest_tokens() -
     assert constraint.done
 
 
+def test_a_model_that_stops_early_closes_instead_of_padding() -> None:
+    from engine.structured import JsonConstraint, TokenVocab
+
+    table = [bytes((i,)) for i in range(256)] + [b"<eos>"]
+    eos = len(table) - 1
+    schema = {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}
+    constraint = JsonConstraint(as_grammar(schema), TokenVocab(table, eos_ids=[eos]))
+    for b in b'{"a":1':
+        constraint.advance(b)
+    logits = torch.zeros(len(table))
+    logits[eos], logits[ord("\n")], logits[ord("}")] = 10.0, 9.0, 8.0
+    assert constraint.pick(logits, remaining=50) == ord("}")
+
+
 def test_constraint_never_picks_padding_rows(byte_engine) -> None:
     """Logit rows past the tokenizer's vocabulary are never legal tokens."""
     from engine.structured import JsonConstraint, TokenVocab
