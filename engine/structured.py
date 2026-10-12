@@ -913,6 +913,8 @@ class TokenVocab:
         self.token_bytes = [None if i in self.eos_ids else t for i, t in enumerate(token_bytes)]
         self._first = [t[0] if t else 256 for t in self.token_bytes]
         self._first_on: dict[str, torch.Tensor] = {}
+        self._blank = [bool(t) and all(b in _WS for b in t) for t in self.token_bytes]
+        self._blank_on: dict[str, torch.Tensor] = {}
         self._piece_ids: dict[bytes, int] = {}
         for i, t in enumerate(self.token_bytes):
             if t and len(t) <= MAX_PIECE:
@@ -950,6 +952,13 @@ class TokenVocab:
         if key not in self._first_on:
             self._first_on[key] = torch.tensor(self._first, dtype=torch.long, device=device)
         return self._first_on[key]
+
+    def blank(self, device: torch.device) -> torch.Tensor:
+        """Mask of tokens that are nothing but JSON whitespace."""
+        key = str(device)
+        if key not in self._blank_on:
+            self._blank_on[key] = torch.tensor(self._blank, dtype=torch.bool, device=device)
+        return self._blank_on[key]
 
 
 _VOCABS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -1066,15 +1075,17 @@ class JsonConstraint:
             tried.add(token_id)
             return self._legal(token_id, room, can_end)
 
+        wants_end = False
         if params.greedy:
             first = int(torch.argmax(row).item())
             if ok(first):
                 return first
+            wants_end = first in self.vocab.eos_ids
         else:
             choice = self._sample(row, params, generator, ok, can_end)
             if choice is not None:
                 return choice
-        return self._scan(row, ok, can_end, ending if tight else None)
+        return self._scan(row, ok, can_end, ending if tight else None, skip_blank=wants_end)
 
     def _allowed(self, device: torch.device, can_end: bool, n: int) -> torch.Tensor:
         mask = self._first_byte_mask(device)[:n]
@@ -1085,13 +1096,19 @@ class JsonConstraint:
                     mask[eos] = True
         return mask
 
-    def _scan(self, row: torch.Tensor, ok, can_end: bool, tight_ending: bytes | None) -> int:
+    def _scan(
+        self, row: torch.Tensor, ok, can_end: bool, tight_ending: bytes | None, *, skip_blank: bool = False
+    ) -> int:
         """Walk the ranking, best first, until a token is legal.
 
         Short on budget (``tight_ending`` set), only the top candidates get a
         look before the reply takes the cheapest spelling of its ending.
+        ``skip_blank`` is for a model that asked to stop early: whitespace would
+        only pad the reply, so its best real continuation goes first.
         """
         masked = row.masked_fill(~self._allowed(row.device, can_end, row.shape[0]), float("-inf"))
+        if skip_blank:
+            masked = masked.masked_fill(self.vocab.blank(row.device)[: masked.shape[0]], float("-inf"))
         k = min(_CANDIDATES, masked.shape[0])
         values, ids = torch.topk(masked, k)
         for value, token_id in zip(values.tolist(), ids.tolist()):
@@ -1130,6 +1147,8 @@ class JsonConstraint:
             token_id = int(torch.multinomial(probs, 1, generator=generator).item())
             if ok(token_id):
                 return token_id
+            if token_id in self.vocab.eos_ids:
+                probs = probs.masked_fill(self.vocab.blank(row.device)[: probs.shape[0]], 0.0)
             if not masked_once:
                 probs = probs * self._allowed(row.device, can_end, probs.shape[0]).to(probs.dtype)
                 masked_once = True
