@@ -349,6 +349,46 @@ def test_constrained_decode_with_real_tokenizers(tmp_path: Path, monkeypatch, bu
             json.loads(text)
 
 
+def _multibyte_constraint():
+    from engine.structured import JsonConstraint, TokenVocab
+
+    pieces = [b'{"steps":', b"64", b',"note":"', b"hello", b" world", b'"}']
+    table = [bytes((i,)) for i in range(256)] + pieces + [b"<eos>"]
+    schema = {
+        "type": "object",
+        "properties": {"steps": {"type": "integer"}, "note": {"type": "string"}},
+        "required": ["steps", "note"],
+    }
+    return schema, pieces, table, JsonConstraint(as_grammar(schema), TokenVocab(table, eos_ids=[len(table) - 1]))
+
+
+def test_budget_is_counted_in_tokens_not_bytes() -> None:
+    """Six tokens fit a six-token budget, though the shortest ending alone is 21 bytes."""
+    schema, pieces, table, constraint = _multibyte_constraint()
+    out = b""
+    for i in range(len(pieces)):
+        logits = torch.zeros(len(table))
+        logits[256 + i] = 10.0
+        token = constraint.pick(logits, remaining=len(pieces) - i)
+        constraint.advance(token)
+        out += table[token]
+    assert out == b"".join(pieces)
+    assert constraint.done
+
+
+def test_a_budget_below_the_shortest_value_still_closes_in_the_fewest_tokens() -> None:
+    schema, pieces, table, constraint = _multibyte_constraint()
+    logits = torch.zeros(len(table))
+    logits[256 + pieces.index(b"hello")] = 10.0
+    out = b""
+    for left in range(4, 0, -1):
+        token = constraint.pick(logits, remaining=left)
+        constraint.advance(token)
+        out += table[token]
+    assert matches(schema, out), out
+    assert constraint.done
+
+
 def test_constraint_never_picks_padding_rows(byte_engine) -> None:
     """Logit rows past the tokenizer's vocabulary are never legal tokens."""
     from engine.structured import JsonConstraint, TokenVocab
