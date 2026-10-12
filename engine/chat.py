@@ -85,7 +85,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-k", type=int, default=None, help="Top-k filter (0 disables)")
     p.add_argument("--top-p", type=float, default=None, help="Nucleus probability mass")
     p.add_argument("--seed", type=int, default=None, help="RNG seed for sampling")
+    p.add_argument(
+        "--json-schema",
+        default=None,
+        help="Constrain the reply to this JSON Schema (a file path or inline JSON)",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Constrain the reply to any JSON object (same as --json-schema '{\"type\": \"object\"}')",
+    )
     return p
+
+
+def _load_schema(arg: str) -> object:
+    path = Path(arg).expanduser()
+    text = path.read_text(encoding="utf-8") if path.is_file() else arg
+    return json.loads(text)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,6 +144,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(f"prompt={args.prompt!r}")
+    schema = None
+    if args.json_schema is not None:
+        schema = _load_schema(args.json_schema)
+    elif args.json:
+        schema = {"type": "object"}
+    if schema is not None:
+        print(f"json_schema={json.dumps(schema)}")
     use_cache = not args.no_cache
     apply_tmpl = False if args.raw_prompt else None
     print(f"use_cache={use_cache}")
@@ -145,11 +168,20 @@ def main(argv: list[str] | None = None) -> int:
         top_k=args.top_k,
         top_p=args.top_p,
         seed=args.seed,
+        json_schema=schema,
     ):
         pieces.append(piece)
         print(piece, end="", flush=True)
     print()
-    print(f"completion={''.join(pieces)!r}")
+    completion = "".join(pieces)
+    print(f"completion={completion!r}")
+    if schema is not None:
+        try:
+            json.loads(completion)
+        except json.JSONDecodeError as e:
+            print(f"json_ok=false ({e})")
+        else:
+            print("json_ok=true")
     if eng.last_mtp_stats is not None:
         print(f"mtp_stats={json.dumps(eng.last_mtp_stats, sort_keys=True)}")
     print("generate_ok=true")
