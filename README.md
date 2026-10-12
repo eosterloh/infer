@@ -46,6 +46,7 @@ After Pass 1 you can trace: `python -m engine.chat --model ~/models/Llama-3.2-1B
 | [`engine/mtp.py`](engine/mtp.py) | Native Qwen MTP draft layer sharing embed/lm_head |
 | [`engine/cache.py`](engine/cache.py) | `RuntimeState` = KV + Mamba conv/SSM |
 | [`engine/agent_api.py`](engine/agent_api.py) | `inspect_capabilities` / `load_engine` — public agent surface |
+| [`engine/structured.py`](engine/structured.py) | JSON Schema → byte-level pushdown matcher; `JsonConstraint.pick` picks the best legal token |
 | [`engine/capabilities.py`](engine/capabilities.py) | Older capability dict (Spark also has this) |
 | [`engine/runtime.py`](engine/runtime.py) | Older handle API; prefer `agent_api.py` if they overlap |
 
@@ -84,6 +85,49 @@ print(qwen.generate_messages(messages, max_new_tokens=32))
 ```
 
 Toy walkthrough (no engine modules): `~/Projects/Scratch/inference.py`.
+
+## Structured output
+
+`json_schema=` keeps every decode step on tokens that leave the reply valid JSON
+for the schema. The model still ranks the tokens; illegal ones are skipped. The
+reply stops when the value closes, and it closes inside `max_new_tokens`
+whenever the budget can hold the schema's shortest value. Built for agents that
+answer with one JSON object per turn, like the lab experimenter.
+
+```python
+schema = {
+    "type": "object",
+    "properties": {"tool": {"enum": ["run_eval", "enter_research"]}, "args": {"type": "object", "properties": {}}},
+    "required": ["tool", "args"],
+}
+eng.generate(prompt, max_new_tokens=128, json_schema=schema)   # str, always parses
+eng.generate_json(prompt, schema)                              # parsed value
+eng.generate_json(prompt)                                      # any JSON value
+```
+
+```bash
+python -m engine.chat --model ~/models/Qwen3.8-27B --prompt "..." --json-schema tool.json
+python -m engine.chat --model ~/models/Qwen3.8-27B --prompt "..." --json   # any object
+```
+
+Supported keywords: `type` (also a list), `properties`, `required`,
+`additionalProperties`, `items`, `minItems`, `maxItems`, `minLength`,
+`maxLength`, `enum`, `const`, `anyOf`, `oneOf`, local non-recursive `$ref`.
+Annotations (`title`, `description`, `default`, `$defs`, …) are ignored.
+Anything else, `minimum` or `pattern` say, raises `SchemaError` instead of
+being quietly dropped.
+
+Where JSON Schema leaves it open:
+
+- keys come out in `properties` order; optional keys may be skipped
+- `additionalProperties` is false when `properties` is given
+- whitespace is allowed between tokens, at most 20 bytes per gap; nothing follows the value
+- strings are strict UTF-8 (no surrogates or overlong forms)
+
+Works with greedy and sampled decode (sampling draws from the top-k / top-p
+distribution, restricted to legal tokens). Not combined with MTP
+(`num_speculative_tokens`) or `enable_thinking=True`, and greedy decode runs
+eager instead of from a CUDA graph while a schema is set.
 
 ## Tests
 
